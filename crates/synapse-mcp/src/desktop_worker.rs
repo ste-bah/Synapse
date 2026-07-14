@@ -858,10 +858,8 @@ impl WorkerProcessHandles {
             return;
         };
         if let Err(error) = unsafe { windows::Win32::Foundation::CloseHandle(handle) } {
-            let detail = format!(
-                "CloseHandle({kind}) failed for desktop worker pid {}: {error}",
-                pid
-            );
+            let detail =
+                format!("CloseHandle({kind}) failed for desktop worker pid {pid}: {error}");
             report_worker_process_lifecycle_failure(
                 "MCP_DESKTOP_WORKER_HANDLE_CLOSE_FAILED",
                 pid,
@@ -1530,7 +1528,9 @@ fn terminate_worker_process_and_readback(
             "desktop worker pid {pid} exact-process pre-fallback wait returned {pre_fallback_wait:?}; last_error={last_error}"
         ));
     }
-    let provisional_terminate_process_failure = if pre_fallback_wait != WAIT_OBJECT_0 {
+    let provisional_terminate_process_failure = if pre_fallback_wait == WAIT_OBJECT_0 {
+        None
+    } else {
         unsafe { TerminateProcess(process, 1) }
             .err()
             .map(|error| {
@@ -1538,8 +1538,6 @@ fn terminate_worker_process_and_readback(
                     "TerminateProcess exact-child fallback failed for desktop worker pid {pid} after {initial_timeout_ms} ms: {error}; pre_fallback_wait={pre_fallback_wait:?}"
                 )
             })
-    } else {
-        None
     };
     let termination_wait =
         unsafe { WaitForSingleObject(process, WORKER_TERMINATION_READBACK_TIMEOUT_MS) };

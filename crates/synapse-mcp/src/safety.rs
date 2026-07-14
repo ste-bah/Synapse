@@ -540,8 +540,8 @@ async fn drain_operator_panic_k2_tasks_with_timeouts(
 
         tasks_observed += graceful_owners.len();
         let outcomes = join_all(
-            graceful_owners
-                .drain(..)
+            std::mem::take(&mut graceful_owners)
+                .into_iter()
                 .map(|owner| wait_for_operator_panic_k2_task_until(owner, graceful_deadline)),
         )
         .await;
@@ -603,8 +603,8 @@ async fn drain_operator_panic_k2_tasks_with_timeouts(
             ));
         }
         let outcomes = join_all(
-            abort_owners
-                .drain(..)
+            std::mem::take(&mut abort_owners)
+                .into_iter()
                 .map(|owner| wait_for_operator_panic_k2_task_until(owner, abort_deadline)),
         )
         .await;

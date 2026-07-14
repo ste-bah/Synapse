@@ -166,6 +166,7 @@ fn haiku_price_real() -> AgentCostPricePutParams {
 fn cost_params(spawn: Option<&str>, since: Option<u64>, until: Option<u64>) -> AgentCostParams {
     AgentCostParams {
         spawn_id: spawn.map(ToOwned::to_owned),
+        all_history: spawn.is_none() && since.is_none() && until.is_none(),
         since_ns: since,
         until_ns: until,
         include_per_turn: false,
@@ -176,6 +177,7 @@ fn cost_params(spawn: Option<&str>, since: Option<u64>, until: Option<u64>) -> A
 fn cost_params_per_turn(spawn: Option<&str>) -> AgentCostParams {
     AgentCostParams {
         spawn_id: spawn.map(ToOwned::to_owned),
+        all_history: false,
         since_ns: None,
         until_ns: None,
         include_per_turn: true,

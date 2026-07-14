@@ -15,6 +15,7 @@ use crate::{ActionError, ActionResult, validate_action};
 pub const ACTION_QUEUE_CAPACITY: usize = 256;
 
 /// Emitter queue item carrying the operator-panic epoch from the enqueue edge.
+///
 /// A normal action must still match this epoch at physical dispatch; otherwise
 /// an item queued before K1 could resume after a fully finalized K2 wave.
 pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>, Option<u64>);

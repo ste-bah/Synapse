@@ -25,7 +25,9 @@ pub const fn hwnd_to_wire(native: isize) -> i64 {
 }
 
 /// Compares two native HWND representations by their canonical USER-handle
-/// bits. Win64 APIs may return the same high-bit handle zero-extended or
+/// bits.
+///
+/// Win64 APIs may return the same high-bit handle zero-extended or
 /// sign-extended, so pointer-sized integer equality is not sufficient.
 #[must_use]
 pub const fn native_hwnds_equal(left: isize, right: isize) -> bool {

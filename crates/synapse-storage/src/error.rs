@@ -30,6 +30,8 @@ pub enum StorageError {
         pressure_level: String,
         rows: usize,
     },
+    #[error("storage GC refused unsafe eviction in {cf_name}: {detail}")]
+    UnsafeGcEvictionRefused { cf_name: String, detail: String },
     #[error("storage read failed in {cf_name}: {detail}")]
     ReadFailed { cf_name: String, detail: String },
     #[error("storage schema mismatch: expected {expected}, actual {actual}")]
@@ -45,6 +47,7 @@ impl StorageError {
             Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
                 error_codes::STORAGE_WRITE_FAILED
             }
+            Self::UnsafeGcEvictionRefused { .. } => error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,
         }

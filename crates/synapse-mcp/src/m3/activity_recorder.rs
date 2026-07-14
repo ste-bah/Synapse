@@ -752,8 +752,26 @@ struct ForegroundSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForegroundTransition {
     Duplicate,
+    TitleChurnSuppressed(TitleChurnReason),
     TitleChanged,
     Switched,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleChurnReason {
+    VolatilePrefix,
+    VolatileSuffix,
+    ProgressPercent,
+}
+
+impl TitleChurnReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VolatilePrefix => "volatile_prefix",
+            Self::VolatileSuffix => "volatile_suffix",
+            Self::ProgressPercent => "progress_percent",
+        }
+    }
 }
 
 fn classify_foreground_transition(
@@ -765,12 +783,127 @@ fn classify_foreground_transition(
             // Same window: only the title can have moved.
             if prev.title == next.title {
                 ForegroundTransition::Duplicate
+            } else if let Some(reason) = classify_title_churn(&prev.title, &next.title) {
+                ForegroundTransition::TitleChurnSuppressed(reason)
             } else {
                 ForegroundTransition::TitleChanged
             }
         }
         _ => ForegroundTransition::Switched,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NormalizedTitle {
+    semantic: String,
+    reason: Option<TitleChurnReason>,
+}
+
+fn classify_title_churn(previous: &str, next: &str) -> Option<TitleChurnReason> {
+    let previous = normalize_title_for_churn(previous);
+    let next = normalize_title_for_churn(next);
+    if previous.semantic.is_empty() || previous.semantic != next.semantic {
+        return None;
+    }
+    previous.reason.or(next.reason)
+}
+
+fn normalize_title_for_churn(title: &str) -> NormalizedTitle {
+    let trimmed = title.trim();
+    if let Some(semantic) = strip_volatile_prefix(trimmed) {
+        return NormalizedTitle {
+            semantic,
+            reason: Some(TitleChurnReason::VolatilePrefix),
+        };
+    }
+    if let Some(semantic) = strip_volatile_suffix(trimmed) {
+        return NormalizedTitle {
+            semantic,
+            reason: Some(TitleChurnReason::VolatileSuffix),
+        };
+    }
+    if let Some(semantic) = strip_trailing_progress_percent(trimmed) {
+        return NormalizedTitle {
+            semantic,
+            reason: Some(TitleChurnReason::ProgressPercent),
+        };
+    }
+    NormalizedTitle {
+        semantic: trimmed.to_owned(),
+        reason: None,
+    }
+}
+
+fn strip_volatile_prefix(title: &str) -> Option<String> {
+    let mut chars = title.char_indices();
+    let (_first_at, first) = chars.next()?;
+    if !is_volatile_title_glyph(first) {
+        return None;
+    }
+    let after_first = &title[first.len_utf8()..];
+    if !after_first.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let semantic = after_first.trim_start();
+    (!semantic.is_empty()).then(|| semantic.to_owned())
+}
+
+fn strip_volatile_suffix(title: &str) -> Option<String> {
+    let (last_at, last) = title.char_indices().next_back()?;
+    if !is_volatile_title_glyph(last) {
+        return None;
+    }
+    let before_last = &title[..last_at];
+    if !before_last
+        .chars()
+        .next_back()
+        .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let semantic = before_last.trim_end();
+    (!semantic.is_empty()).then(|| semantic.to_owned())
+}
+
+fn strip_trailing_progress_percent(title: &str) -> Option<String> {
+    let before_percent = title.strip_suffix('%')?.trim_end();
+    let digit_start = before_percent
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| {
+            (!ch.is_ascii_digit() && ch != '.').then_some(index + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    let number = before_percent[digit_start..].trim();
+    if number.is_empty() || !number.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let semantic = before_percent[..digit_start].trim_end();
+    (!semantic.is_empty()).then(|| format!("{semantic} <%>"))
+}
+
+fn is_volatile_title_glyph(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2800}'
+            ..='\u{28ff}'
+                | '◐'
+                | '◓'
+                | '◑'
+                | '◒'
+                | '◴'
+                | '◷'
+                | '◶'
+                | '◵'
+                | '◜'
+                | '◝'
+                | '◞'
+                | '◟'
+                | '|'
+                | '/'
+                | '-'
+                | '\\'
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1922,6 +2055,9 @@ impl WorkerState {
         }
         match classify_foreground_transition(self.foreground.as_ref(), &next) {
             ForegroundTransition::Duplicate => {}
+            ForegroundTransition::TitleChurnSuppressed(reason) => {
+                self.record_suppressed_title_change(&next, reason);
+            }
             ForegroundTransition::TitleChanged => {
                 let ts_ns = now_ts_ns();
                 self.write_title_change(&next, ts_ns);
@@ -1964,7 +2100,7 @@ impl WorkerState {
     }
 
     fn handle_name_change(&mut self, window_id: i64) {
-        let Some(previous) = self.foreground.as_ref() else {
+        let Some(previous) = self.foreground.clone() else {
             return;
         };
         if previous.hwnd != window_id {
@@ -1984,9 +2120,6 @@ impl WorkerState {
                 return;
             }
         };
-        if context.window_title == previous.title {
-            return;
-        }
         let next = ForegroundSnapshot {
             hwnd: context.hwnd,
             pid: context.pid,
@@ -1994,6 +2127,26 @@ impl WorkerState {
             process_path: context.process_path,
             title: context.window_title,
         };
+        match classify_foreground_transition(Some(&previous), &next) {
+            ForegroundTransition::Duplicate => return,
+            ForegroundTransition::TitleChurnSuppressed(reason) => {
+                self.record_suppressed_title_change(&next, reason);
+                self.foreground = Some(next);
+                return;
+            }
+            ForegroundTransition::Switched => {
+                tracing::debug!(
+                    code = "TIMELINE_NAMECHANGE_FOREGROUND_SWITCHED",
+                    hwnd = window_id,
+                    next_hwnd = next.hwnd,
+                    next_pid = next.pid,
+                    "NAMECHANGE readback no longer matches the previous foreground; next foreground poll will record the switch"
+                );
+                self.foreground = Some(next);
+                return;
+            }
+            ForegroundTransition::TitleChanged => {}
+        }
         let ts_ns = now_ts_ns();
         self.write_title_change(&next, ts_ns);
         self.assist.note_state_change();
@@ -2018,6 +2171,24 @@ impl WorkerState {
                 "pid": next.pid,
                 "hwnd": next.hwnd,
             }),
+        );
+    }
+
+    fn record_suppressed_title_change(&self, next: &ForegroundSnapshot, reason: TitleChurnReason) {
+        synapse_telemetry::metrics::counter!(
+            "timeline_title_changes_suppressed_total",
+            "app" => next.process_name.clone(),
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+        tracing::debug!(
+            code = "TIMELINE_TITLE_CHANGE_SUPPRESSED",
+            app = %next.process_name,
+            hwnd = next.hwnd,
+            pid = next.pid,
+            reason = reason.as_str(),
+            semantic_title_sha256 = %sha256_hex(&normalize_title_for_churn(&next.title).semantic),
+            "suppressed volatile title-only churn; raw title omitted from metric labels and log"
         );
     }
 
@@ -4254,6 +4425,62 @@ mod tests {
             classify_foreground_transition(Some(&first), &snapshot(100, 8, "Inbox")),
             ForegroundTransition::Switched,
             "hwnd reuse by a different pid is a switch"
+        );
+    }
+
+    #[test]
+    fn title_churn_classifier_suppresses_spinner_frames_only() {
+        let stable = snapshot(100, 7, "Synapse");
+        assert_eq!(
+            classify_foreground_transition(Some(&stable), &snapshot(100, 7, "⠋ Synapse")),
+            ForegroundTransition::TitleChurnSuppressed(TitleChurnReason::VolatilePrefix),
+            "volatile spinner prefix over the same semantic title is suppressed"
+        );
+        assert_eq!(
+            classify_foreground_transition(
+                Some(&snapshot(100, 7, "⠋ Synapse")),
+                &snapshot(100, 7, "⠙ Synapse")
+            ),
+            ForegroundTransition::TitleChurnSuppressed(TitleChurnReason::VolatilePrefix),
+            "rotating spinner frames over the same title stay suppressed"
+        );
+        assert_eq!(
+            classify_foreground_transition(
+                Some(&snapshot(100, 7, "Build 1%")),
+                &snapshot(100, 7, "Build 2%")
+            ),
+            ForegroundTransition::TitleChurnSuppressed(TitleChurnReason::ProgressPercent),
+            "trailing progress counters are churn when the semantic prefix is stable"
+        );
+    }
+
+    #[test]
+    fn title_churn_classifier_preserves_meaningful_edge_titles() {
+        assert_eq!(
+            classify_foreground_transition(Some(&snapshot(100, 7, "A")), &snapshot(100, 7, "B")),
+            ForegroundTransition::TitleChanged,
+            "one-character real document titles are not spinner-normalized"
+        );
+        assert_eq!(
+            classify_foreground_transition(
+                Some(&snapshot(100, 7, "file.txt")),
+                &snapshot(100, 7, "* file.txt")
+            ),
+            ForegroundTransition::TitleChanged,
+            "dirty markers are meaningful document state"
+        );
+        assert_eq!(
+            classify_foreground_transition(Some(&snapshot(100, 7, "")), &snapshot(100, 7, "⠋")),
+            ForegroundTransition::TitleChanged,
+            "empty/one-glyph titles do not produce an empty semantic suppression key"
+        );
+        assert_eq!(
+            classify_foreground_transition(
+                Some(&snapshot(101, 7, "⠋ Synapse")),
+                &snapshot(102, 7, "⠙ Synapse")
+            ),
+            ForegroundTransition::Switched,
+            "window boundaries remain separate even for identical normalized titles"
         );
     }
 

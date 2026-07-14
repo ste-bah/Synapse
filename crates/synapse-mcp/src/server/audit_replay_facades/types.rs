@@ -328,6 +328,7 @@ pub struct AuditCommandQueryRowSummary {
 #[serde(deny_unknown_fields)]
 pub struct AuditLifecycleTailResponse {
     pub path: String,
+    pub segment_count: usize,
     pub limit: usize,
     pub max_line_bytes: usize,
     pub total_lines_read: u64,

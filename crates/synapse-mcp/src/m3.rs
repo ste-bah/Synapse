@@ -47,7 +47,7 @@ use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
     install_action_combo_scheduler,
 };
-use synapse_storage::Db;
+use synapse_storage::{Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask};
 use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
@@ -275,6 +275,8 @@ pub struct M3State {
     /// on first reflex use) and reused by the reflex runtime so there is never
     /// a second open of the same path within this process.
     pub db: Option<Arc<Db>>,
+    pub storage_gc_task: Option<GcTask>,
+    pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
     pub reflex_last_error: Option<String>,
     pub profile_last_error: Option<String>,
@@ -294,6 +296,14 @@ pub struct M3State {
     /// detector and the `intent_detect_tick` tool so transitions have one
     /// source of truth. Cheap `Arc` clone hands a handle to either driver.
     pub intent_tracker: intent_events::SharedIntentTracker,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StorageMaintenanceReadback {
+    pub gc_task_running: bool,
+    pub pressure_task_running: bool,
+    pub gc_task: GcTaskReadback,
+    pub pressure_probe: PressureProbeReadback,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +424,8 @@ impl M3State {
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
             db: None,
+            storage_gc_task: None,
+            storage_pressure_task: None,
             storage_last_error: None,
             reflex_last_error: None,
             profile_last_error: None,
@@ -547,6 +559,75 @@ impl M3State {
         }
     }
 
+    pub fn ensure_storage_maintenance_tasks(
+        &mut self,
+    ) -> std::result::Result<(), synapse_storage::StorageError> {
+        let db = self.ensure_storage()?;
+        if self.storage_pressure_task.is_none() {
+            let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
+            {
+                db.run_pressure_check_with_free_bytes_sample(free_bytes)
+            } else {
+                db.run_pressure_check_once()
+            };
+            if let Err(error) = pressure_result {
+                self.storage_last_error = Some(format!("storage pressure startup probe: {error}"));
+                return Err(error);
+            }
+            match db.spawn_pressure_task() {
+                Ok(task) => {
+                    self.storage_pressure_task = Some(task);
+                }
+                Err(error) => {
+                    self.storage_last_error = Some(format!("storage pressure task start: {error}"));
+                    return Err(error);
+                }
+            }
+        }
+        if self.storage_gc_task.is_none() {
+            match db.spawn_gc_task() {
+                Ok(task) => {
+                    self.storage_gc_task = Some(task);
+                }
+                Err(error) => {
+                    self.storage_last_error = Some(format!("storage GC task start: {error}"));
+                    return Err(error);
+                }
+            }
+        }
+        self.storage_last_error = None;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn storage_maintenance_readback(&self) -> StorageMaintenanceReadback {
+        let gc_task = self
+            .storage_gc_task
+            .as_ref()
+            .map(GcTask::readback)
+            .unwrap_or_default();
+        let pressure_task_running = self
+            .storage_pressure_task
+            .as_ref()
+            .is_some_and(PressureTask::running);
+        let pressure_probe = self
+            .db
+            .as_ref()
+            .map_or_else(PressureProbeReadback::default, |db| {
+                db.pressure_probe_readback()
+                    .unwrap_or_else(|error| PressureProbeReadback {
+                        last_error: Some(error.to_string()),
+                        ..PressureProbeReadback::default()
+                    })
+            });
+        StorageMaintenanceReadback {
+            gc_task_running: gc_task.running,
+            pressure_task_running,
+            gc_task,
+            pressure_probe,
+        }
+    }
+
     pub fn ensure_reflex_runtime(
         &mut self,
         action_handle: ActionHandle,
@@ -561,13 +642,8 @@ impl M3State {
             });
         }
 
+        self.ensure_storage_maintenance_tasks()?;
         let db = self.ensure_storage()?;
-        if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
-            && let Err(error) = db.run_pressure_check_with_free_bytes_sample(free_bytes)
-        {
-            self.storage_last_error = Some(error.to_string());
-            return Err(error.into());
-        }
         let scheduler_config = synapse_reflex::SchedulerConfig {
             force_degraded: self.reflex_force_degraded,
             ..synapse_reflex::SchedulerConfig::default()

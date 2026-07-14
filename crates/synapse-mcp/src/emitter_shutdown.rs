@@ -695,14 +695,17 @@ async fn wait_for_m2_emitter_done_with_timeout(
     .await;
 
     let snapshot = match wait_result {
-        Ok(Ok(())) => match done.borrow().as_ref().cloned() {
-            Some(snapshot) => snapshot,
-            None => {
-                let error = M2EmitterDrainError::ChannelClosed { transport, source };
-                report_error(&error);
-                return Err(error);
+        Ok(Ok(())) => {
+            let done_snapshot = done.borrow().as_ref().cloned();
+            match done_snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    let error = M2EmitterDrainError::ChannelClosed { transport, source };
+                    report_error(&error);
+                    return Err(error);
+                }
             }
-        },
+        }
         Ok(Err(error)) => {
             report_error(&error);
             return Err(error);

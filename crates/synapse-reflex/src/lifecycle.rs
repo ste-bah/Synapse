@@ -212,7 +212,7 @@ impl ReflexRuntime {
         self.disable_all_with_reason("release_all")
     }
 
-    /// Disables one exact reflex registered by the ActionHandle combo bridge
+    /// Disables one exact reflex registered by the `ActionHandle` combo bridge
     /// when an operator-panic epoch crosses its registration critical section.
     /// The caller holds the runtime lock across register, epoch recheck, and
     /// this rollback, so no later K2 sweep can miss the generated id.

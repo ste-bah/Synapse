@@ -1,5 +1,7 @@
 //! Public browser facades for the <=40 MCP tool surface.
 
+use std::sync::Arc;
+
 use super::{
     BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
     BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserConsoleMessagesParams,
@@ -23,7 +25,7 @@ use super::{
 };
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use synapse_core::error_codes;
 
 const BROWSER_CAPTURE_TOOL: &str = "browser_capture";
@@ -207,6 +209,78 @@ pub struct BrowserDebuggerResponse {
     pub drop: Option<BrowserDndResponse>,
 }
 
+fn loose_object_schema(description: &'static str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": true
+    })
+}
+
+fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation"],
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "evaluate",
+                    "console_messages",
+                    "reload_bridge",
+                    "pdf",
+                    "file_upload",
+                    "dialog",
+                    "add_init_script",
+                    "add_script_tag",
+                    "add_style_tag",
+                    "network",
+                    "network_har",
+                    "network_overrides",
+                    "route",
+                    "emulate",
+                    "expose_binding",
+                    "drag",
+                    "drop"
+                ],
+                "description": "Debugger facade operation. Supply exactly the same-named spec object."
+            },
+            "cdp_target_id": {
+                "type": "string",
+                "description": "Optional top-level target alias folded into the selected operation spec; reload_bridge rejects it."
+            },
+            "window_hwnd": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4_294_967_295_u64,
+                "description": "Optional browser window HWND folded into the selected operation spec."
+            },
+            "evaluate": loose_object_schema("Spec for operation=evaluate."),
+            "console_messages": loose_object_schema("Spec for operation=console_messages."),
+            "reload_bridge": loose_object_schema("Spec for operation=reload_bridge."),
+            "pdf": loose_object_schema("Spec for operation=pdf."),
+            "file_upload": loose_object_schema("Spec for operation=file_upload."),
+            "dialog": loose_object_schema("Spec for operation=dialog."),
+            "add_init_script": loose_object_schema("Spec for operation=add_init_script."),
+            "add_script_tag": loose_object_schema("Spec for operation=add_script_tag."),
+            "add_style_tag": loose_object_schema("Spec for operation=add_style_tag."),
+            "network": loose_object_schema("Spec for operation=network."),
+            "network_har": loose_object_schema("Spec for operation=network_har."),
+            "network_overrides": loose_object_schema("Spec for operation=network_overrides."),
+            "route": loose_object_schema("Spec for operation=route."),
+            "emulate": loose_object_schema("Spec for operation=emulate."),
+            "expose_binding": loose_object_schema("Spec for operation=expose_binding."),
+            "drag": loose_object_schema("Spec for operation=drag."),
+            "drop": loose_object_schema("Spec for operation=drop.")
+        }
+    });
+    match schema {
+        Value::Object(map) => Arc::new(map),
+        _ => Arc::new(Map::new()),
+    }
+}
+
 #[tool_router(router = browser_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
@@ -278,7 +352,8 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Stable browser debugger facade. The tool name is visible in the default <=40 surface so clients with static tool namespaces can keep one callable route; each operation still fails closed with TOOL_PROFILE_POLICY_DENIED until this MCP session is explicitly set to browser_debugger (or a broader admin profile). Routes typed operations to target-scoped chrome.debugger/CDP browser tools: evaluate, console_messages, reload_bridge, pdf, file_upload, dialog, script/style injection, network/HAR/overrides/route, emulation, binding, drag, and drop. Exactly one operation-specific spec is accepted."
+        description = "Stable browser debugger facade. Visible for static clients, but operations fail closed until this session is set to browser_debugger. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
+        input_schema = browser_debugger_input_schema()
     )]
     pub async fn browser_debugger(
         &self,

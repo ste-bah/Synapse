@@ -1121,14 +1121,19 @@ fn kernel_parent_process_snapshot() -> anyhow::Result<Option<KernelParentProcess
                 .is_some_and(|end| end <= used_bytes),
             "native process snapshot entry at offset {offset} exceeds returned length {used_bytes}"
         );
-        // SAFETY: bounds were checked above, the Vec<usize> base is pointer
-        // aligned, and Windows guarantees aligned NextEntryOffset entries.
+        // SAFETY: bounds were checked above. Copy the entry bytes into an
+        // aligned local value because the Windows byte stream's alignment is
+        // an external ABI fact, not a Rust type-system guarantee carried by
+        // the `u8` offset pointer.
         let process = unsafe {
-            &*buffer
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset)
-                .cast::<SYSTEM_PROCESS_INFORMATION>()
+            let process_bytes = buffer.as_ptr().cast::<u8>().add(offset);
+            let mut process = std::mem::MaybeUninit::<SYSTEM_PROCESS_INFORMATION>::uninit();
+            std::ptr::copy_nonoverlapping(
+                process_bytes,
+                process.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>(),
+            );
+            process.assume_init()
         };
         let pid_value = process.UniqueProcessId.0 as usize;
         if pid_value != 0 {

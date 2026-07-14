@@ -159,9 +159,13 @@ pub struct StorageGcCfReport {
     pub after_value: u64,
     pub before_estimated_num_keys: Option<u64>,
     pub after_estimated_num_keys: Option<u64>,
+    pub examined_rows: u64,
+    pub scan_limited: bool,
     pub evicted_rows: u64,
     pub hard_cap_reached: bool,
     pub hard_cap_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_skipped_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -245,8 +249,8 @@ pub fn inspect_storage_summary(
     let (cf_sizes, missing_cf_size_estimates) = runtime
         .storage_cf_live_data_size_estimates()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let cf_row_counts = runtime
-        .storage_cf_row_counts()
+    let (cf_row_counts, missing_cf_row_count_estimates) = runtime
+        .storage_cf_estimated_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageSummaryResponse {
         schema_version: runtime.schema_version(),
@@ -258,11 +262,11 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: "rocksdb_live_data_size_estimates_exact_row_counts".to_owned(),
+        metrics_mode: "rocksdb_live_data_size_estimates_estimated_row_counts".to_owned(),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
-        missing_cf_row_count_estimates: Vec::new(),
+        missing_cf_row_count_estimates,
     })
 }
 
@@ -354,21 +358,13 @@ pub fn run_storage_gc_once(
     reject_audit_retention_fields(params)?;
     let cf_name = probe_writable_cf(&params.cf_name)?;
     let runtime = lock_runtime(runtime)?;
-    let before = cf_count(
-        &runtime
-            .storage_cf_row_counts()
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
-        cf_name,
-    );
     let report = runtime
         .storage_run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let after = cf_count(
-        &runtime
-            .storage_cf_row_counts()
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
-        cf_name,
-    );
+    let (before, after) = report
+        .cf(cf_name)
+        .map(|cf_report| (cf_report.before_value, cf_report.after_value))
+        .unwrap_or((0, 0));
     drop(runtime);
     Ok(gc_response(cf_name, before, after, report))
 }
@@ -387,8 +383,8 @@ pub fn apply_storage_pressure_sample(
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let cf_row_counts = runtime
-        .storage_cf_row_counts()
+    let (cf_row_counts, _missing_cf_row_count_estimates) = runtime
+        .storage_cf_estimated_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     drop(runtime);
     Ok(StoragePressureSampleResponse {
@@ -743,9 +739,12 @@ fn gc_response(
                 after_value: report.after_value,
                 before_estimated_num_keys: report.before_estimated_num_keys,
                 after_estimated_num_keys: report.after_estimated_num_keys,
+                examined_rows: report.examined_rows,
+                scan_limited: report.scan_limited,
                 evicted_rows: report.evicted_rows,
                 hard_cap_reached: report.hard_cap_reached,
                 hard_cap_code: report.hard_cap_code.map(str::to_owned),
+                eviction_skipped_reason: report.eviction_skipped_reason.map(str::to_owned),
             })
             .collect(),
         audit_retention_report_key: None,

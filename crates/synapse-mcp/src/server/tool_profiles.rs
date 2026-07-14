@@ -28,6 +28,7 @@ const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
 /// grant/revoke response so a facade profile is never mistaken for a grant.
 const PROFILE_INDEPENDENT_OF_GRANTS_NOTE: &str = "the selected facade tool-visibility profile (e.g. full_capability) is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself; reality-write requires an explicit startup grant (SYNAPSE_MCP_ALLOWED_PERMISSIONS listing WRITE_STORAGE) or a runtime profile operation=grant_reality_write overlay";
 pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
+pub(crate) const PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES: usize = 200_000;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
 const PUBLIC_TOOL_REGISTRY_OPERATION: &str = "validate_public_tool_registry";
@@ -7409,5 +7410,41 @@ mod tests {
             eprintln!("TOOL_SURFACE longest_desc {name} {bytes}");
         }
         eprintln!("TOOL_SURFACE written_to={out_path}");
+    }
+
+    #[test]
+    fn full_capability_openai_tool_payload_stays_under_budget() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "tool-surface-budget-local-session";
+        seed_session_client(&service, session_id, "synapse-local-model-agent");
+        let tools = service
+            .tools_for_session_profile(Some(session_id))
+            .expect("full-capability facade tool surface");
+        let openai_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name.as_ref(),
+                        "description": tool
+                            .description
+                            .as_ref()
+                            .map(|desc| desc.as_ref())
+                            .unwrap_or("Synapse MCP tool"),
+                        "parameters": serde_json::Value::Object((*tool.input_schema).clone()),
+                    }
+                })
+            })
+            .collect();
+        let payload =
+            serde_json::to_string(&openai_tools).expect("serialize local-agent OpenAI tools[]");
+        assert!(
+            payload.len() <= PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES,
+            "OpenAI tools[] payload {} bytes exceeds budget {}; compact schemas/descriptions before shipping",
+            payload.len(),
+            PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES
+        );
     }
 }

@@ -73,7 +73,7 @@ fn durable_init_script_key(endpoint: &str, target_id: &str, identifier: &str) ->
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub(crate) struct CdpDurableInitScriptDrainReadback {
+pub struct CdpDurableInitScriptDrainReadback {
     pub found: usize,
     pub removed: usize,
     pub failures: Vec<String>,
@@ -1658,7 +1658,7 @@ struct PersistedCdpMutationOwnerSnapshot {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CdpPersistedMutationOwnerReadback {
+pub struct CdpPersistedMutationOwnerReadback {
     pub total_count: usize,
     pub input_count: usize,
     pub evaluate_count: usize,
@@ -1667,7 +1667,7 @@ pub(crate) struct CdpPersistedMutationOwnerReadback {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CdpPersistedMutationOwnerDrainReadback {
+pub struct CdpPersistedMutationOwnerDrainReadback {
     pub total_found: usize,
     pub input_found: usize,
     pub evaluate_found: usize,
@@ -2067,7 +2067,8 @@ fn read_persisted_cdp_mutation_owner_snapshot() -> PersistedCdpMutationOwnerSnap
     read_persisted_cdp_mutation_owner_snapshot_from_root(&root)
 }
 
-pub(crate) fn persisted_cdp_mutation_owner_readback() -> CdpPersistedMutationOwnerReadback {
+#[must_use]
+pub fn persisted_cdp_mutation_owner_readback() -> CdpPersistedMutationOwnerReadback {
     let snapshot = read_persisted_cdp_mutation_owner_snapshot();
     let mut readback = CdpPersistedMutationOwnerReadback {
         total_count: snapshot.candidate_count,
@@ -2466,7 +2467,7 @@ fn record_drained_owner(
     }
 }
 
-pub(crate) async fn persisted_cdp_mutation_owners_disable_and_drain()
+pub async fn persisted_cdp_mutation_owners_disable_and_drain()
 -> CdpPersistedMutationOwnerDrainReadback {
     let snapshot = read_persisted_cdp_mutation_owner_snapshot();
     let mut drain = CdpPersistedMutationOwnerDrainReadback {
@@ -2503,9 +2504,7 @@ pub(crate) async fn persisted_cdp_mutation_owners_disable_and_drain()
                 continue;
             }
         };
-        let terminal_owner = if !present {
-            Ok(owner.clone())
-        } else {
+        let terminal_owner = if present {
             match &owner.mutation {
                 PersistedCdpMutationKind::Mouse { .. }
                 | PersistedCdpMutationKind::Keys { .. }
@@ -2592,6 +2591,8 @@ pub(crate) async fn persisted_cdp_mutation_owners_disable_and_drain()
                     }
                 }
             }
+        } else {
+            Ok(owner.clone())
         };
         match terminal_owner {
             Ok(terminal_owner) => match resolve_persisted_cdp_mutation_owner(&terminal_owner) {
@@ -2697,7 +2698,7 @@ where
 /// crash-safe owner rows are the restart-surviving source of truth; this count
 /// is cleared only as K2 terminally reconciles matching rows.
 #[must_use]
-pub(crate) fn unresolved_raw_cdp_evaluate_timeout_count() -> u64 {
+pub fn unresolved_raw_cdp_evaluate_timeout_count() -> u64 {
     UNRESOLVED_RAW_CDP_EVALUATE_TIMEOUTS.load(Ordering::SeqCst)
 }
 
@@ -2705,7 +2706,7 @@ pub(crate) fn unresolved_raw_cdp_evaluate_timeout_count() -> u64 {
 /// Each physical press/start is preceded by a crash-safe owner row, so K2 can
 /// retry the exact release (or reload) even after daemon restart.
 #[must_use]
-pub(crate) fn unresolved_raw_cdp_input_owner_count() -> u64 {
+pub fn unresolved_raw_cdp_input_owner_count() -> u64 {
     UNRESOLVED_RAW_CDP_INPUT_OWNERS.load(Ordering::SeqCst)
 }
 
@@ -3283,15 +3284,14 @@ async fn cdp_remove_init_script_target_physical(
     .await
 }
 
-pub(crate) fn durable_init_script_active_count_readback() -> Result<usize, String> {
+pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
     durable_init_script_registry()
         .lock()
         .map(|entries| entries.len())
         .map_err(|_| "durable init-script registry lock is poisoned".to_owned())
 }
 
-pub(crate) async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback
-{
+pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
     let entries = match durable_init_script_registry().lock() {
         Ok(mut entries) => std::mem::take(&mut *entries),
         Err(_) => {

@@ -21,12 +21,15 @@ use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
     Direction, IteratorMode, Options, SliceTransform, WriteBatch,
 };
-use synapse_core::error_codes;
+use synapse_core::{
+    error_codes,
+    retention::{DEFAULTS, RetentionTtl},
+};
 
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
-pub use gc::{GcCfReport, GcReport, GcTask};
-pub use pressure::{DiskPressureLevel, PressureReport, PressureTask};
+pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
+pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
 
 const MIB: usize = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * MIB;
@@ -41,6 +44,8 @@ const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
+/// One column-family batch: CF name plus raw rows.
+pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
 /// Per-CF integer storage metrics plus CFs whose `RocksDB` property was absent.
@@ -247,6 +252,76 @@ impl Db {
             })
     }
 
+    /// Writes key/value batches across multiple column families in one `RocksDB`
+    /// write batch while bypassing the pressure ingestion gate.
+    ///
+    /// Callers must perform any required pressure admission check before using
+    /// this helper. It exists for coupled rows where a primary row and its
+    /// secondary index must appear atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when any column family is missing
+    /// or `RocksDB` rejects the multi-CF write batch/flush.
+    #[tracing::instrument(skip_all)]
+    pub fn put_cf_batches_pressure_bypass(
+        &self,
+        batches: Vec<CfWriteBatch<'_>>,
+    ) -> StorageResult<()> {
+        if batches.iter().all(|(_cf_name, rows)| rows.is_empty()) {
+            return Ok(());
+        }
+        let mut handles = Vec::with_capacity(batches.len());
+        for (cf_name, _rows) in &batches {
+            let handle =
+                self.inner
+                    .cf_handle(cf_name)
+                    .ok_or_else(|| StorageError::WriteFailed {
+                        cf_name: (*cf_name).to_owned(),
+                        detail: "column family handle missing".to_owned(),
+                    })?;
+            handles.push(handle);
+        }
+        let mut batch = WriteBatch::default();
+        for ((_cf_name, rows), handle) in batches.iter().zip(&handles) {
+            for (key, value) in rows {
+                batch.put_cf(handle, key, value);
+            }
+        }
+        self.inner
+            .write(batch)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: "<multi-cf>".to_owned(),
+                detail: source.to_string(),
+            })?;
+        for ((cf_name, _rows), handle) in batches.into_iter().zip(handles) {
+            self.inner
+                .flush_cf(&handle)
+                .map_err(|source| StorageError::WriteFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: source.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Reads one key from a column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing or
+    /// `RocksDB` rejects the point lookup.
+    #[tracing::instrument(skip_all, fields(cf_name, key_len = key.len()))]
+    pub fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        let handle = self.cf_handle(cf_name)?;
+        self.inner
+            .get_cf(&handle, key)
+            .map_err(|source| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })
+    }
+
     /// Applies key deletes and key/value writes to one column family in a
     /// single synchronous `RocksDB` batch while bypassing pressure shedding.
     ///
@@ -435,6 +510,16 @@ impl Db {
     #[tracing::instrument(skip_all)]
     pub fn pressure_transition_codes(&self) -> StorageResult<Vec<&'static str>> {
         self.pressure.transition_codes()
+    }
+
+    /// Returns the last successfully observed disk-pressure probe readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] if the pressure state cannot be read.
+    #[tracing::instrument(skip_all)]
+    pub fn pressure_probe_readback(&self) -> StorageResult<PressureProbeReadback> {
+        self.pressure.probe_readback()
     }
 
     /// Returns approximate logical bytes currently stored in each Synapse column family.
@@ -817,9 +902,25 @@ fn cf_options(name: &'static str) -> Options {
         _ => {}
     }
 
+    if cf_has_ttl(name) {
+        // RocksDB TTL filters only remove expired entries during compaction.
+        // Apply periodic compaction to every TTL-backed CF so cold files still
+        // traverse the filter without a foreground full-CF scan.
+        options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
+    }
+
     compaction::install_ttl_filter(&mut options, name);
     apply_block_cache(&mut options);
     options
+}
+
+fn cf_has_ttl(name: &'static str) -> bool {
+    DEFAULTS
+        .iter()
+        .find(|default| default.cf == name)
+        .is_some_and(|default| {
+            matches!(default.ttl, RetentionTtl::Hours(_) | RetentionTtl::Days(_))
+        })
 }
 
 fn apply_block_cache(options: &mut Options) {

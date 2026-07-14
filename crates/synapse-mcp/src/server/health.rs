@@ -54,6 +54,50 @@ fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String 
     .to_owned()
 }
 
+fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !readback.gc_task_running {
+        reasons.push("storage GC task is not running".to_owned());
+    }
+    if !readback.pressure_task_running {
+        reasons.push("storage pressure task is not running".to_owned());
+    }
+    if !readback.pressure_probe.observed {
+        reasons.push("storage pressure probe has not completed successfully".to_owned());
+    }
+    if let Some(error) = &readback.gc_task.last_error {
+        reasons.push(format!("storage GC last_error={error}"));
+    }
+    if let Some(error) = &readback.pressure_probe.last_error {
+        reasons.push(format!("storage pressure last_error={error}"));
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+fn apply_storage_maintenance_fields(
+    health: &mut SubsystemHealth,
+    readback: &crate::m3::StorageMaintenanceReadback,
+) {
+    health.storage_gc_task_running = Some(readback.gc_task_running);
+    health.storage_pressure_task_running = Some(readback.pressure_task_running);
+    health.storage_pressure_probe_observed = Some(readback.pressure_probe.observed);
+    health.storage_pressure_last_free_bytes = readback.pressure_probe.last_free_bytes;
+    health.storage_pressure_last_level = readback
+        .pressure_probe
+        .last_level
+        .map(|level| format!("{level:?}"));
+    health.storage_gc_last_started_unix_ms = readback.gc_task.last_started_unix_ms;
+    health.storage_gc_last_completed_unix_ms = readback.gc_task.last_completed_unix_ms;
+    health.storage_gc_last_duration_ms = readback.gc_task.last_duration_ms;
+    health.storage_gc_last_error = readback.gc_task.last_error.clone();
+    health.storage_gc_last_unsupported_policy_skips =
+        readback.gc_task.last_unsupported_policy_skips.clone();
+    health.storage_pressure_last_started_unix_ms = readback.pressure_probe.last_started_unix_ms;
+    health.storage_pressure_last_completed_unix_ms = readback.pressure_probe.last_completed_unix_ms;
+    health.storage_pressure_last_duration_ms = readback.pressure_probe.last_duration_ms;
+    health.storage_pressure_last_error = readback.pressure_probe.last_error.clone();
+}
+
 impl SynapseService {
     #[cfg(test)]
     pub(crate) fn health_payload(&self) -> Health {
@@ -313,62 +357,101 @@ impl SynapseService {
                     .db_path
                     .as_ref()
                     .map(|path| path.display().to_string());
+                let maintenance = state.storage_maintenance_readback();
                 if let Some(error) = &state.storage_last_error {
-                    return SubsystemHealth {
+                    let mut health = SubsystemHealth {
                         status: "error".to_owned(),
                         detail: Some(error.clone()),
                         db_path,
                         ..SubsystemHealth::default()
                     };
+                    apply_storage_maintenance_fields(&mut health, &maintenance);
+                    return health;
                 }
                 let Some(runtime) = &state.reflex_runtime else {
                     if state.db.is_some() {
-                        return SubsystemHealth {
-                            status: "ok".to_owned(),
-                            detail: Some(
-                                "storage opened at daemon startup (reflex runtime idle)".to_owned(),
-                            ),
+                        let maintenance_error = storage_maintenance_error(&maintenance);
+                        let cf_sizes = state.db.as_ref().and_then(|db| {
+                            db.cf_live_data_size_estimates()
+                                .ok()
+                                .map(|(sizes, _)| sizes)
+                        });
+                        let mut health = SubsystemHealth {
+                            status: if maintenance_error.is_some() {
+                                "error".to_owned()
+                            } else {
+                                "ok".to_owned()
+                            },
+                            detail: Some(match maintenance_error {
+                                Some(error) => format!(
+                                    "storage opened at daemon startup (reflex runtime idle); maintenance unhealthy: {error}"
+                                ),
+                                None => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
+                            }),
                             db_path,
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
+                            cf_sizes,
                             ..SubsystemHealth::default()
                         };
+                        apply_storage_maintenance_fields(&mut health, &maintenance);
+                        return health;
                     }
-                    return SubsystemHealth {
+                    let mut health = SubsystemHealth {
                         status: "initializing".to_owned(),
                         detail: Some("storage opens on first reflex tool call".to_owned()),
                         db_path,
                         ..SubsystemHealth::default()
                     };
+                    apply_storage_maintenance_fields(&mut health, &maintenance);
+                    return health;
                 };
                 match runtime.lock() {
                     Ok(runtime) => match runtime.storage_cf_live_data_size_estimates() {
-                        Ok(cf_sizes) => SubsystemHealth {
-                            status: storage_pressure_status(runtime.storage_pressure_level()),
-                            detail: Some(
-                                "storage runtime initialized; cf_sizes use RocksDB live-data estimates"
-                                    .to_owned(),
-                            ),
-                            db_path: Some(runtime.storage_path().display().to_string()),
-                            schema_version: Some(runtime.schema_version()),
-                            cf_sizes: Some(cf_sizes.0),
-                            ..SubsystemHealth::default()
-                        },
-                        Err(error) => SubsystemHealth {
+                        Ok(cf_sizes) => {
+                            let maintenance_error = storage_maintenance_error(&maintenance);
+                            let mut health = SubsystemHealth {
+                                status: maintenance_error.as_ref().map_or_else(
+                                    || storage_pressure_status(runtime.storage_pressure_level()),
+                                    |_| "error".to_owned(),
+                                ),
+                                detail: Some(match maintenance_error {
+                                    Some(error) => format!(
+                                        "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance unhealthy: {error}"
+                                    ),
+                                    None => "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance tasks running and pressure probe observed".to_owned(),
+                                }),
+                                db_path: Some(runtime.storage_path().display().to_string()),
+                                schema_version: Some(runtime.schema_version()),
+                                cf_sizes: Some(cf_sizes.0),
+                                ..SubsystemHealth::default()
+                            };
+                            apply_storage_maintenance_fields(&mut health, &maintenance);
+                            health
+                        }
+                        Err(error) => {
+                            let mut health = SubsystemHealth {
+                                status: "error".to_owned(),
+                                detail: Some(error.to_string()),
+                                db_path: Some(runtime.storage_path().display().to_string()),
+                                schema_version: Some(runtime.schema_version()),
+                                ..SubsystemHealth::default()
+                            };
+                            apply_storage_maintenance_fields(&mut health, &maintenance);
+                            health
+                        }
+                    },
+                    Err(_err) => {
+                        let mut health = SubsystemHealth {
                             status: "error".to_owned(),
-                            detail: Some(error.to_string()),
-                            db_path: Some(runtime.storage_path().display().to_string()),
-                            schema_version: Some(runtime.schema_version()),
+                            detail: Some(
+                                "reflex runtime lock poisoned while reading storage".to_owned(),
+                            ),
+                            db_path,
                             ..SubsystemHealth::default()
-                        },
-                    },
-                    Err(_err) => SubsystemHealth {
-                        status: "error".to_owned(),
-                        detail: Some(
-                            "reflex runtime lock poisoned while reading storage".to_owned(),
-                        ),
-                        db_path,
-                        ..SubsystemHealth::default()
-                    },
+                        };
+                        apply_storage_maintenance_fields(&mut health, &maintenance);
+                        health
+                    }
                 }
             }
             Err(_err) => state_lock_health(),
@@ -1023,6 +1106,92 @@ mod tests {
             compact_bridge.detail.is_none(),
             "compact chrome_bridge drops its detail string"
         );
+    }
+
+    #[test]
+    fn storage_health_errors_when_open_db_has_no_maintenance_tasks() {
+        let temp = tempfile::tempdir().expect("temp db dir");
+        let service = SynapseService::new();
+        {
+            let m3_state = service.m3_state_handle();
+            let mut state = m3_state.lock().expect("m3 state lock");
+            state.db_path = Some(temp.path().join("db"));
+            state.ensure_storage().expect("open storage");
+        }
+
+        let payload = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Full,
+        );
+        let storage = &payload.subsystems["storage"];
+        println!(
+            "evidence=storage_health_no_maintenance ok={} status={} gc_running={:?} pressure_running={:?} pressure_observed={:?} detail={:?}",
+            payload.ok,
+            storage.status,
+            storage.storage_gc_task_running,
+            storage.storage_pressure_task_running,
+            storage.storage_pressure_probe_observed,
+            storage.detail
+        );
+
+        assert!(!payload.ok);
+        assert_eq!(storage.status, "error");
+        assert_eq!(storage.storage_gc_task_running, Some(false));
+        assert_eq!(storage.storage_pressure_task_running, Some(false));
+        assert_eq!(storage.storage_pressure_probe_observed, Some(false));
+        assert!(
+            storage
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("maintenance unhealthy"))
+        );
+        assert!(storage.cf_sizes.is_some());
+    }
+
+    #[tokio::test]
+    async fn storage_health_reports_retained_maintenance_task_readback() {
+        let temp = tempfile::tempdir().expect("temp db dir");
+        let service = SynapseService::new();
+        {
+            let m3_state = service.m3_state_handle();
+            let mut state = m3_state.lock().expect("m3 state lock");
+            state.db_path = Some(temp.path().join("db"));
+            state
+                .ensure_storage_maintenance_tasks()
+                .expect("start storage maintenance");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let payload = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Full,
+        );
+        let storage = &payload.subsystems["storage"];
+        println!(
+            "evidence=storage_health_maintenance ok={} status={} gc_running={:?} pressure_running={:?} pressure_observed={:?} pressure_free={:?} pressure_level={:?} detail={:?}",
+            payload.ok,
+            storage.status,
+            storage.storage_gc_task_running,
+            storage.storage_pressure_task_running,
+            storage.storage_pressure_probe_observed,
+            storage.storage_pressure_last_free_bytes,
+            storage.storage_pressure_last_level,
+            storage.detail
+        );
+
+        assert_eq!(storage.status, "ok");
+        assert_eq!(storage.storage_gc_task_running, Some(true));
+        assert_eq!(storage.storage_pressure_task_running, Some(true));
+        assert_eq!(storage.storage_pressure_probe_observed, Some(true));
+        assert!(storage.storage_pressure_last_free_bytes.is_some());
+        assert_eq!(
+            storage.storage_pressure_last_level.as_deref(),
+            Some("Normal")
+        );
+        assert_eq!(storage.storage_gc_last_error, None);
+        assert_eq!(storage.storage_pressure_last_error, None);
     }
 
     #[test]

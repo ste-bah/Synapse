@@ -374,7 +374,7 @@ impl WinEventSubscription {
                     expected_hook_count: Some(self.readback.hook_count),
                     join: None,
                     exit_report: exit_report_receiver,
-                    terminal_report: exit_report.clone(),
+                    terminal_report: exit_report,
                     failures: retained_failures,
                 });
             }
@@ -853,12 +853,12 @@ pub fn retained_live_owner_count() -> usize {
         Ok(state) => usize::from(win_event_delivery_slot_is_active(&state)),
         // A poisoned or contended global slot is not proof of absence. Count it
         // as unsafe so the existing daemon lifetime gate fails closed.
-        Err(TryLockError::Poisoned(_)) | Err(TryLockError::WouldBlock) => 1,
+        Err(TryLockError::Poisoned(_) | TryLockError::WouldBlock) => 1,
     };
     retained.max(active_or_unobservable_slot)
 }
 
-fn win_event_delivery_slot_is_active(state: &WinEventDeliveryState) -> bool {
+const fn win_event_delivery_slot_is_active(state: &WinEventDeliveryState) -> bool {
     state.subscription_owner_id.is_some() || state.sender.is_some()
 }
 
@@ -1388,9 +1388,7 @@ mod ownership_tests {
         });
 
         let readback = wake_win_event_owner_before_stop(&wake_tx, Some(41), Duration::from_secs(1));
-        if owner.join().is_err() {
-            panic!("synthetic WinEvent owner panicked");
-        }
+        assert!(owner.join().is_ok(), "synthetic WinEvent owner panicked");
 
         assert!(readback.exact_owner_acknowledged(Some(41)), "{readback:?}");
         assert!(!readback.exact_owner_acknowledged(Some(42)), "{readback:?}");

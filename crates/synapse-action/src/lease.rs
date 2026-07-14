@@ -93,10 +93,11 @@ pub struct LeaseStatus {
 }
 
 /// One-lock safety readback of the visible lease plus its private physical
-/// panic-generation tag. Consumers must use this instead of composing
-/// [`status`] and [`operator_panic_lease_generation`] across two lock
-/// acquisitions, because a concurrent exact finalizer can change the lease
-/// between those reads.
+/// panic-generation tag.
+///
+/// Consumers must use this instead of composing [`status`] and
+/// [`operator_panic_lease_generation`] across two lock acquisitions, because a
+/// concurrent exact finalizer can change the lease between those reads.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LeaseSafetySnapshot {
     pub status: LeaseStatus,
@@ -1040,10 +1041,11 @@ mod tests {
     #[test]
     fn tagged_panic_lease_cannot_ttl_expire_while_safety_transaction_is_pending() {
         let now = Instant::now();
+        let one_minute_ago = now.checked_sub(Duration::from_mins(1)).unwrap();
         let tagged = InputLease {
             owner_session_id: OPERATOR_LEASE_OWNER_SESSION_ID.to_owned(),
-            acquired_at: now - Duration::from_secs(60),
-            renewed_at: now - Duration::from_secs(60),
+            acquired_at: one_minute_ago,
+            renewed_at: one_minute_ago,
             ttl: ttl_from_ms(OPERATOR_PREEMPT_LEASE_TTL_MS),
             operator_panic_generation: Some(91),
         };

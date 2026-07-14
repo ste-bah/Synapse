@@ -54,6 +54,80 @@ pub(super) fn read_lifecycle_tail(
     params: &AuditLifecycleTailParams,
 ) -> Result<AuditLifecycleTailResponse, ErrorData> {
     validate_lifecycle_params(params)?;
+    let segment_paths =
+        daemon_lifecycle::lifecycle_ledger_paths_oldest_first(path).map_err(|error| {
+            ErrorData::new(
+                ErrorCode(-32099),
+                format!(
+                    "audit operation=lifecycle_tail could not discover daemon lifecycle ledger segments for {}: {error:#}",
+                    path.display()
+                ),
+                Some(json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "tool": AUDIT_TOOL,
+                    "operation": "lifecycle_tail",
+                    "source_id": path.display().to_string(),
+                    "source_of_truth": AUDIT_SOT,
+                    "remediation": "inspect daemon lifecycle segment paths and file permissions",
+                })),
+            )
+        })?;
+    if segment_paths.is_empty() {
+        File::open(path).map_err(|error| {
+            io_error(
+                AUDIT_TOOL,
+                "lifecycle_tail",
+                &path.display().to_string(),
+                AUDIT_SOT,
+                error,
+                "inspect daemon lifecycle paths and file permissions",
+            )
+        })?;
+    }
+    let mut state = LifecycleTailState::new(params);
+    for segment_path in &segment_paths {
+        read_lifecycle_segment(segment_path, params, &mut state)?;
+    }
+    let rows: Vec<_> = state.rows.into_iter().rev().collect();
+    Ok(AuditLifecycleTailResponse {
+        path: path.display().to_string(),
+        segment_count: segment_paths.len(),
+        limit: params.limit,
+        max_line_bytes: params.max_line_bytes,
+        total_lines_read: state.total_lines_read,
+        matched_lines_seen: state.matched_lines_seen,
+        oversized_lines_seen: state.oversized_lines_seen,
+        oversized_lines_skipped: state.oversized_lines_skipped,
+        returned_count: rows.len(),
+        rows,
+    })
+}
+
+struct LifecycleTailState {
+    total_lines_read: u64,
+    matched_lines_seen: u64,
+    oversized_lines_seen: u64,
+    oversized_lines_skipped: u64,
+    rows: VecDeque<AuditLifecycleRowSummary>,
+}
+
+impl LifecycleTailState {
+    fn new(params: &AuditLifecycleTailParams) -> Self {
+        Self {
+            total_lines_read: 0,
+            matched_lines_seen: 0,
+            oversized_lines_seen: 0,
+            oversized_lines_skipped: 0,
+            rows: VecDeque::with_capacity(params.limit),
+        }
+    }
+}
+
+fn read_lifecycle_segment(
+    path: &Path,
+    params: &AuditLifecycleTailParams,
+    state: &mut LifecycleTailState,
+) -> Result<(), ErrorData> {
     let file = File::open(path).map_err(|error| {
         io_error(
             AUDIT_TOOL,
@@ -65,11 +139,6 @@ pub(super) fn read_lifecycle_tail(
         )
     })?;
     let reader = BufReader::new(file);
-    let mut total_lines_read = 0_u64;
-    let mut matched_lines_seen = 0_u64;
-    let mut oversized_lines_seen = 0_u64;
-    let mut oversized_lines_skipped = 0_u64;
-    let mut rows = VecDeque::with_capacity(params.limit);
     for line in reader.split(b'\n') {
         let mut bytes = line.map_err(|error| {
             io_error(
@@ -81,33 +150,33 @@ pub(super) fn read_lifecycle_tail(
                 "inspect daemon lifecycle ledger readability",
             )
         })?;
-        total_lines_read = total_lines_read.saturating_add(1);
+        state.total_lines_read = state.total_lines_read.saturating_add(1);
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
         if bytes.is_empty() {
             return Err(lifecycle_corrupt_error(
                 path,
-                total_lines_read,
+                state.total_lines_read,
                 "empty JSONL line",
             ));
         }
         if bytes.len() > params.max_line_bytes {
-            oversized_lines_seen = oversized_lines_seen.saturating_add(1);
+            state.oversized_lines_seen = state.oversized_lines_seen.saturating_add(1);
             let probe: LifecycleFilterProbe = serde_json::from_slice(&bytes).map_err(|error| {
                 lifecycle_corrupt_error(
                     path,
-                    total_lines_read,
+                    state.total_lines_read,
                     format!("oversized_row JSON decode failed: {error}"),
                 )
             })?;
             if !lifecycle_probe_matches(&probe, params) {
-                oversized_lines_skipped = oversized_lines_skipped.saturating_add(1);
+                state.oversized_lines_skipped = state.oversized_lines_skipped.saturating_add(1);
                 continue;
             }
             return Err(lifecycle_oversized_error(
                 path,
-                total_lines_read,
+                state.total_lines_read,
                 bytes.len(),
                 params.max_line_bytes,
                 &probe.tool,
@@ -118,30 +187,23 @@ pub(super) fn read_lifecycle_tail(
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
             lifecycle_corrupt_error(
                 path,
-                total_lines_read,
+                state.total_lines_read,
                 format!("JSON decode failed: {error}"),
             )
         })?;
         if lifecycle_matches(&value, params) {
-            matched_lines_seen = matched_lines_seen.saturating_add(1);
-            if rows.len() == params.limit {
-                rows.pop_front();
+            state.matched_lines_seen = state.matched_lines_seen.saturating_add(1);
+            if state.rows.len() == params.limit {
+                state.rows.pop_front();
             }
-            rows.push_back(summarize_lifecycle_row(total_lines_read, &bytes, &value));
+            state.rows.push_back(summarize_lifecycle_row(
+                state.total_lines_read,
+                &bytes,
+                &value,
+            ));
         }
     }
-    let rows: Vec<_> = rows.into_iter().collect();
-    Ok(AuditLifecycleTailResponse {
-        path: path.display().to_string(),
-        limit: params.limit,
-        max_line_bytes: params.max_line_bytes,
-        total_lines_read,
-        matched_lines_seen,
-        oversized_lines_seen,
-        oversized_lines_skipped,
-        returned_count: rows.len(),
-        rows,
-    })
+    Ok(())
 }
 
 fn lifecycle_probe_matches(
@@ -181,7 +243,7 @@ fn summarize_lifecycle_row(line_no: u64, bytes: &[u8], value: &Value) -> AuditLi
     let mcp_session_id = string_field(value, "mcp_session_id");
     AuditLifecycleRowSummary {
         line_no,
-        raw_len_bytes: bytes.len() as u64,
+        raw_len_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         raw_sha256: prefixed_sha256(bytes),
         schema_version: value.get("schema_version").and_then(Value::as_u64),
         run_id: string_field(value, "run_id"),
@@ -204,8 +266,64 @@ fn summarize_lifecycle_row(line_no: u64, bytes: &[u8], value: &Value) -> AuditLi
         in_flight_count: value
             .get("in_flight_tool_events")
             .and_then(Value::as_array)
-            .map(|items| items.len() as u64),
+            .map(|items| u64::try_from(items.len()).unwrap_or(u64::MAX)),
         last_tool: last_tool_event.and_then(|event| string_field(event, "tool")),
         last_tool_status: last_tool_event.and_then(|event| string_field(event, "status")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn segment_path(active: &Path, suffix: usize) -> PathBuf {
+        active.with_file_name(format!(
+            "{}.{suffix}",
+            active.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    fn lifecycle_row(idx: usize) -> String {
+        format!(
+            "{{\"schema_version\":1,\"event_kind\":\"synthetic\",\"tool\":\"tool-{idx}\",\"status\":\"ok\",\"seq\":{idx}}}\n"
+        )
+    }
+
+    #[test]
+    fn lifecycle_tail_reads_retained_segments_and_returns_newest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("daemon-tool-events.jsonl");
+        fs::write(
+            segment_path(&active, 1),
+            [lifecycle_row(1), lifecycle_row(2)].concat(),
+        )
+        .unwrap();
+        fs::write(&active, [lifecycle_row(3), lifecycle_row(4)].concat()).unwrap();
+
+        let readback = read_lifecycle_tail(
+            &active,
+            &AuditLifecycleTailParams {
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let seqs: Vec<_> = readback.rows.iter().filter_map(|row| row.seq).collect();
+        assert_eq!(
+            readback.segment_count, 2,
+            "active + retained segment must both be read"
+        );
+        assert_eq!(
+            readback.total_lines_read, 4,
+            "readback must count rows across all retained segments"
+        );
+        assert_eq!(
+            seqs,
+            vec![4, 3, 2],
+            "tail response must return the newest matching retained rows first"
+        );
     }
 }

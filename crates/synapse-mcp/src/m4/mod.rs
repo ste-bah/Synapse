@@ -2210,7 +2210,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                 &paths,
                 &request_sha256,
                 authorization,
-                started_at.clone(),
+                started_at,
                 None,
                 context,
             );
@@ -2394,7 +2394,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
             let cleanup_verified = readback.cleanup_verified;
             let spawn_error_code = extract_error_code(&error);
             let spawn_error_message = error.message.to_string();
-            let original_error_data = error.data.clone();
+            let original_error_data = error.data;
             let mut status = shell_job_status_record(
                 &job_id,
                 if cleanup_verified {
@@ -3759,7 +3759,11 @@ fn shell_job_recovery_record_paths(job_dir: &Path, prefix: &str) -> Result<Vec<P
                 name.to_string_lossy()
             )
         })?;
-        if name.starts_with(prefix) && name.ends_with(".json") {
+        if name.starts_with(prefix)
+            && std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             let file_type = entry.file_type().map_err(|error| {
                 format!(
                     "failed to classify recovery record {}: {error}",
@@ -4314,7 +4318,7 @@ fn verify_corrupt_shell_job_remote_state(
         &liveness_before_readback,
         &liveness_before_status,
     );
-    let liveness_before = Some(liveness_before_evidence.clone());
+    let liveness_before = Some(liveness_before_evidence);
     if liveness_before_status == "already_gone" {
         if let Some((intent, intent_sha256)) = existing_intent.as_ref() {
             let resume_liveness_after = shell_job_remote_command_evidence(
@@ -4453,7 +4457,7 @@ fn verify_corrupt_shell_job_remote_state(
         );
         let outcome = ShellJobRemoteRecoveryOutcome {
             schema_version: 1,
-            recovery_id: intent.recovery_id.clone(),
+            recovery_id: intent.recovery_id,
             job_id: job_id.to_owned(),
             completed_at: chrono::Utc::now().to_rfc3339(),
             intent_sha256: intent_sha256.clone(),
@@ -5474,7 +5478,7 @@ fn verify_completed_quarantine_directory(
         .iter()
         .map(|artifact| artifact.relative_path.clone())
         .collect::<HashSet<_>>();
-    if !expected_names.insert(completion.manifest_file_name.clone())
+    if !expected_names.insert(completion.manifest_file_name)
         || !expected_names.insert(completion_name.to_owned())
     {
         return Err(format!(
@@ -13380,31 +13384,31 @@ fn ssh_control_args_unsafe_for_automatic_replay(args: &[String]) -> Option<Strin
         }
         let key = key.to_ascii_lowercase();
         let value = value.to_ascii_lowercase();
-        let explicitly_safe = matches!(
-            (key.as_str(), value.as_str()),
-            ("batchmode", "yes")
-                | ("clearallforwardings", "yes")
-                | ("permitlocalcommand", "no")
-                | ("proxycommand", "none")
-                | ("proxyjump", "none")
-                | ("controlmaster", "no")
-                | ("controlpath", "none")
-                | ("controlpersist", "no")
-                | ("forwardagent", "no")
-                | ("forwardx11", "no")
-                | ("forwardx11trusted", "no")
-                | ("tunnel", "no")
-                | ("requesttty", "no")
-                | ("forkafterauthentication", "no")
-                | ("stdinnull", "yes")
-                | ("enableescapecommandline", "no")
-                | ("addkeystoagent", "no")
-                | ("updatehostkeys", "no")
-                | ("stricthostkeychecking", "yes")
-                | ("numberofpasswordprompts", "0")
-                | ("knownhostscommand", "none")
-                | ("identitiesonly", "yes")
-        );
+        let explicitly_safe = [
+            ("batchmode", "yes"),
+            ("clearallforwardings", "yes"),
+            ("permitlocalcommand", "no"),
+            ("proxycommand", "none"),
+            ("proxyjump", "none"),
+            ("controlmaster", "no"),
+            ("controlpath", "none"),
+            ("controlpersist", "no"),
+            ("forwardagent", "no"),
+            ("forwardx11", "no"),
+            ("forwardx11trusted", "no"),
+            ("tunnel", "no"),
+            ("requesttty", "no"),
+            ("forkafterauthentication", "no"),
+            ("stdinnull", "yes"),
+            ("enableescapecommandline", "no"),
+            ("addkeystoagent", "no"),
+            ("updatehostkeys", "no"),
+            ("stricthostkeychecking", "yes"),
+            ("numberofpasswordprompts", "0"),
+            ("knownhostscommand", "none"),
+            ("identitiesonly", "yes"),
+        ]
+        .contains(&(key.as_str(), value.as_str()));
         if !explicitly_safe {
             return Some(format!("-o{key}:not_allowlisted"));
         }
@@ -16508,16 +16512,7 @@ async fn wait_shell_job_child_with_identity(
                     let termination = if let (Some(pid), Some(identity)) =
                         (child.id(), local_process_identity)
                     {
-                        if pid != identity.pid {
-                            ShellJobTerminationReadback {
-                                attempted: false,
-                                status: format!(
-                                    "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
-                                    identity.pid
-                                ),
-                                remaining_process_ids: vec![pid],
-                            }
-                        } else {
+                        if pid == identity.pid {
                             // Exact-handle termination and identity-aware tree
                             // discovery are blocking OS work; keep them off the
                             // async executor so parallel timeouts remain causal.
@@ -16533,6 +16528,15 @@ async fn wait_shell_job_child_with_identity(
                                     remaining_process_ids: vec![pid],
                                 }
                             })
+                        } else {
+                            ShellJobTerminationReadback {
+                                attempted: false,
+                                status: format!(
+                                    "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
+                                    identity.pid
+                                ),
+                                remaining_process_ids: vec![pid],
+                            }
                         }
                     } else {
                         ShellJobTerminationReadback {
@@ -19092,7 +19096,7 @@ impl OwnedProcessJob {
     }
 
     pub(crate) fn disarm_kill_on_close(
-        &mut self,
+        &self,
         tool_name: &'static str,
         pid: u32,
         resource_id: Option<&str>,
@@ -19163,7 +19167,7 @@ impl OwnedProcessJob {
     }
 
     pub(crate) fn disarm_kill_on_close(
-        &mut self,
+        &self,
         _tool_name: &'static str,
         _pid: u32,
         _resource_id: Option<&str>,
@@ -19723,16 +19727,7 @@ async fn wait_shell_child_with_identity(
             let termination = if let (Some(pid), Some(local_process_identity)) =
                 (child.id(), local_process_identity)
             {
-                if pid != local_process_identity.pid {
-                    ShellJobTerminationReadback {
-                        attempted: false,
-                        status: format!(
-                            "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
-                            local_process_identity.pid
-                        ),
-                        remaining_process_ids: vec![pid],
-                    }
-                } else {
+                if pid == local_process_identity.pid {
                     // Keep exact-handle termination and process-table reads off
                     // the async executor (#1589).
                     let identity = local_process_identity.clone();
@@ -19743,6 +19738,15 @@ async fn wait_shell_child_with_identity(
                             status: format!("termination_task_join_failed:{join_error}"),
                             remaining_process_ids: vec![pid],
                         })
+                } else {
+                    ShellJobTerminationReadback {
+                        attempted: false,
+                        status: format!(
+                            "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
+                            local_process_identity.pid
+                        ),
+                        remaining_process_ids: vec![pid],
+                    }
                 }
             } else {
                 ShellJobTerminationReadback {

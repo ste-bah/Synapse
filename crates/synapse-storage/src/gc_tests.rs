@@ -49,15 +49,150 @@ async fn gc_periodic_task_runs_tick() -> Result<(), Box<dyn Error>> {
     let config = gc::GcConfig::for_row_caps(Duration::from_millis(10), cf::CF_EVENTS, 6, 20);
     let task = gc::spawn(Arc::clone(&db.inner), config)?;
     tokio::time::sleep(Duration::from_millis(40)).await;
+    let readback = task.readback();
     let after = db.scan_cf(cf::CF_EVENTS)?;
     println!(
-        "regression_state=cf_scan case=periodic_task before_count={} after_count={} observed=spawned_tick_evicted:{}",
+        "regression_state=cf_scan case=periodic_task before_count={} after_count={} task_running={} last_started={:?} last_completed={:?} last_error={:?} observed=spawned_tick_evicted:{}",
         before.len(),
         after.len(),
+        readback.running,
+        readback.last_started_unix_ms,
+        readback.last_completed_unix_ms,
+        readback.last_error,
         before.len().saturating_sub(after.len())
     );
     drop(task);
+    assert!(readback.running);
+    assert!(readback.last_started_unix_ms.is_some());
+    assert!(readback.last_completed_unix_ms.is_some());
+    assert_eq!(readback.last_error, None);
     assert!(after.len() <= 6);
+    Ok(())
+}
+
+#[test]
+fn gc_row_caps_converge_with_bounded_pass_readback() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
+    fill_rows(&db, 30)?;
+    db.flush()?;
+    let before = db.scan_cf(cf::CF_EVENTS)?;
+    let config = gc::GcConfig::for_row_caps(Duration::from_mins(5), cf::CF_EVENTS, 5, 10);
+
+    let report = gc::run_once(&db.inner, &config)?;
+    let cf_report = report
+        .cf(cf::CF_EVENTS)
+        .ok_or("GC report missing CF_EVENTS")?;
+    let after = db.scan_cf(cf::CF_EVENTS)?;
+    println!(
+        "regression_state=bounded_gc case=row_cap_boundary before_actual={} reported_before={} examined_rows={} scan_limited={} evicted={} after_actual={} reported_after={} observed=keys:{}",
+        before.len(),
+        cf_report.before_value,
+        cf_report.examined_rows,
+        cf_report.scan_limited,
+        cf_report.evicted_rows,
+        after.len(),
+        cf_report.after_value,
+        printable_keys(&after)
+    );
+
+    assert_eq!(before.len(), 30);
+    assert_eq!(cf_report.before_value, 11);
+    assert_eq!(cf_report.evicted_rows, 25);
+    assert!(cf_report.scan_limited);
+    assert_eq!(after.len(), 5);
+    Ok(())
+}
+
+#[test]
+fn byte_gc_refuses_non_chronological_cf_without_deleting_rows() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
+    let kvs = (0..32)
+        .map(|index| {
+            (
+                format!("config-key-{index:04}").into_bytes(),
+                vec![b'x'; 4096],
+            )
+        })
+        .collect::<Vec<_>>();
+    db.put_batch(cf::CF_KV, kvs)?;
+    db.flush()?;
+    db.compact_cf(cf::CF_KV)?;
+    let before = db.scan_cf(cf::CF_KV)?;
+    let live_estimate = db.cf_live_data_size_estimates()?.0[cf::CF_KV];
+    println!(
+        "regression_state=cf_scan case=unsafe_byte_gc_before cf={} rows={} live_data_estimate={}",
+        cf::CF_KV,
+        before.len(),
+        live_estimate
+    );
+
+    assert!(
+        live_estimate > 0,
+        "RocksDB live-data-size estimate must observe the seeded CF_KV rows"
+    );
+    let config = gc::GcConfig::for_byte_caps(Duration::from_mins(5), cf::CF_KV, 1, 2);
+    let error = gc::run_once(&db.inner, &config)
+        .expect_err("byte-cap GC must refuse non-chronological CF_KV");
+    let after = db.scan_cf(cf::CF_KV)?;
+    println!(
+        "regression_state=cf_scan case=unsafe_byte_gc_after code={} error={error} before_rows={} after_rows={} observed=keys:{:?}",
+        error.code(),
+        before.len(),
+        after.len(),
+        printable_keys(&after)
+    );
+
+    assert_eq!(
+        error.code(),
+        synapse_core::error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED
+    );
+    assert_eq!(after.len(), before.len());
+    assert_eq!(printable_keys(&after), printable_keys(&before));
+    Ok(())
+}
+
+#[test]
+fn default_gc_reports_unsupported_byte_caps_without_failing_tick() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
+    let kvs = (0..4)
+        .map(|index| {
+            (
+                format!("config-key-{index:04}").into_bytes(),
+                vec![b'x'; 1024],
+            )
+        })
+        .collect::<Vec<_>>();
+    db.put_batch(cf::CF_KV, kvs)?;
+    db.flush()?;
+    let before = db.scan_cf(cf::CF_KV)?;
+
+    let config = gc::GcConfig::from_retention_defaults();
+    let report = gc::run_once(&db.inner, &config)?;
+    let events_report = report
+        .cf(cf::CF_EVENTS)
+        .ok_or("GC report missing CF_EVENTS")?;
+    let kv_report = report.cf(cf::CF_KV).ok_or("GC report missing CF_KV")?;
+    let after = db.scan_cf(cf::CF_KV)?;
+    println!(
+        "regression_state=cf_scan case=default_unsupported_byte_cap cf={} before_rows={} after_rows={} skipped_reason={:?} before_estimated_num_keys={:?}",
+        cf::CF_KV,
+        before.len(),
+        after.len(),
+        kv_report.eviction_skipped_reason,
+        kv_report.before_estimated_num_keys
+    );
+
+    assert_eq!(events_report.eviction_skipped_reason, None);
+    assert_eq!(
+        kv_report.eviction_skipped_reason,
+        Some("unsupported_byte_cap_policy_skipped")
+    );
+    assert_eq!(kv_report.evicted_rows, 0);
+    assert_eq!(after.len(), before.len());
+    assert_eq!(printable_keys(&after), printable_keys(&before));
     Ok(())
 }
 
@@ -139,6 +274,7 @@ fn run_gc_case(recorder: &TestRecorder, case: CaseSpec) -> Result<(), Box<dyn Er
         case.expect_hard_cap
             .then_some(synapse_core::error_codes::STORAGE_CF_HARD_CAP_REACHED)
     );
+    assert_eq!(cf_report.eviction_skipped_reason, None);
     let property = after_property.ok_or("rocksdb.estimate-num-keys returned None")?;
     assert!(property <= case.expected_after as u64);
     if case.expected_evicted > 0 {

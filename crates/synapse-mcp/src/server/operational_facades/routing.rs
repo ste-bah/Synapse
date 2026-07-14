@@ -57,7 +57,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public telemetry facade for the <=40 MCP surface. operation=status returns active profile, visible/public/implementation/hidden/profile-gated tool counts, tool-surface hashes, storage CF counters, and agent-event ingress counters from physical SoTs."
+        description = "Public telemetry facade for the <=40 MCP surface. operation=status returns profile/tool counts, model-facing tool payload bytes/token estimates, operation-level lifecycle usage aggregates, storage CF counters, and ingress counters from physical SoTs."
     )]
     pub async fn telemetry(
         &self,

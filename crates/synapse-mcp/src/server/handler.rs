@@ -23,8 +23,12 @@ impl ServerHandler for SynapseService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
-        let lifecycle_guard =
-            self.begin_daemon_lifecycle_tool_call(&tool_name, mcp_session_id.as_deref())?;
+        let operation = tool_operation_from_arguments(&tool_name, request.arguments.as_ref());
+        let lifecycle_guard = self.begin_daemon_lifecycle_tool_call(
+            &tool_name,
+            operation,
+            mcp_session_id.as_deref(),
+        )?;
         if let Some(session_id) = mcp_session_id.as_deref()
             && let Err(error) = self.reject_terminated_session_tool_call(&tool_name, session_id)
         {
@@ -426,6 +430,7 @@ impl SynapseService {
     fn begin_daemon_lifecycle_tool_call(
         &self,
         tool_name: &str,
+        operation: Option<String>,
         mcp_session_id: Option<&str>,
     ) -> Result<crate::daemon_lifecycle::ToolCallGuard, ErrorData> {
         let (audit_context, audit_context_read_error) = match self.current_action_audit_context() {
@@ -455,8 +460,26 @@ impl SynapseService {
             Ok(target) => (target.as_ref().map(session_target_value), None),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
+        let (profile, tool_surface_sha256, tool_profile_read_error) =
+            match self.tool_profile_snapshot(mcp_session_id) {
+                Ok(snapshot) => (
+                    Some(snapshot.profile.as_str().to_owned()),
+                    Some(snapshot.visible_tool_sha256),
+                    None,
+                ),
+                Err(error) => (None, None, Some(error_snapshot(&error))),
+            };
+        let route_id = operation
+            .as_deref()
+            .map(|operation| format!("{tool_name}.{operation}"))
+            .or_else(|| Some(tool_name.to_owned()));
         crate::daemon_lifecycle::begin_tool_call(crate::daemon_lifecycle::ToolCallStart {
             tool: tool_name.to_owned(),
+            operation,
+            route_id,
+            profile,
+            tool_surface_sha256,
+            tool_profile_read_error,
             mcp_session_id: mcp_session_id.map(ToOwned::to_owned),
             audit_context,
             audit_context_read_error,
@@ -466,6 +489,30 @@ impl SynapseService {
             session_target_read_error,
         })
         .map_err(lifecycle_mcp_error)
+    }
+}
+
+fn tool_operation_from_arguments(
+    tool_name: &str,
+    arguments: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    if let Some(operation) = arguments
+        .and_then(|args| args.get("operation"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|operation| !operation.is_empty())
+    {
+        return Some(operation.to_ascii_lowercase());
+    }
+    match tool_name {
+        "shell" => Some("run".to_owned()),
+        "process" => Some("list".to_owned()),
+        "browser_tabs" => Some("list".to_owned()),
+        "target" => Some("get".to_owned()),
+        "profile" => Some("status".to_owned()),
+        "telemetry" => Some("status".to_owned()),
+        "storage" => Some("summary".to_owned()),
+        _ => None,
     }
 }
 
