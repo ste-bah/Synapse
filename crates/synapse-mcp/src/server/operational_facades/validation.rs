@@ -18,7 +18,6 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
         &[
             ("inspect", params.inspect.is_some()),
             ("summary", params.summary.is_some()),
-            ("put_probe_rows", params.put_probe_rows.is_some()),
             ("gc_once", params.gc_once.is_some()),
         ],
     )
@@ -115,6 +114,7 @@ fn validate_exact_spec(
 #[cfg(test)]
 mod tests {
     use crate::m3::storage::StorageInspectParams;
+    use serde_json::json;
 
     use super::*;
     use crate::server::operational_facades::types::{
@@ -128,7 +128,6 @@ mod tests {
             operation: StorageOperation::Inspect,
             inspect: Some(StorageInspectParams::default()),
             summary: None,
-            put_probe_rows: None,
             gc_once: None,
         };
         validate_storage_params(&ok).expect("matching payload accepted");
@@ -137,7 +136,6 @@ mod tests {
             operation: StorageOperation::Inspect,
             inspect: None,
             summary: None,
-            put_probe_rows: None,
             gc_once: None,
         };
         validate_storage_params(&missing).expect_err("missing payload rejected");
@@ -146,10 +144,30 @@ mod tests {
             operation: StorageOperation::Inspect,
             inspect: Some(StorageInspectParams::default()),
             summary: Some(StorageInspectParams::default()),
-            put_probe_rows: None,
             gc_once: None,
         };
         validate_storage_params(&extra).expect_err("extra payload rejected");
+    }
+
+    #[test]
+    fn storage_facade_rejects_probe_row_operation_schema() {
+        let error = serde_json::from_value::<StorageParams>(json!({
+            "operation": "put_probe_rows",
+            "put_probe_rows": {
+                "cf_name": "CF_ACTION_LOG",
+                "key_prefix": "issue1595",
+                "rows": 1,
+                "value_bytes": 8
+            }
+        }))
+        .expect_err("production storage facade must not deserialize synthetic write operation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown variant `put_probe_rows`")
+                || message.contains("unknown field `put_probe_rows`"),
+            "unexpected serde error: {message}"
+        );
     }
 
     #[test]

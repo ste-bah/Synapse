@@ -3786,32 +3786,6 @@ pub struct ChromeDebuggerPageVitals {
     pub error_detail: Option<String>,
 }
 
-// Bridge page-vitals readback type. Currently exercised via the parallel
-// m1_tools raw-CDP path (`raw_cdp_page_vitals_info`); retained as the typed
-// bridge-level surface, so unused in the compiled bins.
-#[allow(dead_code)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageVitalsResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub viewport: Option<ChromeDebuggerViewportReadback>,
-    #[serde(default)]
-    pub viewport_error_detail: Option<String>,
-    pub page_vitals: ChromeDebuggerPageVitals,
-    #[serde(default)]
-    pub readback_backend: String,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ChromeDebuggerPageText {
     #[serde(default)]
@@ -6987,31 +6961,6 @@ pub async fn media_emulation(
     serde_json::from_value::<ChromeDebuggerMediaEmulationResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger mediaEmulation response: {error}"
-        ))
-    })
-}
-
-// See `ChromeDebuggerPageVitalsResult`: the live page-vitals readback runs
-// through m1_tools' raw-CDP path, so this bridge-level entry point is unused in
-// the compiled bins.
-#[allow(dead_code)]
-pub async fn page_vitals(
-    hwnd: i64,
-    target_id: &str,
-) -> Result<ChromeDebuggerPageVitalsResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "pageVitals")?;
-    let result = bridge()
-        .send_command(
-            "pageVitals",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerPageVitalsResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger pageVitals response: {error}"
         ))
     })
 }

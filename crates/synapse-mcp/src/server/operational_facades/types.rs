@@ -19,7 +19,7 @@ use crate::m3::{
     },
     storage::{
         StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-        StoragePutProbeRowsParams, StoragePutProbeRowsResponse, StorageSummaryResponse,
+        StorageSummaryResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -27,7 +27,6 @@ use crate::m3::{
 pub enum StorageOperation {
     Inspect,
     Summary,
-    PutProbeRows,
     GcOnce,
 }
 
@@ -36,7 +35,6 @@ impl StorageOperation {
         match self {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
-            Self::PutProbeRows => "put_probe_rows",
             Self::GcOnce => "gc_once",
         }
     }
@@ -51,8 +49,6 @@ pub struct StorageParams {
     #[serde(default)]
     pub summary: Option<StorageInspectParams>,
     #[serde(default)]
-    pub put_probe_rows: Option<StoragePutProbeRowsParams>,
-    #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
 }
 
@@ -66,8 +62,6 @@ pub struct StorageResponse {
     pub inspect: Option<StorageInspectResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<StorageSummaryResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub put_probe_rows: Option<StoragePutProbeRowsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
 }

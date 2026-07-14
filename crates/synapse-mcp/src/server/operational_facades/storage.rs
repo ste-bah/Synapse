@@ -87,44 +87,6 @@ pub(super) async fn handle(
                 |out| out.summary = Some(response),
             )))
         }
-        StorageOperation::PutProbeRows => {
-            let spec = params
-                .0
-                .put_probe_rows
-                .ok_or_else(|| missing_spec(STORAGE_TOOL, "put_probe_rows"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                STORAGE_TOOL,
-                operation.as_str(),
-                &spec.cf_name,
-                STORAGE_SOT,
-            )?;
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_put(&spec),
-            )?;
-            let runtime = service.reflex_runtime()?;
-            let response =
-                crate::m3::storage::put_probe_rows(&runtime, &spec).map_err(|error| {
-                    facade_delegate_error(
-                        STORAGE_TOOL,
-                        operation.as_str(),
-                        &spec.cf_name,
-                        STORAGE_SOT,
-                        error,
-                        "fix cf_name/key/value limits and inspect CF row counts before retrying",
-                    )
-                })?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "{} before_rows={} after_rows={}",
-                    response.cf_name, response.before_rows, response.after_rows
-                ),
-                |out| out.put_probe_rows = Some(response),
-            )))
-        }
         StorageOperation::GcOnce => {
             let spec = params
                 .0

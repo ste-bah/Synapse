@@ -1748,15 +1748,6 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "repair storage initialization and read CF metadata again",
             ),
             op(
-                "put_probe_rows",
-                true,
-                false,
-                "RocksDB CF probe rows",
-                Some("CF row-count and size readback after probe row write"),
-                error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before writing probe rows",
-            ),
-            op(
                 "gc_once",
                 true,
                 false,
