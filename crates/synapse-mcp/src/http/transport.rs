@@ -668,6 +668,7 @@ struct HttpLifetimeOwnerReadback {
     m2_emitter_safe: bool,
     activity_owners_quiescent: bool,
     win_event_shutdown_history_quiescent: bool,
+    calyx_vault_closed: bool,
     storage_service_owners_quiescent: bool,
     operator_hotkey_quiescent: bool,
     operator_panic_k2_tasks_quiescent: bool,
@@ -710,6 +711,43 @@ impl HttpOperatorOwnerDrain {
     }
 }
 
+fn close_http_calyx_vault(
+    m3_state: &crate::m3::SharedM3State,
+    reason: &'static str,
+    expected_open: bool,
+) -> (
+    bool,
+    anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
+) {
+    let result = match m3_state.lock() {
+        Ok(mut state) => state
+            .close_calyx_vault_for_shutdown(reason, expected_open)
+            .map_err(anyhow::Error::new)
+            .and_then(|readback| {
+                crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
+                Ok(readback)
+            }),
+        Err(poisoned) => {
+            let detail =
+                format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
+            drop(poisoned);
+            Err(anyhow::anyhow!(detail))
+        }
+    };
+    let safe_to_unlock = result
+        .as_ref()
+        .is_ok_and(|readback| readback.safe_to_unlock);
+    tracing::info!(
+        code = "MCP_HTTP_CALYX_VAULT_CLOSE_READBACK",
+        reason,
+        expected_open,
+        safe_to_unlock,
+        result = ?result,
+        "readback=calyx_vault edge=http_shutdown after_flush_close"
+    );
+    (safe_to_unlock, result)
+}
+
 async fn drain_http_operator_owners(
     guard: &mut Option<synapse_action::OperatorHotkeyGuard>,
     reason: &'static str,
@@ -750,6 +788,7 @@ impl HttpLifetimeOwnerReadback {
             && self.m2_emitter_safe
             && self.activity_owners_quiescent
             && self.win_event_shutdown_history_quiescent
+            && self.calyx_vault_closed
             && self.storage_service_owners_quiescent
             && self.operator_hotkey_quiescent
             && self.operator_panic_k2_tasks_quiescent
@@ -1227,6 +1266,10 @@ async fn fail_http_startup_after_service(
         session_registry_readback_ok && session_registry_rows.is_empty();
     let session_input_owners_quiescent = authority_finalizers_quiescent && !lease_after.held;
 
+    let (calyx_vault_closed, calyx_vault_close) =
+        close_http_calyx_vault(&m3_state, "http_startup_failure", false);
+    failures.inspect_result("calyx_vault_close", calyx_vault_close.map(|_readback| ()));
+
     drop(service);
     drop(shutdown_cancel);
     drop(connection_closed_cancel);
@@ -1248,6 +1291,7 @@ async fn fail_http_startup_after_service(
         m2_emitter_safe,
         activity_owners_quiescent,
         win_event_shutdown_history_quiescent,
+        calyx_vault_closed,
         storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
         operator_hotkey_quiescent,
         operator_panic_k2_tasks_quiescent,
@@ -1834,13 +1878,25 @@ pub(super) async fn serve(
     // periodic GC/pressure task handles before serving any MCP request, so a
     // lock/schema/task/probe fault fails fast instead of reporting healthy
     // storage while retention is inert. The handle is cached and reused by the
-    // reflex runtime, so there is no open-then-reopen race.
+    // reflex runtime, so there is no open-then-reopen race. The Calyx vault is
+    // opened in the same transaction so health never serves a silent no-vault
+    // daemon when the configured durable vault is unavailable.
     {
         let open_or_maintenance_result = match m3_state_for_recorder.lock() {
             Ok(mut state) => Some(
                 state
                     .ensure_storage()
-                    .and_then(|_| state.ensure_storage_maintenance_tasks()),
+                    .map_err(anyhow::Error::new)
+                    .and_then(|_| {
+                        state
+                            .ensure_storage_maintenance_tasks()
+                            .map_err(anyhow::Error::new)
+                    })
+                    .and_then(|_| {
+                        let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
+                        crate::m3::record_calyx_vault_status_event(&status, "opened")?;
+                        Ok(())
+                    }),
             ),
             Err(poisoned) => {
                 drop(poisoned);
@@ -1853,7 +1909,7 @@ pub(super) async fn serve(
                 HttpRuntimeStartupFailure::new(
                     "storage_state_lock",
                     anyhow::anyhow!(
-                        "m3 service state lock poisoned during startup storage open/maintenance"
+                        "m3 service state lock poisoned during startup storage/Calyx open/maintenance"
                     ),
                     Vec::new(),
                     None,
@@ -1871,26 +1927,26 @@ pub(super) async fn serve(
             .await;
         };
         if let Err(error) = open_or_maintenance_result {
-            let detail = error.to_string();
+            let detail = format!("{error:#}");
             if detail.to_lowercase().contains("lock") {
                 tracing::error!(
                     code = "STORAGE_LOCK_CONTENDED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: RocksDB storage lock is held by another process; run `synapse-mcp doctor` to find and stop the holder, or point this daemon at a different --db path"
+                    "refusing to start: storage or Calyx lock is held by another process; inspect the named lock holder, or point this daemon at a different durable path"
                 );
             } else {
                 tracing::error!(
-                    code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
+                    code = "STORAGE_OR_CALYX_OPEN_OR_MAINTENANCE_START_FAILED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage open/maintenance startup failed at daemon startup"
+                    "refusing to start: storage open/maintenance or Calyx vault startup failed at daemon startup"
                 );
             }
             drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
-                    "storage_open_or_maintenance_start",
+                    "storage_or_calyx_open_or_maintenance_start",
                     anyhow::anyhow!(detail),
                     Vec::new(),
                     None,
@@ -1908,9 +1964,9 @@ pub(super) async fn serve(
             .await;
         }
         tracing::info!(
-            code = "MCP_DAEMON_STORAGE_OPENED_AND_MAINTENANCE_STARTED",
+            code = "MCP_DAEMON_STORAGE_AND_CALYX_OPENED",
             db_path = %db_path.display(),
-            "daemon storage opened eagerly and storage maintenance tasks started at startup"
+            "daemon storage opened eagerly, storage maintenance started, and Calyx vault opened at startup"
         );
     }
 
@@ -2357,6 +2413,15 @@ pub(super) async fn serve(
             .context("drain HTTP daemon background tasks before releasing lifetime locks"),
     );
 
+    let (calyx_vault_closed, calyx_vault_close) =
+        close_http_calyx_vault(&m3_state_for_recorder, shutdown_source, true);
+    shutdown_failures.inspect_result(
+        "calyx_vault_close",
+        calyx_vault_close
+            .map(|_readback| ())
+            .context("flush and close Calyx vault before releasing lifetime locks"),
+    );
+
     // The custom daemon lock must outlive every RocksDB/service owner. Dropping
     // these Arcs and callbacks before unlock prevents a successor from winning
     // daemon.lock only to collide with this process's still-live RocksDB LOCK.
@@ -2388,6 +2453,7 @@ pub(super) async fn serve(
         m2_emitter_safe,
         activity_owners_quiescent,
         win_event_shutdown_history_quiescent,
+        calyx_vault_closed,
         storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
         operator_hotkey_quiescent,
         operator_panic_k2_tasks_quiescent,
@@ -9807,6 +9873,7 @@ mod tests {
             m2_emitter_safe: true,
             activity_owners_quiescent: true,
             win_event_shutdown_history_quiescent: true,
+            calyx_vault_closed: true,
             storage_service_owners_quiescent: true,
             operator_hotkey_quiescent: true,
             operator_panic_k2_tasks_quiescent: true,
@@ -9856,6 +9923,7 @@ mod tests {
         rejects_false_field!(m2_emitter_safe);
         rejects_false_field!(activity_owners_quiescent);
         rejects_false_field!(win_event_shutdown_history_quiescent);
+        rejects_false_field!(calyx_vault_closed);
         rejects_false_field!(storage_service_owners_quiescent);
         rejects_false_field!(operator_hotkey_quiescent);
         rejects_false_field!(operator_panic_k2_tasks_quiescent);

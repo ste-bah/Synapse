@@ -48,6 +48,7 @@ tempfile.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-audio = { version = "0.1.0", path = "../synapse-audio" }
+synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["directml"] }

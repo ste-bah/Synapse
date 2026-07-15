@@ -142,6 +142,7 @@ impl SynapseService {
     ) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
+        subsystems.insert("calyx_vault".to_owned(), self.calyx_vault_health());
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
@@ -185,6 +186,61 @@ impl SynapseService {
             tool_surface_sha256: tool_surface.sha256,
             tool_names: tool_surface.names,
             subsystems,
+        }
+    }
+
+    fn calyx_vault_health(&self) -> SubsystemHealth {
+        let status = match self.m3_state.lock() {
+            Ok(state) => state.calyx_vault_status(),
+            Err(poisoned) => {
+                drop(poisoned);
+                return state_lock_health();
+            }
+        };
+        let health_status = if !status.enabled {
+            "disabled"
+        } else if status.open {
+            "ok"
+        } else if status.last_error_code.is_some() {
+            "error"
+        } else {
+            "starting"
+        };
+        SubsystemHealth {
+            status: health_status.to_owned(),
+            detail: Some(format!(
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} remediation={}",
+                status.enabled,
+                status.phase,
+                status.open,
+                status
+                    .vault_dir
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+                status.vault_id.as_deref().unwrap_or("none"),
+                status.latest_seq,
+                status.last_recovered_seq,
+                status.torn_tail.as_deref().unwrap_or("none"),
+                status.last_error_code.as_deref().unwrap_or("none"),
+                status.remediation.as_deref().unwrap_or("none")
+            )),
+            calyx_vault_open: Some(status.open),
+            calyx_vault_phase: Some(status.phase),
+            calyx_vault_path: status.vault_dir.map(|path| path.display().to_string()),
+            calyx_vault_identity_path: status.identity_path.map(|path| path.display().to_string()),
+            calyx_machine_salt_path: status
+                .machine_salt_path
+                .map(|path| path.display().to_string()),
+            calyx_vault_lock_path: status.lock_path.map(|path| path.display().to_string()),
+            calyx_vault_pid_path: status.pid_path.map(|path| path.display().to_string()),
+            calyx_vault_id: status.vault_id,
+            calyx_vault_latest_seq: status.latest_seq,
+            calyx_vault_last_recovered_seq: status.last_recovered_seq,
+            calyx_vault_torn_tail: status.torn_tail,
+            calyx_vault_last_error_code: status.last_error_code,
+            calyx_vault_last_error: status.last_error,
+            calyx_vault_remediation: status.remediation,
+            ..SubsystemHealth::default()
         }
     }
 

@@ -62,6 +62,8 @@ const PROFILE_DIR_ENV: &str = "SYNAPSE_PROFILE_DIR";
 const REFLEX_DISABLED_ENV: &str = "SYNAPSE_REFLEX_DISABLED";
 const REFLEX_FORCE_DEGRADED_ENV: &str = "SYNAPSE_REFLEX_FORCE_DEGRADED";
 const STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV: &str = "SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE";
+const CALYX_VAULT_ENV: &str = "SYNAPSE_CALYX_VAULT";
+const CALYX_VAULT_DIR_ENV: &str = "SYNAPSE_CALYX_VAULT_DIR";
 const ENABLE_AUDIO_ENV: &str = "SYNAPSE_ENABLE_AUDIO";
 const ALLOW_UNKNOWN_PROFILE_ENV: &str = "SYNAPSE_ALLOW_UNKNOWN_PROFILE";
 const ALLOWED_PERMISSIONS_ENV: &str = "SYNAPSE_MCP_ALLOWED_PERMISSIONS";
@@ -89,6 +91,8 @@ pub struct M3ServiceConfig {
     pub allowed_permissions: Option<String>,
     pub reflex_force_degraded: bool,
     pub storage_pressure_free_bytes_sample: Option<u64>,
+    pub calyx_vault: bool,
+    pub calyx_vault_dir: Option<PathBuf>,
 }
 
 impl M3ServiceConfig {
@@ -125,6 +129,8 @@ impl M3ServiceConfig {
             allowed_permissions,
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
+            calyx_vault: true,
+            calyx_vault_dir: None,
         }
     }
 
@@ -135,6 +141,7 @@ impl M3ServiceConfig {
             std::env::var(STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV).ok();
         let enable_audio_raw = std::env::var(ENABLE_AUDIO_ENV).ok();
         let allow_unknown_profile_raw = std::env::var(ALLOW_UNKNOWN_PROFILE_ENV).ok();
+        let calyx_vault_raw = std::env::var(CALYX_VAULT_ENV).ok();
         let max_subscriptions_raw = std::env::var(MAX_SUBSCRIPTIONS_ENV).ok();
         Ok(Self {
             db_path: std::env::var_os(DB_ENV).map(PathBuf::from),
@@ -156,6 +163,10 @@ impl M3ServiceConfig {
                 STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV,
                 storage_pressure_free_bytes_sample_raw.as_deref(),
             )?,
+            calyx_vault: calyx_vault_raw
+                .as_deref()
+                .map_or(Ok(true), |raw| parse_bool_env(CALYX_VAULT_ENV, Some(raw)))?,
+            calyx_vault_dir: std::env::var_os(CALYX_VAULT_DIR_ENV).map(PathBuf::from),
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
             max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
@@ -271,6 +282,10 @@ pub struct M3State {
     pub allow_unknown_profile: bool,
     pub reflex_force_degraded: bool,
     pub storage_pressure_free_bytes_sample: Option<u64>,
+    pub calyx_vault_enabled: bool,
+    pub calyx_vault_config: Option<synapse_calyx::SynapseCalyxConfig>,
+    pub calyx_vault: Option<synapse_calyx::SynapseCalyxVault>,
+    pub calyx_vault_status: synapse_calyx::SynapseCalyxVaultStatus,
     /// Shared RocksDB handle. Opened once (eagerly at daemon startup, or lazily
     /// on first reflex use) and reused by the reflex runtime so there is never
     /// a second open of the same path within this process.
@@ -337,6 +352,40 @@ pub fn shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
     )))
 }
 
+pub(crate) fn record_calyx_vault_status_event(
+    status: &synapse_calyx::SynapseCalyxVaultStatus,
+    event_status: &'static str,
+) -> Result<u64> {
+    let detail = serde_json::to_value(status).context("serialize Calyx vault status event")?;
+    crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
+        event_kind: "calyx_vault_lifecycle",
+        tool: "calyx_vault",
+        status: event_status,
+        mcp_session_id: None,
+        foreground: None,
+        foreground_read_error: None,
+        detail,
+    })
+    .context("record Calyx vault lifecycle status event")
+}
+
+pub(crate) fn record_calyx_vault_close_event(
+    readback: &synapse_calyx::SynapseCalyxVaultCloseReadback,
+    event_status: &'static str,
+) -> Result<u64> {
+    let detail = serde_json::to_value(readback).context("serialize Calyx vault close event")?;
+    crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
+        event_kind: "calyx_vault_lifecycle",
+        tool: "calyx_vault",
+        status: event_status,
+        mcp_session_id: None,
+        foreground: None,
+        foreground_read_error: None,
+        detail,
+    })
+    .context("record Calyx vault lifecycle close event")
+}
+
 impl M3State {
     pub fn from_config(config: M3ServiceConfig) -> Result<Self> {
         let sse_state = SseState::with_max_subscriptions(config.max_subscriptions);
@@ -367,6 +416,8 @@ impl M3State {
             config.allowed_permissions.as_deref(),
             Some(bool_env_value(config.reflex_force_degraded)),
             config.storage_pressure_free_bytes_sample,
+            config.calyx_vault,
+            config.calyx_vault_dir,
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
@@ -386,6 +437,8 @@ impl M3State {
         allowed_permissions: Option<&str>,
         reflex_force_degraded: Option<&str>,
         storage_pressure_free_bytes_sample: Option<u64>,
+        calyx_vault_enabled: bool,
+        calyx_vault_dir: Option<PathBuf>,
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
@@ -397,6 +450,18 @@ impl M3State {
         let reflex_force_degraded =
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
+        let calyx_vault_config = if calyx_vault_enabled {
+            Some(synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir(
+                calyx_vault_dir,
+            )?)
+        } else {
+            None
+        };
+        let calyx_vault_status = calyx_vault_config
+            .as_ref()
+            .map_or_else(synapse_calyx::SynapseCalyxVaultStatus::disabled, |config| {
+                synapse_calyx::SynapseCalyxVaultStatus::not_opened(Some(config))
+            });
         // #1559: record the config source so status/denial remediation can state
         // exactly how to opt into reality-write, and never imply that an absent
         // WRITE_STORAGE is present.
@@ -423,6 +488,10 @@ impl M3State {
             allow_unknown_profile,
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
+            calyx_vault_enabled,
+            calyx_vault_config,
+            calyx_vault: None,
+            calyx_vault_status,
             db: None,
             storage_gc_task: None,
             storage_pressure_task: None,
@@ -597,6 +666,108 @@ impl M3State {
         }
         self.storage_last_error = None;
         Ok(())
+    }
+
+    pub fn ensure_calyx_vault(
+        &mut self,
+    ) -> std::result::Result<synapse_calyx::SynapseCalyxVaultStatus, synapse_calyx::SynapseCalyxError>
+    {
+        if !self.calyx_vault_enabled {
+            self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::disabled();
+            return Ok(self.calyx_vault_status.clone());
+        }
+        if let Some(vault) = &self.calyx_vault {
+            self.calyx_vault_status = vault.status();
+            return Ok(self.calyx_vault_status.clone());
+        }
+        let Some(config) = self.calyx_vault_config.clone() else {
+            let error = synapse_calyx::SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CONFIG_MISSING",
+                "Calyx vault is enabled but no resolved vault configuration is present",
+                "restart with SYNAPSE_CALYX_VAULT=true and a valid APPDATA or SYNAPSE_CALYX_VAULT_DIR",
+            );
+            self.calyx_vault_status =
+                synapse_calyx::SynapseCalyxVaultStatus::error(None, "error", &error);
+            return Err(error);
+        };
+        match synapse_calyx::SynapseCalyxVault::open(config.clone()) {
+            Ok(vault) => {
+                let status = vault.status();
+                self.calyx_vault_status = status.clone();
+                self.calyx_vault = Some(vault);
+                Ok(status)
+            }
+            Err(error) => {
+                self.calyx_vault_status =
+                    synapse_calyx::SynapseCalyxVaultStatus::error(Some(&config), "error", &error);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn close_calyx_vault_for_shutdown(
+        &mut self,
+        reason: &'static str,
+        expected_open: bool,
+    ) -> std::result::Result<
+        synapse_calyx::SynapseCalyxVaultCloseReadback,
+        synapse_calyx::SynapseCalyxError,
+    > {
+        if !self.calyx_vault_enabled {
+            self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::disabled();
+            return Ok(synapse_calyx::SynapseCalyxVaultCloseReadback::disabled(
+                reason,
+            ));
+        }
+        let Some(vault) = self.calyx_vault.take() else {
+            if expected_open {
+                let error = synapse_calyx::SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_VAULT_MISSING_AT_SHUTDOWN",
+                    "Calyx vault was expected to be open during daemon shutdown but no handle was present",
+                    "inspect startup logs; the daemon must open the vault before serving and retain the handle until shutdown",
+                );
+                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::error(
+                    self.calyx_vault_config.as_ref(),
+                    "error",
+                    &error,
+                );
+                return Err(error);
+            }
+            return Ok(synapse_calyx::SynapseCalyxVaultCloseReadback::not_open(
+                reason,
+                self.calyx_vault_config.as_ref(),
+            ));
+        };
+        match vault.close(reason) {
+            Ok(readback) => {
+                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus {
+                    enabled: true,
+                    phase: "closed".to_owned(),
+                    open: false,
+                    latest_seq: readback.latest_seq,
+                    vault_dir: readback.vault_dir.clone(),
+                    lock_path: readback.lock_path.clone(),
+                    pid_path: readback.pid_path.clone(),
+                    ..self.calyx_vault_status.clone()
+                };
+                Ok(readback)
+            }
+            Err(error) => {
+                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::error(
+                    self.calyx_vault_config.as_ref(),
+                    "error",
+                    &error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn calyx_vault_status(&self) -> synapse_calyx::SynapseCalyxVaultStatus {
+        self.calyx_vault
+            .as_ref()
+            .map_or_else(|| self.calyx_vault_status.clone(), |vault| vault.status())
     }
 
     #[must_use]

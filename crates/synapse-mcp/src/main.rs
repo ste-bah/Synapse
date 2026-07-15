@@ -161,6 +161,15 @@ struct Cli {
     storage_pressure_free_bytes_sample: Option<u64>,
     #[arg(
         long,
+        env = "SYNAPSE_CALYX_VAULT",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    calyx_vault: bool,
+    #[arg(long, env = "SYNAPSE_CALYX_VAULT_DIR", value_name = "PATH")]
+    calyx_vault_dir: Option<PathBuf>,
+    #[arg(
+        long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
         default_value_t = synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO,
         value_name = "COUNT"
@@ -270,7 +279,7 @@ impl Cli {
     }
 
     fn m3_config(&self) -> m3::M3ServiceConfig {
-        m3::M3ServiceConfig::from_cli_parts(
+        let mut config = m3::M3ServiceConfig::from_cli_parts(
             self.db.clone(),
             self.profile_dir.clone(),
             self.reflex_disabled,
@@ -281,7 +290,10 @@ impl Cli {
             self.allowed_permissions.clone(),
             self.reflex_force_degraded,
             self.storage_pressure_free_bytes_sample,
-        )
+        );
+        config.calyx_vault = self.calyx_vault;
+        config.calyx_vault_dir = self.calyx_vault_dir.clone();
+        config
     }
 
     fn m4_config(&self) -> anyhow::Result<m4::M4ServiceConfig> {
@@ -625,6 +637,7 @@ struct StdioLifetimeLockReadiness {
     server_dispatch_quiescent: bool,
     m2_emitter_safe: bool,
     win_event_owners_quiescent: bool,
+    calyx_vault_closed: bool,
     hotkey_owners_quiescent: bool,
     k2_tasks_quiescent: bool,
     desktop_worker_owners_quiescent: bool,
@@ -638,6 +651,7 @@ const fn stdio_lifetime_locks_safe_to_close(readiness: StdioLifetimeLockReadines
         && readiness.server_dispatch_quiescent
         && readiness.m2_emitter_safe
         && readiness.win_event_owners_quiescent
+        && readiness.calyx_vault_closed
         && readiness.hotkey_owners_quiescent
         && readiness.k2_tasks_quiescent
         && readiness.desktop_worker_owners_quiescent
@@ -678,6 +692,7 @@ fn close_stdio_lifetime_locks(
             server_dispatch_quiescent = readiness.server_dispatch_quiescent,
             m2_emitter_safe = readiness.m2_emitter_safe,
             win_event_owners_quiescent = readiness.win_event_owners_quiescent,
+            calyx_vault_closed = readiness.calyx_vault_closed,
             hotkey_owners_quiescent = readiness.hotkey_owners_quiescent,
             k2_tasks_quiescent = readiness.k2_tasks_quiescent,
             desktop_worker_owners_quiescent = readiness.desktop_worker_owners_quiescent,
@@ -744,6 +759,43 @@ async fn drain_stdio_m2_owner(
     reason: &'static str,
 ) -> M2EmitterDrainReport {
     drain_m2_emitter_owner(owner.take(), "stdio", reason).await
+}
+
+fn close_stdio_calyx_vault(
+    m3_state: &crate::m3::SharedM3State,
+    reason: &'static str,
+    expected_open: bool,
+) -> (
+    bool,
+    anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
+) {
+    let result = match m3_state.lock() {
+        Ok(mut state) => state
+            .close_calyx_vault_for_shutdown(reason, expected_open)
+            .map_err(anyhow::Error::new)
+            .and_then(|readback| {
+                crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
+                Ok(readback)
+            }),
+        Err(poisoned) => {
+            let detail =
+                format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
+            drop(poisoned);
+            Err(anyhow::anyhow!(detail))
+        }
+    };
+    let safe_to_unlock = result
+        .as_ref()
+        .is_ok_and(|readback| readback.safe_to_unlock);
+    tracing::info!(
+        code = "MCP_STDIO_CALYX_VAULT_CLOSE_READBACK",
+        reason,
+        expected_open,
+        safe_to_unlock,
+        result = ?result,
+        "readback=calyx_vault edge=stdio_shutdown after_flush_close"
+    );
+    (safe_to_unlock, result)
 }
 
 #[derive(Clone, Debug)]
@@ -1143,31 +1195,70 @@ async fn run_stdio(
         let maintenance_result = match m3_state.lock() {
             Ok(mut state) => state
                 .ensure_storage_maintenance_tasks()
-                .context("start stdio storage maintenance"),
+                .map_err(anyhow::Error::new)
+                .and_then(|_| {
+                    let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
+                    crate::m3::record_calyx_vault_status_event(&status, "opened")?;
+                    Ok(())
+                })
+                .context("start stdio storage maintenance and Calyx vault"),
             Err(poisoned) => {
                 drop(poisoned);
                 Err(anyhow::anyhow!(
-                    "m3 service state lock poisoned during stdio storage maintenance startup"
+                    "m3 service state lock poisoned during stdio storage/Calyx startup"
                 ))
             }
         };
         if let Err(error) = maintenance_result {
+            let calyx_cleanup = match m3_state.lock() {
+                Ok(mut state) => state
+                    .close_calyx_vault_for_shutdown(
+                        "stdio_storage_or_calyx_open_or_maintenance_start_failed",
+                        false,
+                    )
+                    .map_err(anyhow::Error::new)
+                    .and_then(|readback| {
+                        crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
+                        Ok(readback)
+                    }),
+                Err(poisoned) => {
+                    let detail = format!(
+                        "m3 service state lock poisoned while cleaning up Calyx vault after startup failure: {poisoned}"
+                    );
+                    drop(poisoned);
+                    Err(anyhow::anyhow!(detail))
+                }
+            };
+            if let Err(cleanup_error) = &calyx_cleanup {
+                tracing::error!(
+                    code = "STDIO_CALYX_STARTUP_FAILURE_CLEANUP_FAILED",
+                    detail = %cleanup_error,
+                    "failed to close Calyx vault after stdio startup failure"
+                );
+            }
             tracing::error!(
-                code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
+                code = "STORAGE_OR_CALYX_OPEN_OR_MAINTENANCE_START_FAILED",
                 mode = "stdio",
                 db_path = %db_path.display(),
                 detail = %error,
-                "refusing to start: stdio storage open/maintenance startup failed"
+                "refusing to start: stdio storage open/maintenance or Calyx vault startup failed"
             );
             daemon_lifecycle::record_startup_exit(
-                "stdio_storage_open_or_maintenance_start_failed",
+                "stdio_storage_or_calyx_open_or_maintenance_start_failed",
                 serde_json::json!({
                     "mode": "stdio",
                     "db_path": db_path.display().to_string(),
                     "detail": error.to_string(),
+                    "calyx_cleanup": calyx_cleanup.as_ref().map(|readback| serde_json::to_value(readback).unwrap_or_else(|serialize_error| serde_json::json!({"serialize_error": serialize_error.to_string()}))).ok(),
+                    "calyx_cleanup_error": calyx_cleanup.as_ref().err().map(|cleanup_error| cleanup_error.to_string()),
                 }),
             )
             .context("record daemon lifecycle stdio storage maintenance startup failure")?;
+            if let Err(cleanup_error) = calyx_cleanup {
+                return Err(error).with_context(|| {
+                    format!("Calyx cleanup after startup failure also failed: {cleanup_error:#}")
+                });
+            }
             return Err(error);
         }
     }
@@ -1203,6 +1294,13 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio hotkey install failure");
+            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                &m3_state_for_calyx,
+                "stdio_operator_hotkey_install_failed",
+                true,
+            );
+            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             drop(service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1217,6 +1315,7 @@ async fn run_stdio(
                     server_dispatch_quiescent: true,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
+                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -1232,6 +1331,7 @@ async fn run_stdio(
                     ("operator_hotkey_install", Err(install_error)),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
+                    ("calyx_vault_close", calyx_vault_close.map(|_readback| ())),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1277,6 +1377,13 @@ async fn run_stdio(
                     .verdict()
                     .context("drain M2 emitter after stdio closed before init");
                 drop(start);
+                let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+                let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                    &m3_state_for_calyx,
+                    "stdio_connection_closed_before_init",
+                    true,
+                );
+                drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
                     inspect_win_event_shutdown_history(
@@ -1292,6 +1399,7 @@ async fn run_stdio(
                         server_dispatch_quiescent: true,
                         m2_emitter_safe,
                         win_event_owners_quiescent,
+                        calyx_vault_closed,
                         hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                         k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                         desktop_worker_owners_quiescent: false,
@@ -1306,6 +1414,10 @@ async fn run_stdio(
                     vec![
                         ("authority_finalizer_drain", authority_drain),
                         ("m2_emitter_drain", emitter_drain),
+                        (
+                            "calyx_vault_close",
+                            calyx_vault_close.map(|_readback| ()),
+                        ),
                         ("win_event_shutdown_history", win_event_shutdown_history),
                         ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                         ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1346,6 +1458,13 @@ async fn run_stdio(
                     .verdict()
                     .context("drain M2 emitter after stdio startup failure");
                 drop(start);
+                let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+                let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                    &m3_state_for_calyx,
+                    "stdio_start_failed_before_init",
+                    true,
+                );
+                drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
                     inspect_win_event_shutdown_history(
@@ -1359,6 +1478,7 @@ async fn run_stdio(
                         server_dispatch_quiescent: true,
                         m2_emitter_safe,
                         win_event_owners_quiescent,
+                        calyx_vault_closed,
                         hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                         k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                         desktop_worker_owners_quiescent: false,
@@ -1374,6 +1494,10 @@ async fn run_stdio(
                         ("rmcp_start", Err(start_error)),
                         ("authority_finalizer_drain", authority_drain),
                         ("m2_emitter_drain", emitter_drain),
+                        (
+                            "calyx_vault_close",
+                            calyx_vault_close.map(|_readback| ()),
+                        ),
                         ("win_event_shutdown_history", win_event_shutdown_history),
                         ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                         ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1418,6 +1542,13 @@ async fn run_stdio(
                 .verdict()
                 .context("drain M2 emitter after stdio signal before init");
             drop(start);
+            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                &m3_state_for_calyx,
+                "stdio_signal_before_init",
+                true,
+            );
+            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -1433,6 +1564,7 @@ async fn run_stdio(
                     server_dispatch_quiescent: true,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
+                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -1451,6 +1583,10 @@ async fn run_stdio(
                     ),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
+                    (
+                        "calyx_vault_close",
+                        calyx_vault_close.map(|_readback| ()),
+                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1500,6 +1636,13 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio service completion");
+            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                &m3_state_for_calyx,
+                "stdio_service_completed",
+                true,
+            );
+            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -1518,6 +1661,7 @@ async fn run_stdio(
                     server_dispatch_quiescent,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
+                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -1533,6 +1677,10 @@ async fn run_stdio(
                     ("rmcp_service_task_join", service_task_join),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
+                    (
+                        "calyx_vault_close",
+                        calyx_vault_close.map(|_readback| ()),
+                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1584,6 +1732,13 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio signal after init");
+            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
+            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
+                &m3_state_for_calyx,
+                "stdio_signal_after_init",
+                true,
+            );
+            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -1603,6 +1758,7 @@ async fn run_stdio(
                     server_dispatch_quiescent,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
+                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -1622,6 +1778,10 @@ async fn run_stdio(
                     ("rmcp_service_task_join", service_task_join),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
+                    (
+                        "calyx_vault_close",
+                        calyx_vault_close.map(|_readback| ()),
+                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1765,6 +1925,7 @@ mod stdio_shutdown_tests {
             server_dispatch_quiescent: true,
             m2_emitter_safe: true,
             win_event_owners_quiescent: true,
+            calyx_vault_closed: true,
             hotkey_owners_quiescent: true,
             k2_tasks_quiescent: true,
             desktop_worker_owners_quiescent: true,
@@ -1788,6 +1949,10 @@ mod stdio_shutdown_tests {
 
         let mut readiness = safe;
         readiness.win_event_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.calyx_vault_closed = false;
         assert!(!stdio_lifetime_locks_safe_to_close(readiness));
 
         let mut readiness = safe;

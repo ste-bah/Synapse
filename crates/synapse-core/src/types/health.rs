@@ -69,6 +69,34 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_identity_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_machine_salt_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_lock_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_pid_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_latest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_last_recovered_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_torn_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_count: Option<usize>,

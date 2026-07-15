@@ -4114,12 +4114,13 @@ function Test-SynapseCandidateDaemon {
 
     $candidateRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-candidates') -Purpose 'candidate'
     $candidateDb = Join-Path $candidateRoot 'db'
+    $candidateCalyxVault = Join-Path $candidateRoot 'vault'
     $candidateShellJobRoot = Join-Path $candidateRoot 'shell-jobs'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
-    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
 
     $candidate = $null
     $health = $null
@@ -4131,7 +4132,7 @@ function Test-SynapseCandidateDaemon {
             $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
             $candidate = Start-Process `
                 -FilePath $CandidateExePath `
-                -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
+                -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info') `
                 -WindowStyle Hidden `
                 -PassThru
         } finally {

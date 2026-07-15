@@ -5,6 +5,7 @@ members = [
     "crates/synapse-core",
     "crates/synapse-capture",
     "crates/synapse-a11y",
+    "crates/synapse-calyx",
     "crates/synapse-perception",
     "crates/synapse-audio",
     "crates/synapse-action",
@@ -95,6 +96,7 @@ windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
     "Foundation_Collections",
 ] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 windows-capture = "2.0.0"
 uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
 chromiumoxide = "0.9.1"
@@ -106,6 +108,7 @@ rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "zs
 clap = { version = "4.6.1", features = ["derive", "env"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
+ulid = { version = "1", features = ["serde"] }
 # Pinned to an exact version: schemars output IS the published MCP tool-schema
 # contract surface (see tests/snapshots/*.snap). A transparent minor/patch bump
 # can silently change schema emission (e.g. `items: true` -> `items: {}`) and
