@@ -1,0 +1,491 @@
+use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use calyx_core::{Input, Lens, Modality};
+
+use super::{
+    CALYX_LICENSE_DENIED, MultimodalAdapterLens, MultimodalAdapterSpec, MultimodalAxis,
+    default_multimodal_lens_specs,
+};
+use crate::LensHealth;
+
+const CPU_OVERRIDE_ENV: &str = "CALYX_MULTIMODAL_ALLOW_CPU_ADAPTER";
+
+#[test]
+fn adapter_requires_real_config_and_registers_loaded_contract() {
+    let fixture = adapter_fixture("loaded", MultimodalAxis::Image, 768);
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-image",
+        MultimodalAxis::Image,
+        768,
+        Some(fixture.config.clone()),
+        None,
+        false,
+    ))
+    .unwrap();
+    let spec = lens.lens_spec();
+    let contract = lens.contract();
+
+    assert_eq!(spec.health(), LensHealth::Loaded);
+    contract.verify_registration(&lens).unwrap();
+
+    let reloaded = MultimodalAdapterLens::from_lens_spec(&spec).unwrap();
+    contract.verify_registration(&reloaded).unwrap();
+}
+
+#[test]
+fn persisted_adapter_rehash_rejects_replaced_model_file() {
+    let fixture = adapter_fixture("frozen-rehash", MultimodalAxis::Image, 32);
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-frozen-rehash",
+        MultimodalAxis::Image,
+        32,
+        Some(fixture.config.clone()),
+        None,
+        false,
+    ))
+    .unwrap();
+    let spec = lens.lens_spec();
+    let model = fixture.config.parent().unwrap().join("model.onnx");
+    fs::write(model, b"replacement-model-bytes").unwrap();
+
+    let error = MultimodalAdapterLens::from_lens_spec(&spec).unwrap_err();
+
+    assert_eq!(error.code, "CALYX_LENS_FROZEN_VIOLATION");
+    assert!(error.message.contains("weights_sha256"));
+}
+
+#[test]
+fn missing_adapter_config_fails_closed() {
+    let error = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "missing",
+        MultimodalAxis::Image,
+        768,
+        None,
+        None,
+        false,
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_LENS_CONFIG_INVALID");
+    assert!(error.message.contains("config is required"));
+}
+
+#[test]
+fn cuda_fail_loud_provider_loads_from_real_config() {
+    let fixture = adapter_fixture_with_provider(
+        "cuda-provider",
+        MultimodalAxis::Image,
+        128,
+        "cuda_fail_loud",
+    );
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-cuda-image",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap();
+
+    assert!(lens.provider().is_gpu());
+    assert_eq!(
+        lens.provider_detail(),
+        "cuda:0,error_on_failure,no_cpu_fallback"
+    );
+}
+
+#[test]
+fn missing_provider_defaults_to_cuda_fail_loud() {
+    let fixture = adapter_fixture_without_provider("missing-provider", MultimodalAxis::Image, 128);
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-default-cuda-image",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap();
+
+    assert!(lens.provider().is_gpu());
+    assert_eq!(
+        lens.provider_detail(),
+        "cuda:0,error_on_failure,no_cpu_fallback"
+    );
+    assert_eq!(lens.lens_spec().max_batch, Some(32));
+}
+
+#[test]
+fn cuda_preferred_provider_fails_closed() {
+    let fixture = adapter_fixture_with_provider(
+        "cuda-preferred-provider",
+        MultimodalAxis::Image,
+        128,
+        "cuda_preferred",
+    );
+    let error = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-cuda-preferred-image",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_LENS_CONFIG_INVALID");
+    assert!(error.message.contains("CPU fallback is forbidden"));
+}
+
+#[test]
+fn tensorrt_cuda_fail_loud_provider_loads_from_real_config() {
+    let fixture = adapter_fixture_with_provider(
+        "tensorrt-cuda-provider",
+        MultimodalAxis::Image,
+        128,
+        "tensorrt_cuda_fail_loud",
+    );
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-tensorrt-cuda-image",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap();
+
+    assert!(lens.provider().is_gpu());
+    assert_eq!(
+        lens.provider_detail(),
+        "tensorrt:0,cuda:0,error_on_failure,no_cpu_fallback"
+    );
+}
+
+#[test]
+fn unsupported_adapter_provider_fails_closed() {
+    let fixture = adapter_fixture_with_provider("bad-provider", MultimodalAxis::Image, 128, "auto");
+    let error = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "fixture-bad-provider",
+        MultimodalAxis::Image,
+        128,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_LENS_CONFIG_INVALID");
+    assert!(
+        error
+            .message
+            .contains("unsupported multimodal adapter provider auto")
+    );
+}
+
+#[test]
+fn malformed_inputs_return_typed_errors_before_helper_spawn() {
+    let cases = [
+        (
+            MultimodalAxis::Image,
+            Input::new(Modality::Image, b"not-an-image".to_vec()),
+        ),
+        (
+            MultimodalAxis::Audio,
+            Input::new(Modality::Audio, b"RIFFbad".to_vec()),
+        ),
+        (
+            MultimodalAxis::Protein,
+            Input::new(Modality::Protein, b"ACDZ".to_vec()),
+        ),
+        (
+            MultimodalAxis::Dna,
+            Input::new(Modality::Dna, b"ACGTX".to_vec()),
+        ),
+        (
+            MultimodalAxis::Molecule,
+            Input::new(Modality::Molecule, b"C?O".to_vec()),
+        ),
+    ];
+
+    for (axis, input) in cases {
+        let fixture = adapter_fixture(axis.as_str(), axis, 16);
+        let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+            "bad",
+            axis,
+            16,
+            Some(fixture.config),
+            None,
+            false,
+        ))
+        .unwrap();
+        let error = lens.measure(&input).unwrap_err();
+        assert_eq!(error.code, "CALYX_LENS_DIM_MISMATCH");
+        assert!(error.message.contains(axis.as_str()));
+        assert!(!fixture.marker.exists());
+    }
+}
+
+#[test]
+fn cpu_provider_requires_audited_override_before_helper_spawn() {
+    let _guard = cpu_env_guard(None);
+    let fixture = adapter_fixture("cpu-no-override", MultimodalAxis::Protein, 4);
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "cpu-no-override",
+        MultimodalAxis::Protein,
+        4,
+        Some(fixture.config),
+        None,
+        false,
+    ))
+    .unwrap();
+
+    let error = lens
+        .measure(&Input::new(Modality::Protein, b"ACDE".to_vec()))
+        .unwrap_err();
+
+    assert_eq!(error.code, "CALYX_MULTIMODAL_CPU_OVERRIDE_REQUIRED");
+    assert!(error.message.contains(CPU_OVERRIDE_ENV));
+    assert!(!fixture.marker.exists());
+}
+
+#[cfg_attr(
+    windows,
+    ignore = "Windows cleanup-job assignment can be denied in local test shells"
+)]
+#[test]
+fn cpu_adapter_respawns_one_shot_helper_for_repeated_measurements() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let _guard = cpu_env_guard(Some("1"));
+    let root = temp_root("one-shot-helper");
+    let helper = root.join("helper.py");
+    let model = root.join("model.onnx");
+    let config = root.join("adapter.json");
+    let marker = root.join("adapter.count");
+    fs::write(&model, b"not-used-by-helper").unwrap();
+    fs::write(
+        &helper,
+        format!(
+            r#"import argparse, json, struct, sys
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
+marker = Path({marker:?})
+count = int(marker.read_text()) if marker.exists() else 0
+marker.write_text(str(count + 1))
+header = sys.stdin.buffer.read(4)
+if len(header) != 4:
+    raise SystemExit(2)
+size = struct.unpack(">I", header)[0]
+request = json.loads(sys.stdin.buffer.read(size))
+payload = json.dumps({{"vectors": [[1.0, 0.0, 0.0, 0.0] for _ in request.get("inputs", [])]}}).encode()
+sys.stdout.buffer.write(struct.pack(">I", len(payload)))
+sys.stdout.buffer.write(payload)
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &config,
+        r#"{
+  "schema": "calyx-multimodal-adapter-v2",
+  "engine": "onnx-external",
+  "axis": "protein",
+  "model_id": "fixture/protein",
+  "processor_model_id": "fixture/protein",
+  "dim": 4,
+  "python": "python3",
+  "helper": "helper.py",
+  "model_file": "model.onnx",
+  "provider": "cpu_explicit"
+}"#,
+    )
+    .unwrap();
+    let lens = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "one-shot-protein",
+        MultimodalAxis::Protein,
+        4,
+        Some(config),
+        None,
+        false,
+    ))
+    .unwrap();
+    let input = Input::new(Modality::Protein, b"ACDE".to_vec());
+
+    lens.measure(&input).unwrap();
+    lens.measure(&input).unwrap();
+
+    assert_eq!(fs::read_to_string(marker).unwrap(), "2");
+}
+
+#[test]
+fn license_gate_denies_noncommercial_before_config_load() {
+    let denied = MultimodalAdapterLens::from_adapter_spec(adapter_spec(
+        "nc-dna",
+        MultimodalAxis::Dna,
+        16,
+        None,
+        Some("CC-BY-NC-SA-4.0"),
+        false,
+    ))
+    .unwrap_err();
+
+    assert_eq!(denied.code, CALYX_LICENSE_DENIED);
+}
+
+#[test]
+fn default_pack_advertises_only_real_priority_axes() {
+    let specs = default_multimodal_lens_specs();
+
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0].axis, MultimodalAxis::Image);
+    assert_eq!(specs[0].dim, 768);
+    assert_eq!(specs[1].axis, MultimodalAxis::Audio);
+    assert_eq!(specs[1].dim, 512);
+}
+
+struct AdapterFixture {
+    config: PathBuf,
+    marker: PathBuf,
+}
+
+fn adapter_fixture(label: &str, axis: MultimodalAxis, dim: u32) -> AdapterFixture {
+    adapter_fixture_with_provider(label, axis, dim, "cpu_explicit")
+}
+
+fn adapter_fixture_without_provider(label: &str, axis: MultimodalAxis, dim: u32) -> AdapterFixture {
+    write_adapter_fixture(label, axis, dim, None)
+}
+
+fn adapter_fixture_with_provider(
+    label: &str,
+    axis: MultimodalAxis,
+    dim: u32,
+    provider: &str,
+) -> AdapterFixture {
+    write_adapter_fixture(label, axis, dim, Some(provider))
+}
+
+fn write_adapter_fixture(
+    label: &str,
+    axis: MultimodalAxis,
+    dim: u32,
+    provider: Option<&str>,
+) -> AdapterFixture {
+    let root = temp_root(label);
+    let helper = root.join("helper.py");
+    let marker = root.join("helper-ran.marker");
+    fs::write(
+        &helper,
+        format!(
+            "from pathlib import Path\nPath({:?}).write_text('ran')\n",
+            marker
+        ),
+    )
+    .unwrap();
+    let model = root.join("model.onnx");
+    fs::write(&model, b"not-used-by-invalid-input-tests").unwrap();
+    let config = root.join("adapter.json");
+    let provider_line = provider
+        .map(|value| format!(",\n  \"provider\": \"{value}\""))
+        .unwrap_or_default();
+    fs::write(
+        &config,
+        format!(
+            r#"{{
+  "schema": "calyx-multimodal-adapter-v2",
+  "engine": "onnx-external",
+  "axis": "{}",
+  "model_id": "fixture/{}",
+  "processor_model_id": "fixture/{}",
+  "dim": {},
+  "python": "python3",
+  "helper": "helper.py",
+  "model_file": "model.onnx"{}
+}}"#,
+            axis.as_str(),
+            axis.as_str(),
+            axis.as_str(),
+            dim,
+            provider_line
+        ),
+    )
+    .unwrap();
+    AdapterFixture { config, marker }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn cpu_env_guard(value: Option<&str>) -> EnvGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let previous = std::env::var_os(CPU_OVERRIDE_ENV);
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(CPU_OVERRIDE_ENV, value),
+            None => std::env::remove_var(CPU_OVERRIDE_ENV),
+        }
+    }
+    EnvGuard {
+        key: CPU_OVERRIDE_ENV,
+        previous,
+        _lock: lock,
+    }
+}
+
+fn adapter_spec(
+    name: &str,
+    axis: MultimodalAxis,
+    dim: u32,
+    adapter_config: Option<PathBuf>,
+    license: Option<&str>,
+    allow_non_commercial: bool,
+) -> MultimodalAdapterSpec {
+    MultimodalAdapterSpec {
+        name: name.to_string(),
+        axis,
+        model_id: format!("fixture/{}", axis.as_str()),
+        dim,
+        license: license.map(str::to_string),
+        allow_non_commercial,
+        adapter_config,
+        files: Vec::new(),
+    }
+}
+
+fn temp_root(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "calyx-multimodal-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    root
+}

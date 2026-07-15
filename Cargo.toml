@@ -17,7 +17,9 @@ members = [
     "crates/synapse-overlay",
 ]
 default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]
-exclude = []
+# The vendored Calyx workspace (calyx/) is its own nested workspace; Synapse
+# crates reach it via path dependencies (issue #1652 / docs/calyx/).
+exclude = ["calyx"]
 
 [workspace.package]
 version = "0.1.0"
