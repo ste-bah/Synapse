@@ -101,6 +101,10 @@ async fn release_all_on_empty_state_stays_empty() -> Result<(), Box<dyn Error>> 
 #[test]
 fn emitter_channel_preserves_bounded_queue_capacity() {
     let (handle, _snapshot_handle, emitter) = ActionEmitter::channel();
+    let normal_action = Action::KeyDown {
+        key: key_named("capacity"),
+        backend: Backend::Software,
+    };
     println!(
         "readback=action_emitter_queue edge=capacity before=queued:{}",
         emitter.pending_len()
@@ -109,14 +113,14 @@ fn emitter_channel_preserves_bounded_queue_capacity() {
 
     for _index in 0..ACTION_QUEUE_CAPACITY {
         handle
-            .try_execute(Action::ReleaseAll)
+            .try_execute(normal_action.clone())
             .unwrap_or_else(|err| {
                 panic!("bounded queue should accept capacity-sized burst: {err}")
             });
     }
 
     assert_eq!(emitter.pending_len(), ACTION_QUEUE_CAPACITY);
-    let error = match handle.try_execute(Action::ReleaseAll) {
+    let error = match handle.try_execute(normal_action) {
         Ok(()) => panic!("257th action should return ACTION_QUEUE_FULL"),
         Err(error) => error,
     };
