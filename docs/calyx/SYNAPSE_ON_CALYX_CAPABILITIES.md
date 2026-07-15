@@ -79,6 +79,18 @@ Because real outcomes are attached as **anchors** — routine confirmations and 
 - **Measured compression** — slots quantize only as far as recall/bits/false-accept hold; the store refuses to trade intelligence for space silently.
 - **Reactive triggers** — after each ingest: new-region (first-ever territory), recurs (known pattern again), drift — pushed live through `subscribe`, quarantine-grade events through `escalation`.
 
+## 9.5 Calyx steers and controls (the closed loop)
+
+The substrate doesn't just answer questions — it drives decisions, under a strict doctrine: **grounded + calibrated may control; provisional may only advise;** everything ledger-logged, reversible, and operator-overridable (and every override becomes an anchor that retrains the steering).
+
+- **Model routing** — the `model` tool recommends models per task class from measured success/cost bits with confidence intervals, not vibes.
+- **Tool steering** — agents spawn with recommended/discouraged tool sets backed by per-tool outcome bits and failure arrows; the 40-tool schema budget is curated by measured usage instead of hand tuning.
+- **Risky-call gating** — destructive shell/delete/send calls get a pre-flight grounded consequence tree + out-of-distribution check: warn by default, deny per policy, honest *Insufficient* when evidence is thin.
+- **Live agent intervention** — a running agent whose event stream drifts out of the trusted region is quarantined with pause/kill recommendations and per-slot evidence.
+- **Steering the agent that uses Synapse** — Synapse measures its *own* MCP usage as a corpus; tool responses carry in-band, evidence-tagged `steering` hints (next-best call, cheaper parameterization, misuse warnings), a `guide` action returns the kernel-backed optimal usage pattern, and defaults/tool-sets are annealed (shadow-tested, reversible).
+- **Autonomy gating** — routine arming and autonomy-tier escalation require identity-lock + the readiness predicate; unready domains fail closed.
+- **Hot-path safety** — reflex and capture ticks never call Calyx live; they consume only lowered, fingerprinted frozen artifacts, refreshed asynchronously.
+
 ## 10. Hardware posture
 
 - **GPU-first, CPU-always** — all vector/association math (cosine, GEMM, top-k, MI estimation support) runs on CUDA when a GPU is present (VRAM-budgeted, bit-parity-checked against CPU), and falls back automatically to AVX-512-aware SIMD CPU kernels when it isn't. The daemon never fails for lack of a GPU; `health` reports which backend is live.
@@ -106,4 +118,6 @@ Because real outcomes are attached as **anchors** — routine confirmations and 
 - *"Did anything tamper with the store? Erase last night's clipboard rows."* → chain verifies green; rows erased with tombstones; chain still green.
 - *"Something feels off about this agent."* → it was quarantined 40 seconds ago: its event stream left the trusted region on the tool-call slot; escalation already raised.
 
-One engine. Every record measured. Every association counted. Every claim grounded or labeled. Every answer explainable. Every byte verifiable.
+- *(to the agent calling Synapse)* — your cost query just came back with a steering hint: "bound the window; the rollup answers this 100× cheaper" — because the last 40 unbounded scans measurably preceded retries.
+
+One engine — absorbed into this repo as Synapse's own code (`calyx/`, fork-and-own; see `calyx/README.md`). Every record measured. Every association counted. Every claim grounded or labeled. Every answer explainable. Every byte verifiable. And the loop closed: Calyx steers Synapse, its agents, and the agents using it.

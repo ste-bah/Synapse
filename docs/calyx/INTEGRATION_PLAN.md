@@ -177,15 +177,17 @@ Beyond storing and analyzing, Calyx **controls** what it can do so with groundin
 
 Every issue ends with manual FSV (never automated, AGENTS.md D1): daemon PID/bind named, real MCP `tools/call` trigger, SoT read *after* the call (vault scan / ledger `verify_chain` / assay rows / kernel report — the actual bytes), evidence doc `docs/fsv/issue-<n>-…md`. Regression support: `cargo test --workspace`, clippy deny gate, determinism probes on every new lens, CPU↔GPU parity checks, `reproduce` drift bounds.
 
-## 7. Issue graph (filed 2026-07-15 — epic #1684)
+## 7. Issue graph (filed 2026-07-15, extended same day — epic #1684)
 
-- **Phase 0 — Foundation:** #1652 vendoring (pinned git deps, cuda feature) → #1653 `synapse-calyx` vault crate → #1654 GPU-preferred/CPU-fallback math runtime.
-- **Phase 1 — Parity swap:** #1655 backend seam → #1656 Kv backend (byte-identical Db API) → #1657 retention/TTL, #1658 disk pressure, #1659 GC, #1660 inspect/dump → #1661 migration (byte-exact verified) → #1662 cutover + rocksdb removal.
-- **Phase 2 — Measure:** #1663 `Syn*` encoder family → #1664 timeline/episode panels, #1665 agent panels, #1666 action/reflex/process/observation panels → #1667 temporal lenses + recurrence → #1668 panel lifecycle/backfill/admission gate.
+- **Phase 0 — Foundation & absorption:** #1652 absorb Calyx fork-and-own (landed in tree) → #1653 `synapse-calyx` vault crate → #1654 GPU-preferred/CPU-fallback math runtime.
+- **Phase 0.5 — Calyx adaptation (new code — §2.5):** #1692 async vault facade + WAL-synced batcher → #1693 Windows durability hardening + crash soak → #1694 structured-record measurement pipeline → #1695 deferred forge GPU ops (profile-driven) → #1696 error/config/clock bridges.
+- **Phase 1 — Parity swap:** #1655 backend seam → #1656 Kv backend (byte-identical Db API; needs #1692) → #1657 retention/TTL, #1658 disk pressure, #1659 GC, #1660 inspect/dump → #1661 migration (byte-exact verified) → #1662 cutover + rocksdb removal (needs #1693).
+- **Phase 2 — Measure:** #1663 `Syn*` encoder family (new calyx-registry code; needs #1694) → #1664 timeline/episode panels, #1665 agent panels, #1666 action/reflex/process/observation panels → #1667 temporal lenses + recurrence → #1668 panel lifecycle/backfill/admission gate → #1685 graph-structural + hierarchy lenses.
 - **Phase 3 — Ground:** #1669 anchor writers → #1670 grounding-gap report.
-- **Phase 4 — Count/Differentiate:** #1671 loom weave/abundance → #1672 assay bits/sufficiency → #1673 transfer entropy/periodicity/CUSUM/hazard → #1674 blind spots + drift.
-- **Phase 5 — Compose:** #1675 kernel + kernel_answer → #1676 fused find-similar search → #1677 ward guard + identity lock → #1678 oracle + readiness → #1679 ledger provenance + erase → #1680 reactive triggers → #1681 anneal self-optimizer.
-- **Phase 6 — Prove:** #1682 end-to-end FSV sweep + performance acceptance → #1683 documentation.
+- **Phase 4 — Count/Differentiate:** #1671 loom weave/abundance → #1672 assay bits/sufficiency/synergy → #1673 transfer entropy/periodicity/CUSUM/hazard → #1674 blind spots + drift.
+- **Phase 5 — Compose:** #1675 kernel + kernel_answer → #1676 fused find-similar search (+agree/disagree, MaxSim) → #1677 ward guard + identity lock → #1678 oracle + readiness → #1679 ledger provenance + erase → #1680 reactive triggers → #1681 anneal self-optimizer → #1688 TimeSeries/OLAP analytics.
+- **Phase 5.5 — Control & steering (§4.1):** #1686 hot-path lowering → #1689 grounded agent/model/tool steering + risky-call gating → #1690 proactive daemon steering + readiness-gated autonomy → #1691 Calyx-steered MCP surface.
+- **Phase 6 — Ops & prove:** #1687 backup/verify_restore + encryption decision → #1682 end-to-end FSV sweep + performance acceptance → #1683 documentation.
 - **Tracker:** #1684 `[CALYX][EPIC]` — dependency-ordered checklist of all of the above.
 
-When all are closed, Synapse runs fully on Calyx with every capability live and FSV-verified.
+When all are closed, Synapse runs fully on Calyx — as its database, its intelligence, and its grounded controller — with every capability live and FSV-verified.
