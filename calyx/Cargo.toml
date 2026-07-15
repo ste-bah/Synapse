@@ -68,3 +68,10 @@ debug = "line-tables-only"
 # size reduction with zero loss of first-party debuggability.
 [profile.dev.package."*"]
 debug = false
+
+# The absorbed Calyx crates are Synapse-owned code, but this remains a nested
+# workspace so it can keep a policy that fits the imported baseline. Deny the
+# stable clippy correctness/style surface for every member and leave stricter
+# Synapse-wide pedantic/nursery escalation to targeted follow-up work.
+[workspace.lints.clippy]
+all = "deny"

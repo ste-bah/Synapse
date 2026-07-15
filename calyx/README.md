@@ -8,6 +8,28 @@ Rules:
 3. `calyx/` is a nested cargo workspace (`exclude = ["calyx"]` in the root manifest) so it keeps its own dependency set and lint profile while living in this repo.
 4. The design doctrine is `BUILDING_ON_CALYX.md` (kept here): decompose to atoms → all base associations → differentiate (bits) → kernel → compose. Encoders for the explicit, no learned embedders, grounding mandatory, no-flatten, fail closed.
 
+Local gates for this nested workspace are separate from the root Synapse workspace:
+
+```powershell
+cargo check --manifest-path calyx\Cargo.toml --workspace
+cargo fmt --manifest-path calyx\Cargo.toml --all --check
+cargo clippy --manifest-path calyx\Cargo.toml --workspace --all-targets
+```
+
+The root `.githooks/pre-push` hook runs those Calyx fmt/clippy gates automatically when a push touches `calyx/` Rust or Cargo files.
+
+CUDA compile checks are opt-in and package-feature scoped:
+
+```powershell
+cargo check --manifest-path calyx\Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
+```
+
+On Windows, CUDA 13.x builds require `NVCC_CCBIN` to point at the MSVC
+`Hostx64\x64` directory containing `cl.exe`, and `NVCC_APPEND_FLAGS` must include
+`-Xcompiler=/Zc:preprocessor`. `scripts\synapse-setup.ps1` detects and persists
+those variables when CUDA is installed; if either variable is wrong the CUDA
+build should fail loudly rather than silently compiling a different backend.
+
 Kept crates (dependency-closed set): `calyx-core`, `calyx-aster` (storage), `calyx-registry` (lenses), `calyx-forge` (CPU/CUDA math), `calyx-loom` (associations), `calyx-assay` (bits), `calyx-lodestar` (kernel), `calyx-ward` (guard), `calyx-oracle` (prediction), `calyx-ledger` (provenance), `calyx-sextant`/`calyx-search` (search), `calyx-anneal` (self-optimization), `calyx-mincut`, `calyx-fsv`, `calyx-paths`, `calyx-testkit`.
 
 Pruned at absorption (apps/servers this project doesn't need): calyx-poly, calyx-leapable, calyx-cli, calyxd, calyx-mcp, calyx-web-api, calyx-gatebrokerd, calyx-hazard-soak, calyx-buildinfo, and the upstream assets/data/datasets/docs/fuzz/infra/tools directories.

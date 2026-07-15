@@ -123,6 +123,20 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
+For the absorbed Calyx nested workspace:
+
+```powershell
+cargo check --manifest-path calyx\Cargo.toml --workspace
+cargo fmt --manifest-path calyx\Cargo.toml --all --check
+cargo clippy --manifest-path calyx\Cargo.toml --workspace --all-targets
+```
+
+For Calyx CUDA feature compile coverage:
+
+```powershell
+cargo check --manifest-path calyx\Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
+```
+
 | Goal | Command |
 |---|---|
 | All tests | `cargo test --workspace` |
@@ -131,11 +145,13 @@ cargo test --workspace
 | One test by name | `cargo test -p synapse-core types` |
 | Include `#[ignore]` tests | `cargo test --workspace -- --ignored` |
 | List tests without running | `cargo test -p <crate> -- --list` |
-| Lint gate (what pre-push runs) | `cargo clippy --workspace --all-targets` |
+| Lint gate (what pre-push runs) | Root changes: `cargo fmt --all --check` + `cargo clippy --workspace --all-targets`; Calyx changes: `cargo fmt --manifest-path calyx\Cargo.toml --all --check` + `cargo clippy --manifest-path calyx\Cargo.toml --workspace --all-targets` |
 
 **Build prerequisite (from MEMORY):** the workspace links `librocksdb-sys`; the build/test compile can fail with `STATUS_DLL_NOT_FOUND` unless `libclang.dll` (VS BuildTools `VC\Tools\Llvm\x64\bin`) is on `PATH`.
 
-**Pre-push gate** (`.githooks/pre-push`, enabled once via `git config core.hooksPath .githooks`): runs `cargo clippy --workspace --all-targets` on any push touching `.rs`/`Cargo.*`, blocks on failure, skips docs-only pushes. Warning-only clippy output is accepted by policy, captured to a local Git-private log, and summarized with a warning count so push output distinguishes accepted warnings from deny-level failures. It deliberately does **not** run `cargo test --workspace` (too slow). Bypass: `git push --no-verify`.
+**Calyx CUDA build prerequisite:** on Windows with CUDA 13.x, `nvcc` needs an MSVC `Hostx64\x64` compiler directory in `NVCC_CCBIN`, and dependency CUDA kernels need `NVCC_APPEND_FLAGS` to include `-Xcompiler=/Zc:preprocessor`. `scripts\synapse-setup.ps1` detects and writes those user environment variables when CUDA is installed.
+
+**Pre-push gate** (`.githooks/pre-push`, enabled once via `git config core.hooksPath .githooks`): runs root fmt/clippy on pushes touching root Rust/Cargo files and separate Calyx fmt/clippy with `--manifest-path calyx\Cargo.toml` on pushes touching `calyx/` Rust/Cargo files; it blocks on failure and skips docs-only pushes. Warning-only clippy output is accepted by policy, captured to a local Git-private log, and summarized with a warning count so push output distinguishes accepted warnings from deny-level failures. It deliberately does **not** run `cargo test --workspace` (too slow). Bypass: `git push --no-verify`.
 
 ### Test-relevant environment variables (from `StdioMcpClient`)
 
@@ -183,7 +199,7 @@ cargo test --workspace
 
 - **Real Windows perception/action paths are not exercised in the default suite.** The heavyweight Windows behaviors (Notepad type+save, UIA snapshots, WinRT OCR, ViGEm XInput, real keyboard hook) are all `#[ignore]`d, so `cargo test --workspace` does not validate them. They depend on manual FSV (see §3.1).
 - **Non-Windows is only "fail-closed" tested.** On non-Windows, the Windows surfaces have stub implementations whose tests merely assert they error ("requires Windows"); actual perception/action is untested off-Windows (and unsupported).
-- **No CI.** GitHub Actions are forbidden (#351); the only automated gate is the local pre-push clippy hook, which does **not** run tests. Test execution depends on the developer/agent running `cargo test --workspace` manually.
+- **No CI.** GitHub Actions are forbidden (#351); the only automated gate is the local pre-push fmt/clippy hook, which does **not** run tests. Test execution depends on the developer/agent running the relevant workspace tests manually.
 - **e2e tests pin a synthetic foreground.** `StdioMcpClient` defaults `SYNAPSE_MCP_SYNTHETIC_FIXTURE=notepad`, so e2e action-gate tests run against an injected (not real) foreground — real foreground/SoT behavior is verified only by manual FSV.
 - **FSV itself is unautomated by design.** Manifests carry `minimum_manual_fsv` metadata, but no Rust test performs the FSV checklist; tests only assert the metadata parses.
 - **No workspace-level integration crate.** `C:\code\synapse\tests\` holds fixtures only; there is no cross-crate end-to-end runner outside `synapse-mcp`.

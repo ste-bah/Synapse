@@ -51,3 +51,6 @@ name = "__calyx_integration_suite_1"
 path = "tests/__calyx_integration_suite_1.rs"
 
 # END generated integration harnesses (issue #1546)
+
+[lints]
+workspace = true

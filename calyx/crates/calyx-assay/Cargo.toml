@@ -59,6 +59,9 @@ path = "tests/__calyx_integration_suite_1.rs"
 
 # END generated integration harnesses (issue #1546)
 
+[lints]
+workspace = true
+
 # Dedicated post-#1546 harnesses. The issue1505-1507 roots mutate the shared
 # strict-CUDA environment switch and must remain process-isolated.
 [[test]]

@@ -47,16 +47,33 @@ the roadmap (see the README "What's left on the docket" section).
    cargo clippy --workspace --all-targets
    cargo test --workspace
    ```
+   The absorbed Calyx code lives in its own nested workspace under `calyx/`.
+   When touching it, run the Calyx workspace gates separately:
+   ```bash
+   cargo check --manifest-path calyx/Cargo.toml --workspace
+   cargo fmt --manifest-path calyx/Cargo.toml --all
+   cargo clippy --manifest-path calyx/Cargo.toml --workspace --all-targets
+   ```
+   CUDA-enabled Calyx checks on Windows need `nvcc` plus an MSVC Hostx64
+   compiler directory published through `NVCC_CCBIN`. CUDA 13.x also requires
+   `NVCC_APPEND_FLAGS` to include `-Xcompiler=/Zc:preprocessor` so dependency
+   CUDA kernels compile with MSVC's conforming preprocessor. `scripts/synapse-setup.ps1`
+   detects and writes those user environment variables when CUDA is present.
+   The full Calyx CUDA compile check is:
+   ```bash
+   cargo check --manifest-path calyx/Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
+   ```
 3. **Enable the local pre-push gate (once per clone):**
    ```bash
    git config core.hooksPath .githooks
    ```
    This repo uses no CI (GitHub Actions are forbidden), so `.githooks/pre-push`
-   is the automated backstop: it runs `cargo clippy --workspace --all-targets`
-   before any push that touches `.rs`/`Cargo.*` and blocks the push on failure
-   (it skips docs-only pushes). It is a fast compile+lint gate, not a substitute
-   for `cargo test --workspace` or manual verification. Bypass only for a genuine
-   non-compiling emergency with `git push --no-verify`.
+   is the automated backstop: it runs root fmt/clippy for root Rust/Cargo
+   changes and separate Calyx fmt/clippy with `--manifest-path calyx/Cargo.toml`
+   for `calyx/` Rust/Cargo changes (it skips docs-only pushes). It is a fast
+   compile+lint gate, not a substitute for `cargo test --workspace` or manual
+   verification. Bypass only for a genuine non-compiling emergency with
+   `git push --no-verify`.
 4. **Iterate with fast builds.** Use `cargo check` (~15 s) or `cargo build`
    (dev, ~45 s incremental) for the edit loop. Run `cargo build --release` ONLY
    to ship/run the real `synapse-mcp.exe` daemon — never as compile feedback.

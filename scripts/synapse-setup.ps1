@@ -284,6 +284,134 @@ function Get-SynapseUnixTimeMilliseconds {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 }
 
+function Resolve-SynapseMsvcCcbinPath {
+    param(
+        [Parameter(Mandatory=$true)][string]$PathValue,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+
+    $expanded = [System.Environment]::ExpandEnvironmentVariables($PathValue.Trim().Trim('"'))
+    if ([string]::IsNullOrWhiteSpace($expanded)) {
+        throw "SYNAPSE_CUDA_NVCC_CCBIN_EMPTY context=$Context remediation=NVCC_CCBIN must point to cl.exe or a directory containing cl.exe"
+    }
+    $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction Stop).Path
+    $item = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if ($item.PSIsContainer) {
+        $cl = Join-Path $item.FullName 'cl.exe'
+        if (Test-Path -LiteralPath $cl -PathType Leaf) {
+            return $item.FullName
+        }
+    } elseif ($item.Name -ieq 'cl.exe' -and $item.DirectoryName) {
+        return $item.DirectoryName
+    }
+    throw "SYNAPSE_CUDA_NVCC_CCBIN_INVALID context=$Context path=$PathValue resolved=$resolved remediation=NVCC_CCBIN must point to cl.exe or a directory containing cl.exe"
+}
+
+function Get-SynapseMsvcHostCompilerDir {
+    $roots = @()
+    foreach ($programRoot in @(
+        [System.Environment]::GetEnvironmentVariable('ProgramFiles'),
+        [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($programRoot)) {
+            $vsRoot = Join-Path $programRoot 'Microsoft Visual Studio'
+            if (Test-Path -LiteralPath $vsRoot -PathType Container) {
+                $roots += $vsRoot
+            }
+        }
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($root in $roots) {
+        foreach ($majorDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($editionDir in @(Get-ChildItem -LiteralPath $majorDir.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $msvcRoot = Join-Path $editionDir.FullName 'VC\Tools\MSVC'
+                if (-not (Test-Path -LiteralPath $msvcRoot -PathType Container)) {
+                    continue
+                }
+                foreach ($versionDir in @(Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue)) {
+                    $ccbin = Join-Path $versionDir.FullName 'bin\Hostx64\x64'
+                    if (Test-Path -LiteralPath (Join-Path $ccbin 'cl.exe') -PathType Leaf) {
+                        $candidates.Add($ccbin)
+                    }
+                }
+            }
+        }
+    }
+
+    if ($candidates.Count -lt 1) {
+        return $null
+    }
+    return @($candidates | Sort-Object)[-1]
+}
+
+function Add-SynapseNvccAppendFlag {
+    param(
+        [AllowNull()][string]$ExistingFlags,
+        [Parameter(Mandatory=$true)][string]$RequiredFlag
+    )
+
+    $existing = if ($null -eq $ExistingFlags) { '' } else { $ExistingFlags.Trim() }
+    if ($existing -match '/Zc:preprocessor-') {
+        Die "SYNAPSE_CUDA_NVCC_APPEND_FLAGS_CONFLICT value=$existing remediation=remove the conflicting /Zc:preprocessor- flag before setup can enable CUDA 13.x CCCL builds"
+    }
+    if ($existing -match '/Zc:preprocessor(?!-)') {
+        return $existing
+    }
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        return $RequiredFlag
+    }
+    return "$existing $RequiredFlag"
+}
+
+function Set-SynapseCudaBuildEnvironment {
+    $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+    if (-not $nvcc -and -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
+        $cudaPathNvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+        if (Test-Path -LiteralPath $cudaPathNvcc -PathType Leaf) {
+            $nvcc = [pscustomobject]@{ Source = $cudaPathNvcc }
+        }
+    }
+    if (-not $nvcc) {
+        Info "CUDA nvcc not found; skipping NVCC_CCBIN/NVCC_APPEND_FLAGS setup for optional CUDA builds."
+        return
+    }
+
+    $existingCcbin = if (-not [string]::IsNullOrWhiteSpace($env:NVCC_CCBIN)) {
+        $env:NVCC_CCBIN
+    } else {
+        [System.Environment]::GetEnvironmentVariable('NVCC_CCBIN', 'User')
+    }
+    $ccbin = $null
+    if (-not [string]::IsNullOrWhiteSpace($existingCcbin)) {
+        try {
+            $ccbin = Resolve-SynapseMsvcCcbinPath -PathValue $existingCcbin -Context 'existing_NVCC_CCBIN'
+        } catch {
+            Info "WARN: existing NVCC_CCBIN is invalid and will be repaired by Visual Studio discovery: $($_.Exception.Message)"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($ccbin)) {
+        $ccbin = Get-SynapseMsvcHostCompilerDir
+    }
+    if ([string]::IsNullOrWhiteSpace($ccbin)) {
+        Die "SYNAPSE_CUDA_MSVC_HOST_COMPILER_MISSING nvcc=$($nvcc.Source) remediation=install Visual Studio Build Tools with MSVC x64 tools, then rerun setup so NVCC_CCBIN can be set for CUDA builds"
+    }
+
+    $requiredNvccAppendFlag = '-Xcompiler=/Zc:preprocessor'
+    $existingAppendFlags = if (-not [string]::IsNullOrWhiteSpace($env:NVCC_APPEND_FLAGS)) {
+        $env:NVCC_APPEND_FLAGS
+    } else {
+        [System.Environment]::GetEnvironmentVariable('NVCC_APPEND_FLAGS', 'User')
+    }
+    $appendFlags = Add-SynapseNvccAppendFlag -ExistingFlags $existingAppendFlags -RequiredFlag $requiredNvccAppendFlag
+
+    $env:NVCC_CCBIN = $ccbin
+    $env:NVCC_APPEND_FLAGS = $appendFlags
+    [System.Environment]::SetEnvironmentVariable('NVCC_CCBIN', $ccbin, 'User')
+    [System.Environment]::SetEnvironmentVariable('NVCC_APPEND_FLAGS', $appendFlags, 'User')
+    Info "CUDA build env set: NVCC_CCBIN=$ccbin; NVCC_APPEND_FLAGS includes $requiredNvccAppendFlag."
+}
+
 function Assert-SynapseChromeBridgeMaintenancePauseBudget {
     param(
         [Parameter(Mandatory=$true)][string]$Reason,
@@ -6154,6 +6282,8 @@ if (-not $SkipBuild) {
 # ---------------------------------------------------------------------------
 # 2. Build (local source -> persistent target) and verify the binary
 # ---------------------------------------------------------------------------
+Set-SynapseCudaBuildEnvironment
+
 if (-not $SkipBuild) {
     Step "Building synapse-mcp (release) from $SourceDir"
     if (-not $PSBoundParameters.ContainsKey('CargoTarget')) {

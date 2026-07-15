@@ -23,6 +23,22 @@ cargo build
 Use `cargo build --release` only when shipping or running the optimized daemon,
 not as compile feedback during edits.
 
+## CUDA Build Environment
+
+The absorbed Calyx workspace has optional CUDA feature builds. On Windows with
+CUDA 13.x, `nvcc` must be able to find MSVC `cl.exe`, and CUDA dependency
+kernels need MSVC's conforming preprocessor. `scripts\synapse-setup.ps1`
+repairs this configured-host state when CUDA is installed:
+
+- `NVCC_CCBIN` -> Visual Studio `VC\Tools\MSVC\...\bin\Hostx64\x64`
+- `NVCC_APPEND_FLAGS` includes `-Xcompiler=/Zc:preprocessor`
+
+The CUDA compile check is:
+
+```powershell
+cargo check --manifest-path calyx\Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
+```
+
 ## Defender Exclusions
 
 Defender real-time scanning of Cargo output can slow local builds. The helper

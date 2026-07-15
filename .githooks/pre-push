@@ -1,44 +1,54 @@
 #!/bin/sh
 # Synapse local pre-push gate (the project's CI replacement; #351 forbids GitHub
-# Actions, so "local cargo gates are source of truth"). Runs the deny-level clippy
-# gate over the whole workspace before any push so [skip ci] branches can never
-# push lint-red / non-compiling code — the exact class that slipped in via the
-# #858 suggestion tests (clippy::field_reassign_with_default) and only surfaced at
-# merge because those [skip ci] commits never ran clippy.
+# Actions, so local Cargo gates are the automated backstop). Runs the deny-level
+# fmt + clippy gates over every touched Rust workspace before any push so
+# [skip ci] branches can never push lint-red / non-compiling code. The root
+# Synapse workspace and the absorbed Calyx nested workspace are intentionally
+# separate Cargo workspaces, so they must be gated by separate Cargo invocations.
 #
 # Install once per clone:   git config core.hooksPath .githooks
 # Bypass for a genuine emergency (e.g. a docs-only hotfix you cannot compile):
 #   git push --no-verify   (use sparingly — you are skipping the only gate).
 #
-# Scope: clippy --workspace --all-targets compiles + lints everything (the full
-# `cargo test --workspace` suite is intentionally NOT run here — it is minutes
-# long and the agent runs it manually per doctrine D1/D5). This hook is the fast
-# compile+lint backstop, not a substitute for manual FSV. The gate is deny-level:
-# warning-only output is accepted, captured to a local log, and summarized so
-# push output clearly distinguishes accepted warnings from blocking failures.
+# Scope: for changed root Rust/Cargo files, gate `Cargo.toml`; for changed
+# `calyx/` Rust/Cargo files, gate `calyx/Cargo.toml`. The full test suites are
+# intentionally NOT run here; they are minutes long and the agent runs them
+# manually per doctrine D1/D5. This hook is the fast compile+lint backstop, not a
+# substitute for manual FSV. The gate is deny-level: warning-only output is
+# accepted, captured to a local log, and summarized so push output clearly
+# distinguishes accepted warnings from blocking failures.
 
 set -e
 
-# Skip the gate when the push contains no Rust / Cargo changes (docs, snapshots,
-# tool-result logs): clippy would just burn a minute for nothing. Compare each
-# pushed local sha against its remote counterpart from stdin.
-needs_gate=0
+# Skip Cargo gates when the push contains no Rust / Cargo changes for a given
+# workspace (docs, snapshots, tool-result logs). Compare each pushed local sha
+# against its remote counterpart from stdin.
+needs_root_gate=0
+needs_calyx_gate=0
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   # Deleted branch (local_sha all zeros) — nothing to check.
   case "$local_sha" in *[!0]*) : ;; *) continue ;; esac
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || [ -z "$remote_sha" ]; then
-    range="$local_sha"            # new branch: inspect the whole commit
     diff_base=$(git rev-list --max-parents=0 "$local_sha" | tail -1)
     range="$diff_base..$local_sha"
   else
     range="$remote_sha..$local_sha"
   fi
-  if git diff --name-only "$range" 2>/dev/null | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
-    needs_gate=1
+
+  if ! changed_paths=$(git diff --name-only "$range"); then
+    echo "pre-push: BLOCKED — failed to inspect pushed range '$range' for changed paths."
+    exit 1
+  fi
+
+  if printf '%s\n' "$changed_paths" | grep -qE '^calyx/(.*\.rs|(.*/)?Cargo\.(toml|lock))$'; then
+    needs_calyx_gate=1
+  fi
+  if printf '%s\n' "$changed_paths" | grep -vE '^calyx/' | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
+    needs_root_gate=1
   fi
 done
 
-if [ "$needs_gate" -eq 0 ]; then
+if [ "$needs_root_gate" -eq 0 ] && [ "$needs_calyx_gate" -eq 0 ]; then
   echo "pre-push: no Rust/Cargo changes in this push — skipping clippy gate."
   exit 0
 fi
@@ -46,39 +56,76 @@ fi
 log_dir=$(git rev-parse --git-path synapse-pre-push-logs 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
 mkdir -p "$log_dir"
 
-# Formatting gate: the toolchain version is pinned in rust-toolchain.toml, and
-# `cargo fmt` invoked here respects that pin, so this catches fmt drift (#1603)
-# before it can be swept into an unrelated PR. --check makes no edits.
-echo "pre-push: running local rustfmt gate (cargo fmt --all --check) ..."
-fmt_log="$log_dir/fmt-$(date +%Y%m%dT%H%M%S)-$$.log"
-if ! cargo fmt --all --check >"$fmt_log" 2>&1; then
-  echo ""
-  echo "pre-push: BLOCKED — rustfmt gate failed (workspace is not fmt-clean under"
-  echo "          the pinned toolchain). Run 'cargo fmt --all' and re-push."
-  echo "pre-push: diff follows (full log: $fmt_log):"
-  sed -n '1,120p' "$fmt_log" || true
-  exit 1
-fi
-rm -f "$fmt_log"
-echo "pre-push: rustfmt gate green."
+run_fmt_gate() {
+  workspace_name=$1
+  manifest_path=$2
+  fmt_log="$log_dir/fmt-${workspace_name}-$(date +%Y%m%dT%H%M%S)-$$.log"
 
-echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets) ..."
-log_path="$log_dir/clippy-$(date +%Y%m%dT%H%M%S)-$$.log"
-
-if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then
-  warning_count=$(grep -c '^warning:' "$log_path" 2>/dev/null || true)
-  warning_count=${warning_count:-0}
-  if [ "$warning_count" -gt 0 ]; then
-    echo "pre-push: clippy gate green with ${warning_count} accepted warning lines; deny-level failures=0."
-    echo "pre-push: full clippy log: $log_path"
+  if [ -n "$manifest_path" ]; then
+    echo "pre-push: running ${workspace_name} rustfmt gate (cargo fmt --manifest-path ${manifest_path} --all --check) ..."
+    if cargo fmt --manifest-path "$manifest_path" --all --check >"$fmt_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   else
-    rm -f "$log_path"
-    echo "pre-push: clippy gate green (0 warnings)."
+    echo "pre-push: running ${workspace_name} rustfmt gate (cargo fmt --all --check) ..."
+    if cargo fmt --all --check >"$fmt_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   fi
-else
-  status=$?
+
+  if [ "$status" -ne 0 ]; then
+    echo ""
+    echo "pre-push: BLOCKED — ${workspace_name} rustfmt gate failed (workspace is not fmt-clean under"
+    echo "          the pinned toolchain). Run the command printed above without '--check' and re-push."
+    echo "pre-push: diff follows (full log: $fmt_log):"
+    sed -n '1,120p' "$fmt_log" || true
+    exit "$status"
+  fi
+
+  rm -f "$fmt_log"
+  echo "pre-push: ${workspace_name} rustfmt gate green."
+}
+
+run_clippy_gate() {
+  workspace_name=$1
+  manifest_path=$2
+  log_path="$log_dir/clippy-${workspace_name}-$(date +%Y%m%dT%H%M%S)-$$.log"
+
+  if [ -n "$manifest_path" ]; then
+    echo "pre-push: running ${workspace_name} clippy gate (cargo clippy --manifest-path ${manifest_path} --workspace --all-targets) ..."
+    if cargo clippy --manifest-path "$manifest_path" --workspace --all-targets >"$log_path" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    echo "pre-push: running ${workspace_name} clippy gate (cargo clippy --workspace --all-targets) ..."
+    if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    warning_count=$(grep -c '^warning:' "$log_path" 2>/dev/null || true)
+    warning_count=${warning_count:-0}
+    if [ "$warning_count" -gt 0 ]; then
+      echo "pre-push: ${workspace_name} clippy gate green with ${warning_count} accepted warning lines; deny-level failures=0."
+      echo "pre-push: full clippy log: $log_path"
+    else
+      rm -f "$log_path"
+      echo "pre-push: ${workspace_name} clippy gate green (0 warnings)."
+    fi
+    return
+  fi
+
   echo ""
-  echo "pre-push: BLOCKED — clippy gate failed. Full clippy log: $log_path"
+  echo "pre-push: BLOCKED — ${workspace_name} clippy gate failed. Full clippy log: $log_path"
   echo "pre-push: first 240 log lines follow:"
   sed -n '1,240p' "$log_path" || true
   total_lines=$(wc -l <"$log_path" 2>/dev/null | tr -d ' ' || true)
@@ -89,7 +136,18 @@ else
   echo ""
   echo "pre-push: BLOCKED — clippy gate failed. Fix the lint/build errors above, or"
   echo "          re-run with 'git push --no-verify' only if this is a genuine"
-  echo "          non-compiling emergency. Local cargo gates are the source of truth (#351)."
+  echo "          non-compiling emergency. Local Cargo gates are the automated backstop (#351)."
   exit "$status"
+}
+
+if [ "$needs_root_gate" -eq 1 ]; then
+  run_fmt_gate root ""
+  run_clippy_gate root ""
 fi
+
+if [ "$needs_calyx_gate" -eq 1 ]; then
+  run_fmt_gate calyx "calyx/Cargo.toml"
+  run_clippy_gate calyx "calyx/Cargo.toml"
+fi
+
 exit 0
