@@ -101,6 +101,33 @@ pwsh -File .\scripts\install-maintenance-task.ps1 -Remove
 Get-ScheduledTask -TaskName SynapseRepoMaintenance
 ```
 
+## Line Endings
+
+`.gitattributes` is the repository Source of Truth for line endings. It pins
+source, docs, manifests, PowerShell, and POSIX hook scripts to LF in the working
+tree even when a Windows checkout has `core.autocrlf=true`. Windows-only batch
+and solution formats are explicit CRLF exceptions. Binary assets are marked
+`binary` so Git never normalizes their bytes.
+
+When adding a new generated artifact or binary format, add an explicit
+`.gitattributes` rule in the same change. When adding a new text format, either
+let the repo default apply or add an explicit `text eol=lf` rule if the format is
+important enough to audit directly.
+
+Manual readback commands for the policy:
+
+```powershell
+git -c core.autocrlf=true diff --check
+git check-attr text eol -- .githooks/pre-push scripts/synapse-setup.ps1 Cargo.toml README.md tests/fixtures/audio/hello_world_5s.wav
+git ls-files --eol .githooks/pre-push scripts/synapse-setup.ps1 Cargo.toml README.md tests/fixtures/audio/hello_world_5s.wav
+```
+
+If an attribute change intentionally normalizes tracked text, stage it with:
+
+```powershell
+git add --renormalize .
+```
+
 ## Root Cause
 
 Parallel issue work created many throwaway git worktrees, each with its own
