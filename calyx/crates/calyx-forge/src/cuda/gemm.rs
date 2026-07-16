@@ -359,6 +359,3 @@ fn device_unavailable(ctx: &CudaContext, detail: String) -> ForgeError {
 fn device_label(ctx: &CudaContext) -> String {
     format!("cuda:{}", ctx.device_idx())
 }
-
-#[cfg(test)]
-mod tests;

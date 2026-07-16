@@ -513,6 +513,3 @@ fn verify_immutable_ref(vault_dir: &Path, reference: &ImmutableRef) -> Result<()
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

@@ -435,7 +435,3 @@ struct ReverseLedgerPayload {
     stats: ReverseStats,
     ts: u64,
 }
-
-#[cfg(test)]
-#[path = "reverse_query_tests.rs"]
-mod tests;

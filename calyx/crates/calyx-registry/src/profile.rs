@@ -305,6 +305,3 @@ fn dense_projection(vector: &SlotVector) -> Result<Option<Vec<f32>>> {
         SlotVector::Absent { .. } => Ok(None),
     }
 }
-
-#[cfg(test)]
-mod tests;

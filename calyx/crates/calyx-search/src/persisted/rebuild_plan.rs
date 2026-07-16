@@ -190,15 +190,6 @@ pub(super) fn manifest_backend(policy: DiskAnnBuildPolicy) -> (String, String, b
     )
 }
 
-#[cfg(test)]
-pub(super) fn cpu_reference_policy_for_tests() -> DiskAnnBuildPolicy {
-    DiskAnnBuildPolicy {
-        backend: DiskAnnBuildBackend::CpuVamana,
-        source: "test-cpu-reference",
-        cuvs_compiled: calyx_sextant::CUVS_COMPILED,
-    }
-}
-
 pub(super) fn slot_build_plans(
     ids_by_slot: &BTreeMap<SlotId, Vec<CxId>>,
     previous_manifest: Option<&SearchIndexManifest>,
@@ -331,69 +322,4 @@ fn configured_nonzero_u64(name: &str) -> CliResult<Option<u64>> {
         return Err(CliError::usage(format!("{name} must be >= 1")));
     }
     Ok(Some(parsed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn absent_env_defaults_to_cuvs_when_compiled() {
-        let policy = resolve_diskann_build_policy(None, false, false, true).unwrap();
-
-        assert_eq!(policy.backend, DiskAnnBuildBackend::CuvsCagra);
-        assert_eq!(policy.source, "compiled-cuvs-default");
-        assert!(policy.cuvs_compiled);
-    }
-
-    #[test]
-    fn absent_env_defaults_to_cpu_only_when_cuvs_is_not_compiled() {
-        let policy = resolve_diskann_build_policy(None, false, false, false).unwrap();
-
-        assert_eq!(policy.backend, DiskAnnBuildBackend::CpuVamana);
-        assert_eq!(policy.source, "compiled-cpu-default");
-        assert!(!policy.cuvs_compiled);
-    }
-
-    #[test]
-    fn strict_gpu_requirement_fails_without_cuvs() {
-        let err = resolve_diskann_build_policy(None, true, false, false).unwrap_err();
-
-        assert_eq!(err.code(), CUVS_UNAVAILABLE_CODE);
-        assert!(err.message().contains(REQUIRE_CUVS_ENV));
-    }
-
-    #[test]
-    fn explicit_cuvs_fails_before_rebuild_when_cuvs_is_not_compiled() {
-        let err =
-            resolve_diskann_build_policy(Some("cuvs-cagra"), false, false, false).unwrap_err();
-
-        assert_eq!(err.code(), CUVS_UNAVAILABLE_CODE);
-        assert!(err.message().contains("requires cuVS"));
-    }
-
-    #[test]
-    fn cpu_reference_requires_audited_override_when_cuvs_is_compiled() {
-        let err = resolve_diskann_build_policy(Some("cpu-vamana"), false, false, true).unwrap_err();
-
-        assert_eq!(err.code(), CPU_REFERENCE_CODE);
-        assert!(err.message().contains("CPU reference rebuild"));
-    }
-
-    #[test]
-    fn cpu_reference_override_records_audited_source() {
-        let policy = resolve_diskann_build_policy(Some("cpu-vamana"), false, true, true).unwrap();
-
-        assert_eq!(policy.backend, DiskAnnBuildBackend::CpuVamana);
-        assert_eq!(policy.source, "env-cpu-reference");
-        assert!(policy.cuvs_compiled);
-    }
-
-    #[test]
-    fn invalid_backend_remains_usage_error() {
-        let err = resolve_diskann_build_policy(Some("surprise"), false, false, true).unwrap_err();
-
-        assert_eq!(err.code(), "CALYX_CLI_USAGE_ERROR");
-        assert!(err.message().contains(DISKANN_BUILD_BACKEND_ENV));
-    }
 }

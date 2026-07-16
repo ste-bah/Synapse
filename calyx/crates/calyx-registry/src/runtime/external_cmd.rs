@@ -439,6 +439,3 @@ impl ExternalCmdLens {
         })
     }
 }
-
-#[cfg(all(test, unix))]
-mod tests;

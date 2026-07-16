@@ -294,7 +294,3 @@ fn proportional_bytes(total_bytes: usize, total_batch: usize, sub_batch: usize) 
         .saturating_mul(sub_batch)
         .saturating_add(remainder.min(sub_batch))
 }
-
-#[cfg(test)]
-#[path = "admission_tests.rs"]
-mod tests;

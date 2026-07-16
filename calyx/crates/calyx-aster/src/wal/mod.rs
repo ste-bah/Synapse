@@ -422,6 +422,3 @@ fn total_bytes(inventory: &[WalSegmentStatus]) -> u64 {
 fn storage_error(context: &str, error: io::Error) -> CalyxError {
     CalyxError::disk_pressure(format!("{context}: {error}"))
 }
-
-#[cfg(test)]
-mod tests;

@@ -380,7 +380,3 @@ struct LedgerWriteInput<'a> {
     confidence: f32,
     clock: &'a dyn Clock,
 }
-
-#[cfg(test)]
-#[path = "predict_tests.rs"]
-mod tests;

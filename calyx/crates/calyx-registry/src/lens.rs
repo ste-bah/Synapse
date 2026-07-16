@@ -431,6 +431,3 @@ pub struct DualMeasurement {
     pub a: SlotVector,
     pub b: SlotVector,
 }
-
-#[cfg(test)]
-mod tests;

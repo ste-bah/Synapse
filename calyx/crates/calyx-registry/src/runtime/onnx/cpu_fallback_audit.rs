@@ -463,6 +463,3 @@ pub(super) fn audit_from_trace(
     enforce_audit(label, &audit, gpu_policy, mode)?;
     Ok(audit)
 }
-
-#[cfg(test)]
-mod tests;

@@ -30,7 +30,7 @@ On Windows, CUDA 13.x builds require `NVCC_CCBIN` to point at the MSVC
 those variables when CUDA is installed; if either variable is wrong the CUDA
 build should fail loudly rather than silently compiling a different backend.
 
-Kept crates (dependency-closed set): `calyx-core`, `calyx-aster` (storage), `calyx-registry` (lenses), `calyx-forge` (CPU/CUDA math), `calyx-loom` (associations), `calyx-assay` (bits), `calyx-lodestar` (kernel), `calyx-ward` (guard), `calyx-oracle` (prediction), `calyx-ledger` (provenance), `calyx-sextant`/`calyx-search` (search), `calyx-anneal` (self-optimization), `calyx-mincut`, `calyx-fsv`, `calyx-paths`, `calyx-testkit`.
+Kept crates (dependency-closed set): `calyx-core`, `calyx-aster` (storage), `calyx-registry` (lenses), `calyx-forge` (CPU/CUDA math), `calyx-loom` (associations), `calyx-assay` (bits), `calyx-lodestar` (kernel), `calyx-ward` (guard), `calyx-oracle` (prediction), `calyx-ledger` (provenance), `calyx-sextant`/`calyx-search` (search), `calyx-anneal` (self-optimization), `calyx-mincut`, `calyx-paths`.
 
 Pruned at absorption (apps/servers this project doesn't need): calyx-poly, calyx-leapable, calyx-cli, calyxd, calyx-mcp, calyx-web-api, calyx-gatebrokerd, calyx-hazard-soak, calyx-buildinfo, and the upstream assets/data/datasets/docs/fuzz/infra/tools directories.
 

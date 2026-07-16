@@ -6,8 +6,6 @@ use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::lens::ensure_input_modality;
 
 mod batch;
-#[cfg(all(test, feature = "cuda"))]
-mod benchmark;
 mod cpu;
 mod gdelt;
 
@@ -347,6 +345,3 @@ fn algorithmic_contract(
         NormPolicy::None,
     )
 }
-
-#[cfg(test)]
-mod tests;

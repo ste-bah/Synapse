@@ -4,12 +4,8 @@ mod format;
 mod ledger;
 mod targets;
 
-#[cfg(test)]
-use crate::cf::{ColumnFamily, base_key};
 use crate::mvcc::tombstone_value;
 use crate::vault::{AsterVault, VaultContext, encode};
-#[cfg(test)]
-use calyx_core::Constellation;
 use calyx_core::{CalyxError, Clock, CxId, Result, Ts, VaultId};
 use calyx_ledger::{EntryKind, ErasureTombstone, SubjectId};
 use format::hex;
@@ -291,9 +287,3 @@ pub fn subject_metadata_value(subject: &SubjectId) -> String {
 struct EraseWriteSummary {
     records_deleted: usize,
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod ledger_tests;

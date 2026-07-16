@@ -14,8 +14,6 @@ use crate::{
 };
 
 mod support;
-#[cfg(test)]
-mod tests;
 
 use support::{backoff_ticks, budget_exhausted, component_details, sha256, write_fault_event};
 

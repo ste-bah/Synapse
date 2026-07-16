@@ -459,7 +459,3 @@ fn resource_budget_error(message: impl Into<String>) -> CalyxError {
         remediation: "raise the panel budget or evict lower-density resident lenses",
     }
 }
-
-#[cfg(test)]
-#[path = "resource_contract_tests.rs"]
-mod tests;

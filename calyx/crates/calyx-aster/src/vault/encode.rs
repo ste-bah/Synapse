@@ -6,15 +6,11 @@ use calyx_core::{
 use std::collections::BTreeMap;
 
 mod components;
-#[cfg(test)]
-mod test_counters;
 
 pub use super::anchor_codec::{decode_anchor, encode_anchor};
 use super::cf_codec::{cf_tag, decode_cf};
 use super::cursor::Cursor;
 use components::*;
-#[cfg(test)]
-pub(super) use test_counters::{reset_slot_operation_counts, slot_operation_counts};
 
 pub const HEADER_LEN: usize = 102;
 const IDENTITY_HASH_LEN: usize = 32;
@@ -252,8 +248,6 @@ pub fn same_constellation_identity(left: &[u8], right: &[u8]) -> Result<bool> {
 }
 
 pub fn encode_slot_vector(vector: &SlotVector) -> Result<Vec<u8>> {
-    #[cfg(test)]
-    test_counters::increment_slot_encode_count();
     vector.validate_schema().map_err(|error| {
         CalyxError::aster_corrupt_shard(format!(
             "cannot encode invalid slot vector: {}",
@@ -555,7 +549,5 @@ fn validate_slot_hashes(cx: &Constellation, slot_hashes: &[(SlotId, [u8; 32])]) 
 }
 
 pub(super) fn hash_slot_bytes(bytes: &[u8]) -> [u8; 32] {
-    #[cfg(test)]
-    test_counters::increment_slot_hash_count();
     *blake3::hash(bytes).as_bytes()
 }

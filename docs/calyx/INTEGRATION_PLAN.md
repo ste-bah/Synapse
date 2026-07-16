@@ -53,7 +53,7 @@ Rust 2024 workspace, **compiles clean on Windows** (verified 2026-07-15: `cargo 
 | `calyx-ledger` | append-only hash chain, Merkle checkpoints, verify/reproduce, redaction tombstones |
 | `calyx-anneal` | reversible shadow-tested self-optimization + tripwires + rollback |
 | `calyx-sextant` / `calyx-search` | per-slot indexes (HNSW/DiskANN/SPANN/BM25/MaxSim), RRF fusion, planner, guarded search |
-| `calyx-mincut`, `calyx-fsv`, `calyx-testkit` | graph primitives; FSV evidence-root resolution; test kit |
+| `calyx-mincut`, `calyx-paths` | graph/path primitives |
 
 `calyx-leapable` proves the intended embedding pattern: an application crate that depends directly on `calyx-aster + calyx-core + calyx-ledger` in-process. Synapse follows the same pattern.
 
@@ -175,7 +175,7 @@ Beyond storing and analyzing, Calyx **controls** what it can do so with groundin
 
 ## 6. Verification doctrine
 
-Every issue ends with manual FSV (never automated, AGENTS.md D1): daemon PID/bind named, real MCP `tools/call` trigger, SoT read *after* the call (vault scan / ledger `verify_chain` / assay rows / kernel report — the actual bytes), evidence doc `docs/fsv/issue-<n>-…md`. Regression support: `cargo test --workspace`, clippy deny gate, determinism probes on every new lens, CPU↔GPU parity checks, `reproduce` drift bounds.
+Every issue ends with manual FSV (never automated, AGENTS.md D1): daemon PID/bind named, real MCP `tools/call` trigger, SoT read *after* the call (vault scan / ledger `verify_chain` / assay rows / kernel report - the actual bytes), evidence doc `docs/fsv/issue-<n>-...md`. Structural support is limited to `cargo check`, `cargo fmt --check`, and clippy gates; behavioral acceptance comes only from manual FSV against the physical Source of Truth.
 
 ## 7. Issue graph (filed 2026-07-15, extended same day — epic #1684)
 

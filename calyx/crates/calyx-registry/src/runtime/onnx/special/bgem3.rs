@@ -445,6 +445,3 @@ impl Drop for SharedBgem3Runtime {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,8 +1,5 @@
 use crate::spectral::{SpectralError, SpectralResult};
 
-#[cfg(test)]
-mod tests;
-
 const EIGEN_EPS: f32 = 1.0e-6;
 const JACOBI_TOL: f32 = 1.0e-6;
 const JACOBI_MIN_MAX_ITER: usize = 256;

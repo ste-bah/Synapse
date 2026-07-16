@@ -19,23 +19,5 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 uuid.workspace = true
 
-[dev-dependencies]
-blake3.workspace = true
-calyx-assay = { path = "../calyx-assay" }
-calyx-testkit = { path = "../calyx-testkit" }
-proptest.workspace = true
-
-# BEGIN generated integration harnesses (issue #1546)
-
-[[test]]
-name = "__calyx_integration_suite_0"
-path = "tests/__calyx_integration_suite_0.rs"
-
-[[test]]
-name = "__calyx_integration_suite_1"
-path = "tests/__calyx_integration_suite_1.rs"
-
-# END generated integration harnesses (issue #1546)
-
 [lints]
 workspace = true

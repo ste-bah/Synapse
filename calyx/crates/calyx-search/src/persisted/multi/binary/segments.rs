@@ -3,38 +3,7 @@ use super::*;
 #[derive(Debug)]
 pub(in crate::persisted::multi) struct BinarySidecarSummary {
     pub(in crate::persisted::multi) base_seq: u64,
-    #[cfg(test)]
-    pub(in crate::persisted::multi) row_count: u64,
-    #[cfg(test)]
-    pub(in crate::persisted::multi) token_count: u64,
     pub(in crate::persisted::multi) ids: BTreeSet<CxId>,
-    #[cfg(test)]
-    pub(in crate::persisted::multi) sha256: String,
-}
-
-#[cfg(test)]
-pub(in crate::persisted::multi) fn summarize_binary_entry(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    slot: SlotId,
-) -> CliResult<BinarySidecarSummary> {
-    entry.require_kind("multi_maxsim", slot)?;
-    let path = sidecar_path(vault_dir, entry, slot)?;
-    let summary = summarize_binary_path(
-        &path,
-        entry.require_sha256(slot)?,
-        slot,
-        entry.require_token_dim(slot)?,
-        Some(entry.len as u64),
-        entry.token_count.map(|count| count as u64),
-    )?;
-    if summary.base_seq != entry.built_at_seq {
-        return Err(stale(format!(
-            "persistent binary multi sidecar seq {} != manifest seq {}; rebuild the vault search indexes",
-            summary.base_seq, entry.built_at_seq
-        )));
-    }
-    Ok(summary)
 }
 
 pub(in crate::persisted::multi) fn summarize_binary_path(
@@ -92,13 +61,7 @@ pub(in crate::persisted::multi) fn summarize_binary_path(
     }
     Ok(BinarySidecarSummary {
         base_seq: header.base_seq,
-        #[cfg(test)]
-        row_count: header.row_count,
-        #[cfg(test)]
-        token_count: header.token_count,
         ids: seen,
-        #[cfg(test)]
-        sha256: actual,
     })
 }
 

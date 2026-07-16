@@ -23,17 +23,12 @@ mod stream;
 
 use calyx_core::{CalyxError, Clock, Modality, Result, Seq};
 
-#[cfg(test)]
-use codec::hex_bytes;
 pub use codec::{blob_row_range, chunk_key, collection_id, manifest_key};
 use codec::{
     blob_too_large, chunk_prefix, corrupt, decode_manifest, encode_manifest, hash_payload,
     invalid_argument, ledger_payload, ledger_subject, require_blob_mode,
 };
 pub use stream::BlobChunkStream;
-
-#[cfg(test)]
-use std::cell::Cell;
 
 use crate::cf::{ColumnFamily, KeyRange};
 use crate::collection::{
@@ -67,59 +62,6 @@ pub const MAX_BLOB_BYTES: usize = 1 << 30;
 const MANIFEST_VALUE_BYTES_V1: usize = 8 + 4 + HASH_BYTES + 1;
 /// Current manifest appends `created_at_ms (8)` for retention decisions.
 const MANIFEST_VALUE_BYTES: usize = MANIFEST_VALUE_BYTES_V1 + 8;
-
-#[cfg(test)]
-thread_local! {
-    static HASH_CALLS: Cell<usize> = const { Cell::new(0) };
-    static HASHED_BYTES: Cell<usize> = const { Cell::new(0) };
-    static SNAPSHOT_PINS: Cell<usize> = const { Cell::new(0) };
-    static MANIFEST_READS: Cell<usize> = const { Cell::new(0) };
-    static MANIFEST_DECODES: Cell<usize> = const { Cell::new(0) };
-    static CHUNK_READS: Cell<usize> = const { Cell::new(0) };
-    static CHUNK_GROUP_COMMITS: Cell<usize> = const { Cell::new(0) };
-    static CHUNK_ROWS_WRITTEN: Cell<usize> = const { Cell::new(0) };
-    static FAIL_CHUNK_GROUP: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct BlobIoCounts {
-    hash_calls: usize,
-    hash_bytes: usize,
-    snapshot_pins: usize,
-    manifest_reads: usize,
-    manifest_decodes: usize,
-    chunk_reads: usize,
-    chunk_group_commits: usize,
-    chunk_rows_written: usize,
-}
-
-#[cfg(test)]
-fn reset_blob_io_counts() {
-    HASH_CALLS.set(0);
-    HASHED_BYTES.set(0);
-    SNAPSHOT_PINS.set(0);
-    MANIFEST_READS.set(0);
-    MANIFEST_DECODES.set(0);
-    CHUNK_READS.set(0);
-    CHUNK_GROUP_COMMITS.set(0);
-    CHUNK_ROWS_WRITTEN.set(0);
-    FAIL_CHUNK_GROUP.set(None);
-}
-
-#[cfg(test)]
-fn blob_io_counts() -> BlobIoCounts {
-    BlobIoCounts {
-        hash_calls: HASH_CALLS.get(),
-        hash_bytes: HASHED_BYTES.get(),
-        snapshot_pins: SNAPSHOT_PINS.get(),
-        manifest_reads: MANIFEST_READS.get(),
-        manifest_decodes: MANIFEST_DECODES.get(),
-        chunk_reads: CHUNK_READS.get(),
-        chunk_group_commits: CHUNK_GROUP_COMMITS.get(),
-        chunk_rows_written: CHUNK_ROWS_WRITTEN.get(),
-    }
-}
 
 /// 16-byte content-or-caller-assigned blob identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -284,10 +226,6 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
                 .filter(|count| *count > 0)
                 .ok_or_else(|| invalid_argument("blob chunk size exceeds WAL group budget"))?;
             for (group_index, group) in chunks.chunks(chunks_per_group).enumerate() {
-                #[cfg(test)]
-                if FAIL_CHUNK_GROUP.get() == Some(group_index) {
-                    self.vault.fail_next_wal_append_for_test();
-                }
                 let first_chunk = group_index * chunks_per_group;
                 let value_bytes = group.iter().map(|bytes| bytes.len()).sum::<usize>();
                 let chunk_rows = group.iter().enumerate().map(|(offset, bytes)| {
@@ -305,11 +243,6 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
                     ),
                     remediation: error.remediation,
                 })?;
-                #[cfg(test)]
-                {
-                    CHUNK_GROUP_COMMITS.set(CHUNK_GROUP_COMMITS.get() + 1);
-                    CHUNK_ROWS_WRITTEN.set(CHUNK_ROWS_WRITTEN.get() + group.len());
-                }
             }
         }
 
@@ -336,10 +269,6 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
     pub fn blob_manifest(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobManifest>> {
         require_blob_mode(col)?;
         let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
-        #[cfg(test)]
-        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
-        #[cfg(test)]
-        MANIFEST_READS.set(MANIFEST_READS.get() + 1);
         let Some(bytes) = self.vault.read_cf_snapshot(
             snapshot.snapshot(),
             ColumnFamily::Blob,
@@ -348,8 +277,6 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
         else {
             return Ok(None);
         };
-        #[cfg(test)]
-        MANIFEST_DECODES.set(MANIFEST_DECODES.get() + 1);
         decode_manifest(&bytes).map(Some)
     }
 
@@ -365,10 +292,6 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
     pub fn blob_read(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobReadResult>> {
         require_blob_mode(col)?;
         let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
-        #[cfg(test)]
-        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
-        #[cfg(test)]
-        MANIFEST_READS.set(MANIFEST_READS.get() + 1);
         let Some(manifest_bytes) = self.vault.read_cf_snapshot(
             snapshot.snapshot(),
             ColumnFamily::Blob,
@@ -377,15 +300,11 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
         else {
             return Ok(None);
         };
-        #[cfg(test)]
-        MANIFEST_DECODES.set(MANIFEST_DECODES.get() + 1);
         let manifest = decode_manifest(&manifest_bytes)?;
         let capacity = usize::try_from(manifest.total_bytes)
             .map_err(|_| corrupt("blob manifest total_bytes does not fit this platform"))?;
         let mut data = Vec::with_capacity(capacity);
         for idx in 0..manifest.chunk_count {
-            #[cfg(test)]
-            CHUNK_READS.set(CHUNK_READS.get() + 1);
             let chunk = self
                 .vault
                 .read_cf_snapshot(
@@ -467,12 +386,3 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
         })
     }
 }
-
-/// Lazy per-chunk iterator returned by [`BlobLayer::blob_stream_chunks`].
-/// Stable per-collection id scoping blob rows. Distinct hash domain from the
-/// other layers so cross-mode collisions are impossible.
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod issue1549_tests;

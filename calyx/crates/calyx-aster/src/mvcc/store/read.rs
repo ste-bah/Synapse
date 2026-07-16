@@ -72,8 +72,6 @@ impl VersionedCfStore {
             .read_barriers
             .read()
             .expect("mvcc read barriers poisoned");
-        #[cfg(test)]
-        self.batch_barrier_phases.fetch_add(1, Ordering::Relaxed);
         for read in reads {
             if let Some(error) = first_blocking(&barriers, read.cf, &read.key) {
                 return Err(error);
@@ -84,8 +82,6 @@ impl VersionedCfStore {
         let mut router_misses = Vec::new();
         {
             let table = self.rows.read().expect("mvcc row table poisoned");
-            #[cfg(test)]
-            self.batch_row_phases.fetch_add(1, Ordering::Relaxed);
             for (index, read) in reads.iter().enumerate() {
                 let visible = table
                     .get(&read.cf)
@@ -105,8 +101,6 @@ impl VersionedCfStore {
 
         self.ensure_router_latest_snapshot(snapshot)?;
         let router = self.router.read().expect("mvcc router poisoned");
-        #[cfg(test)]
-        self.batch_router_phases.fetch_add(1, Ordering::Relaxed);
         if let Some(router) = router.as_ref() {
             for index in router_misses {
                 let read = &reads[index];

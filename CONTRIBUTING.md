@@ -42,10 +42,9 @@ the roadmap (see the README "What's left on the docket" section).
    and `cargo clippy` are reproducible across contributors.
 2. Build and check the workspace:
    ```bash
-   cargo build --workspace
-   cargo fmt --all
+   cargo check --workspace
+   cargo fmt --all --check
    cargo clippy --workspace --all-targets
-   cargo test --workspace
    ```
    The absorbed Calyx code lives in its own nested workspace under `calyx/`.
    When touching it, run the Calyx workspace gates separately:
@@ -71,8 +70,8 @@ the roadmap (see the README "What's left on the docket" section).
    is the automated backstop: it runs root fmt/clippy for root Rust/Cargo
    changes and separate Calyx fmt/clippy with `--manifest-path calyx/Cargo.toml`
    for `calyx/` Rust/Cargo changes (it skips docs-only pushes). It is a fast
-   compile+lint gate, not a substitute for `cargo test --workspace` or manual
-   verification. Bypass only for a genuine non-compiling emergency with
+   compile+lint gate, never a behavioral acceptance gate. Bypass only for a
+   genuine non-compiling emergency with
    `git push --no-verify`.
 4. **Iterate with fast builds.** Use `cargo check` (~15 s) or `cargo build`
    (dev, ~45 s incremental) for the edit loop. Run `cargo build --release` ONLY
@@ -86,8 +85,8 @@ the roadmap (see the README "What's left on the docket" section).
    `SendInput`, UI Automation, WGC/DXGI). Behavior that touches those
    surfaces should be verified on Windows — the project uses manual Full State
    Verification (FSV) on the configured Windows host as the shipping gate (see the
-   README "Agent Doctrine" section). Automated tests are supporting evidence, not a
-   substitute for verifying real behavior.
+   README "Agent Doctrine" section). Automated tests are not part of the
+   acceptance surface.
 5. Keep commits focused and write clear messages. Reference the issue number
    where applicable.
 

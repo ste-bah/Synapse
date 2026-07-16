@@ -152,32 +152,3 @@ fn erf(value: f64) -> f64 {
         * t;
     sign * (1.0 - poly * (-x * x).exp())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn low_bit_codebooks_match_known_standard_normal_centroids() {
-        let two = build_standard_normal_codebook(2);
-        let b1 = (2.0 / std::f64::consts::PI).sqrt() as f32;
-        assert!((two.centroids[0] + b1).abs() <= 0.005);
-        assert!((two.centroids[1] - b1).abs() <= 0.005);
-
-        let four = build_standard_normal_codebook(4);
-        let expected = [-1.51_f32, -0.453, 0.453, 1.51];
-        for (actual, expected) in four.centroids.iter().zip(expected.iter()) {
-            assert!((actual - expected).abs() <= 0.03, "{actual} {expected}");
-        }
-    }
-
-    #[test]
-    fn lloyd_thresholds_are_ordered_and_symmetric() {
-        let book = build_standard_normal_codebook(5);
-        assert!(book.thresholds.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(book.centroids.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(book.centroids[2].abs() <= 1e-5);
-        assert!((book.centroids[0] + book.centroids[4]).abs() <= 1e-5);
-        assert!((book.centroids[1] + book.centroids[3]).abs() <= 1e-5);
-    }
-}

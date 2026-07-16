@@ -1,8 +1,5 @@
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use super::store::DuplicatePutPolicy;
 use super::{AsterVault, PutDisposition, PutOutcome, anchor_merge, ledger_hook, prepared};
 use crate::cf::{ColumnFamily, base_key};
@@ -15,23 +12,6 @@ use calyx_ledger::{ActorId, EntryKind, PayloadBuilder, RedactionPolicy, SubjectI
 use serde_json::json;
 
 const BATCH_ACTOR: &str = "calyx-aster-batch-ingest";
-
-#[cfg(test)]
-thread_local! {
-    static BASE_LOOKUPS: Cell<usize> = const { Cell::new(0) };
-    static SNAPSHOT_PINS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(super) fn reset_batch_read_counts() {
-    BASE_LOOKUPS.set(0);
-    SNAPSHOT_PINS.set(0);
-}
-
-#[cfg(test)]
-pub(super) fn batch_read_counts() -> (usize, usize) {
-    (BASE_LOOKUPS.get(), SNAPSHOT_PINS.get())
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaArtifactIngestCommit {
@@ -192,8 +172,6 @@ where
     ) -> Result<BatchIngestCommit> {
         let latest = self.snapshot();
         let snapshot = self.snapshot_handle(latest);
-        #[cfg(test)]
-        SNAPSHOT_PINS.set(SNAPSHOT_PINS.get() + 1);
         let mut accepted_indexes = BTreeMap::<Vec<u8>, usize>::new();
         // Cache both present and absent Base rows. Every unique CxId is looked
         // up at most once from the single pinned snapshot, regardless of how
@@ -238,8 +216,6 @@ where
                 continue;
             }
             if !base_rows.contains_key(&key) {
-                #[cfg(test)]
-                BASE_LOOKUPS.set(BASE_LOOKUPS.get() + 1);
                 let persisted = self.rows.read_at(
                     snapshot.snapshot(),
                     ColumnFamily::Base,

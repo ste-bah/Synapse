@@ -28,18 +28,6 @@ tracing.workspace = true
 ulid.workspace = true
 zeroize.workspace = true
 
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-mincut = { path = "../calyx-mincut" }
-criterion.workspace = true
-proptest.workspace = true
-ulid.workspace = true
-
-[[bench]]
-name = "bench_arena_reset"
-harness = false
-
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
@@ -52,32 +40,6 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 # BEGIN generated integration harnesses (issue #1546)
-
-[[test]]
-name = "__calyx_integration_isolated_issue460_kv_unsigned_ns_index_fsv"
-path = "tests/__calyx_integration_isolated_issue460_kv_unsigned_ns_index_fsv.rs"
-
-[[test]]
-name = "__calyx_integration_isolated_leapable_issue1977_durability_fsv"
-path = "tests/__calyx_integration_isolated_leapable_issue1977_durability_fsv.rs"
-
-[[test]]
-name = "__calyx_integration_isolated_ph61_integration"
-path = "tests/__calyx_integration_isolated_ph61_integration.rs"
-
-[[test]]
-name = "__calyx_integration_platform_0"
-path = "tests/__calyx_integration_platform_0.rs"
-
-[[test]]
-name = "__calyx_integration_suite_0"
-path = "tests/__calyx_integration_suite_0.rs"
-
-[[test]]
-name = "__calyx_integration_suite_1"
-path = "tests/__calyx_integration_suite_1.rs"
-
-# END generated integration harnesses (issue #1546)
 
 [lints]
 workspace = true

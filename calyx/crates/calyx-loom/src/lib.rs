@@ -57,11 +57,3 @@ pub use recurrence::{
     recurrence_series, recurrence_series_with_tz_offset, recurrence_summary_key,
     temporal_cross_term, temporal_slot_ids_for_panel,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-loom");
-    }
-}

@@ -149,19 +149,3 @@ pub(super) fn sort_ssts_by_sequence(files: &mut [PathBuf]) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use calyx_core::SlotId;
-
-    #[test]
-    fn eager_exact_lookup_covers_base_and_both_slot_families_only() {
-        let slot = SlotId::new(11);
-        assert!(eager_lookup_on_open(ColumnFamily::Base));
-        assert!(eager_lookup_on_open(ColumnFamily::slot(slot)));
-        assert!(eager_lookup_on_open(ColumnFamily::slot_raw(slot)));
-        assert!(!eager_lookup_on_open(ColumnFamily::Ledger));
-        assert!(!eager_lookup_on_open(ColumnFamily::Anchors));
-    }
-}

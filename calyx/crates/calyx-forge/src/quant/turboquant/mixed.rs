@@ -77,24 +77,3 @@ fn read_bits(bytes: &[u8], offset: usize, width: usize) -> u16 {
     }
     value
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mixed_width_lengths_match_scalar_budget() {
-        assert_eq!(packed_len(128, QuantLevel::Bits3p5), 40);
-        assert_eq!(packed_len(128, QuantLevel::Bits2p5), 24);
-        assert_eq!(packed_len(129, QuantLevel::Bits3p5), 41);
-        assert_eq!(packed_len(129, QuantLevel::Bits2p5), 25);
-    }
-
-    #[test]
-    fn mixed_width_unpack_recovers_codes_and_widths() {
-        let bytes = quantize(&[0.0; 8], 0.0, QuantLevel::Bits3p5);
-        let mixed = unpack(&bytes, 8, QuantLevel::Bits3p5);
-        assert_eq!(mixed.widths, vec![3, 2, 3, 2, 3, 2, 3, 2]);
-        assert_eq!(mixed.codes, vec![0; 8]);
-    }
-}

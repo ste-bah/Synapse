@@ -23,9 +23,3 @@ pub use redundancy::{
     linear_cka_sketch_from_row_fn, linear_cka_sketch_from_rows, linear_cka_tuple_plan,
     validate_ensemble_card_redundancy, validate_redundancy_method_metadata,
 };
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod redundancy_tests;

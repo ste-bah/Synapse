@@ -202,16 +202,6 @@ pub(super) fn finite_population_root_scale(n: usize, m: usize) -> Result<f64> {
     Ok(root_scale)
 }
 
-#[cfg(test)]
-pub(super) fn sample_mixed_indices<R: Rng + ?Sized>(
-    labels: &[usize],
-    m: usize,
-    k: usize,
-    rng: &mut R,
-) -> Result<Vec<usize>> {
-    sample_indices_with_rejections(labels, m, k, MAX_DRAW_ATTEMPTS, rng).map(|(indices, _)| indices)
-}
-
 fn sample_indices_with_rejections<R: Rng + ?Sized>(
     labels: &[usize],
     m: usize,

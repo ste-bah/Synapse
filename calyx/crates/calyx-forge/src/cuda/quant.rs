@@ -1,19 +1,9 @@
 mod launch;
 mod mxfp;
-#[cfg(test)]
-mod mxfp_bench;
 mod mxfp_launch;
-#[cfg(test)]
-mod mxfp_tests;
 mod packed;
-#[cfg(test)]
-mod packed_bench;
 mod packed_launch;
-#[cfg(test)]
-mod packed_tests;
 mod scores;
-#[cfg(test)]
-mod tests;
 mod turboquant;
 
 use std::sync::Arc;

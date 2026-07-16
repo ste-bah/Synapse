@@ -72,12 +72,6 @@ pub struct VersionedCfStore {
     resource_counters: Arc<ResourceCounters>,
     snapshot_gc: SnapshotGcReclaimer,
     snapshot_gc_counters: SnapshotGcCounters,
-    #[cfg(test)]
-    batch_barrier_phases: AtomicU64,
-    #[cfg(test)]
-    batch_row_phases: AtomicU64,
-    #[cfg(test)]
-    batch_router_phases: AtomicU64,
 }
 
 impl VersionedCfStore {
@@ -94,12 +88,6 @@ impl VersionedCfStore {
             resource_counters: Arc::new(ResourceCounters::default()),
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
-            #[cfg(test)]
-            batch_barrier_phases: AtomicU64::new(0),
-            #[cfg(test)]
-            batch_row_phases: AtomicU64::new(0),
-            #[cfg(test)]
-            batch_router_phases: AtomicU64::new(0),
         }
     }
 
@@ -117,12 +105,6 @@ impl VersionedCfStore {
             resource_counters,
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
-            #[cfg(test)]
-            batch_barrier_phases: AtomicU64::new(0),
-            #[cfg(test)]
-            batch_row_phases: AtomicU64::new(0),
-            #[cfg(test)]
-            batch_router_phases: AtomicU64::new(0),
         }
     }
 
@@ -399,15 +381,6 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned")
             .clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn batch_read_phase_counts(&self) -> (u64, u64, u64) {
-        (
-            self.batch_barrier_phases.load(Ordering::Relaxed),
-            self.batch_row_phases.load(Ordering::Relaxed),
-            self.batch_router_phases.load(Ordering::Relaxed),
-        )
     }
 }
 

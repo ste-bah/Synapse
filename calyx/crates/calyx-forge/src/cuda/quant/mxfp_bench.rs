@@ -8,43 +8,6 @@ use std::time::{Duration, Instant};
 
 const ZERO_SEED: [u8; 32] = [0; 32];
 
-#[test]
-#[ignore = "release-only production GPU benchmark/FSV; set CALYX_MXFP_BENCH_* variables"]
-fn mxfp_cuda_benchmark_fsv() -> Result<()> {
-    let _guard = test_lock();
-    let dims = bench_sizes("CALYX_MXFP_BENCH_DIMS", &[768, 1_536, 2_048])?;
-    let rows = bench_sizes("CALYX_MXFP_BENCH_ROWS", &[1_024, 100_000, 1_000_000])?;
-    let root = required_env("CALYX_FSV_ROOT")?;
-    let git_sha = required_env("CALYX_BENCH_GIT_SHA")?;
-    let quant = CudaQuantContext::new(init_cuda(0, false)?);
-    let mut measurements = Vec::new();
-    for dim in dims {
-        let codec = MxFp4Codec::new(dim);
-        for &candidate_rows in &rows {
-            measurements.push(benchmark_shape(&quant, &codec, dim, candidate_rows)?);
-        }
-    }
-    let payload = serde_json::to_vec_pretty(&json!({
-        "issue": 1768,
-        "git_sha": git_sha,
-        "mxfp4_dispatch_threshold_elements": MXFP4_CUDA_MIN_ELEMENTS,
-        "mxfp8_dispatch_threshold_elements": MXFP8_CUDA_MIN_ELEMENTS,
-        "measurements": measurements,
-    }))
-    .map_err(|error| bench_error(format!("benchmark JSON serialization failed: {error}")))?;
-    fs::create_dir_all(&root)
-        .map_err(|error| bench_error(format!("create FSV root {root}: {error}")))?;
-    let path = std::path::Path::new(&root).join("mxfp-cuda-benchmark.json");
-    fs::write(&path, &payload)
-        .map_err(|error| bench_error(format!("write {}: {error}", path.display())))?;
-    assert_eq!(
-        fs::read(&path)
-            .map_err(|error| bench_error(format!("read {}: {error}", path.display())))?,
-        payload
-    );
-    println!("MXFP_CUDA_FSV path={}", path.display());
-    Ok(())
-}
 
 fn benchmark_shape(
     quant: &CudaQuantContext,
@@ -150,67 +113,6 @@ fn benchmark_combo(
     }))
 }
 
-#[test]
-#[ignore = "Nsight-only resident search trace; set CALYX_MXFP_TRACE_* variables"]
-fn mxfp_cuda_resident_trace_fsv() -> Result<()> {
-    let _guard = test_lock();
-    let dim = bench_usize("CALYX_MXFP_TRACE_DIM", 768, 4_096)?;
-    let rows = bench_usize("CALYX_MXFP_TRACE_ROWS", 100_000, i32::MAX as usize / dim)?;
-    let pause = bench_usize("CALYX_MXFP_TRACE_PAUSE_SECONDS", 6, 60)?;
-    let root = required_env("CALYX_FSV_ROOT")?;
-    let git_sha = required_env("CALYX_BENCH_GIT_SHA")?;
-    let codec = MxFp4Codec::new(dim);
-    let cpu4 = packed_rows(QuantLevel::Bits4Fp, dim, rows);
-    let cpu8 = packed_rows(QuantLevel::Bits8Fp, dim, rows);
-    let query4 = cpu4[0].clone();
-    let query8 = cpu8[0].clone();
-    let quant = CudaQuantContext::new(init_cuda(0, false)?);
-    let gpu4 = quant.upload_mxfp(&codec, &cpu4)?;
-    let gpu8 = quant.upload_mxfp(&codec, &cpu8)?;
-    drop(cpu4);
-    drop(cpu8);
-    let warm4 = quant.upload_mxfp(&codec, std::slice::from_ref(&query4))?;
-    let warm8 = quant.upload_mxfp(&codec, std::slice::from_ref(&query8))?;
-    let _ = gpu4.score(&warm4)?.topk(10)?;
-    let _ = gpu8.score(&warm8)?.topk(10)?;
-    let _ = gpu8.score(&warm4)?.topk(10)?;
-    let _ = gpu4.score(&warm8)?.topk(10)?;
-    quant.reset_stats();
-    println!("MXFP_TRACE_READY rows={rows} dim={dim} pause_seconds={pause}");
-    std::thread::sleep(Duration::from_secs(pause as u64));
-    let repeats = 5;
-    for _ in 0..repeats {
-        let query_gpu4 = quant.upload_mxfp(&codec, std::slice::from_ref(&query4))?;
-        let query_gpu8 = quant.upload_mxfp(&codec, std::slice::from_ref(&query8))?;
-        let _ = gpu4.score(&query_gpu4)?.topk(10)?;
-        let _ = gpu8.score(&query_gpu8)?.topk(10)?;
-        let _ = gpu8.score(&query_gpu4)?.topk(10)?;
-        let _ = gpu4.score(&query_gpu8)?.topk(10)?;
-    }
-    let stats = quant.stats();
-    let payload = serde_json::to_vec_pretty(&json!({
-        "issue": 1768,
-        "git_sha": git_sha,
-        "dim": dim,
-        "candidate_rows": rows,
-        "repetitions_per_combination": repeats,
-        "corpora_resident_before_capture_pause": true,
-        "gpu_stats": stats,
-    }))
-    .map_err(|error| bench_error(format!("trace JSON serialization failed: {error}")))?;
-    fs::create_dir_all(&root)
-        .map_err(|error| bench_error(format!("create trace root {root}: {error}")))?;
-    let path = std::path::Path::new(&root).join("mxfp-cuda-trace.json");
-    fs::write(&path, payload)
-        .map_err(|error| bench_error(format!("write {}: {error}", path.display())))?;
-    println!(
-        "MXFP_TRACE_DONE d2h={} h2d={} path={}",
-        stats.d2h_bytes,
-        stats.h2d_bytes,
-        path.display()
-    );
-    Ok(())
-}
 
 fn packed_rows(level: QuantLevel, dim: usize, rows: usize) -> Vec<QuantizedVec> {
     (0..rows)

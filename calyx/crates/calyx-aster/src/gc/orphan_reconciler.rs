@@ -5,8 +5,6 @@ use crate::vault::AsterVault;
 use crate::vault::encode::{decode_constellation_base, encode_constellation_base};
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::{Mutex, atomic::AtomicU64};
@@ -16,78 +14,6 @@ pub const CALYX_ORPHAN_RECONCILER_ERROR: &str = "CALYX_ORPHAN_RECONCILER_ERROR";
 const REBUILD_PREFIX: &[u8] = b"orphan_slot_rebuild\0";
 const REBUILD_METADATA_KEY: &str = "gc.orphan_reconciler";
 const REBUILD_METADATA_VALUE: &str = "slot_rebuild_queued";
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct OrphanIoCounts {
-    pub report_entry_visits: usize,
-    pub point_reads: usize,
-    pub group_commits: usize,
-    pub ledger_entries: usize,
-    pub ledger_commits: usize,
-    pub flushes: usize,
-    pub committed_rows: usize,
-    pub committed_bytes: usize,
-    pub max_chunk_rows: usize,
-    pub max_chunk_bytes: usize,
-    pub compaction_calls: BTreeMap<String, usize>,
-}
-
-#[cfg(test)]
-thread_local! {
-    static ORPHAN_IO_COUNTS: RefCell<OrphanIoCounts> = RefCell::new(OrphanIoCounts::default());
-}
-
-#[cfg(test)]
-pub(super) fn reset_orphan_io_counts() {
-    ORPHAN_IO_COUNTS.with(|counts| *counts.borrow_mut() = OrphanIoCounts::default());
-}
-
-#[cfg(test)]
-pub(super) fn orphan_io_counts() -> OrphanIoCounts {
-    ORPHAN_IO_COUNTS.with(|counts| counts.borrow().clone())
-}
-
-#[cfg(test)]
-fn record_report_entry_visit() {
-    ORPHAN_IO_COUNTS.with(|counts| counts.borrow_mut().report_entry_visits += 1);
-}
-
-#[cfg(test)]
-fn record_orphan_point_read() {
-    ORPHAN_IO_COUNTS.with(|counts| counts.borrow_mut().point_reads += 1);
-}
-
-#[cfg(test)]
-fn record_orphan_commit(rows: usize, bytes: usize, ledger_entries: usize) {
-    if rows == 0 && ledger_entries == 0 {
-        return;
-    }
-    ORPHAN_IO_COUNTS.with(|counts| {
-        let counts = &mut *counts.borrow_mut();
-        counts.group_commits += 1;
-        counts.flushes += 1;
-        counts.committed_rows += rows;
-        counts.committed_bytes += bytes;
-        counts.max_chunk_rows = counts.max_chunk_rows.max(rows);
-        counts.max_chunk_bytes = counts.max_chunk_bytes.max(bytes);
-        counts.ledger_entries += ledger_entries;
-        counts.ledger_commits += usize::from(ledger_entries > 0);
-    });
-}
-
-#[cfg(test)]
-fn record_orphan_compactions(cfs: &[ColumnFamily]) {
-    ORPHAN_IO_COUNTS.with(|counts| {
-        let counts = &mut *counts.borrow_mut();
-        for cf in cfs {
-            *counts
-                .compaction_calls
-                .entry(cf.name().to_string())
-                .or_default() += 1;
-        }
-    });
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanBaseEntry {
@@ -333,9 +259,5 @@ fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[cfg(test)]
-mod issue1548_scale_tests;
 mod repair;
-#[cfg(test)]
-mod tests;
 mod vault_target;

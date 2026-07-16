@@ -400,6 +400,3 @@ fn dominant_direction(
 fn insufficient(message: impl Into<String>) -> CalyxError {
     CalyxError::assay_insufficient_samples(message)
 }
-
-#[cfg(test)]
-mod tests;

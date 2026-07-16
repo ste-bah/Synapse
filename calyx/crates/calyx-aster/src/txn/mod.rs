@@ -192,8 +192,3 @@ pub(crate) fn txn_timeout() -> CalyxError {
         "retry after the active transaction commits or rolls back",
     )
 }
-
-#[cfg(test)]
-mod conflict_tests;
-#[cfg(test)]
-mod tests;

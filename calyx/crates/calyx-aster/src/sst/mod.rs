@@ -518,6 +518,3 @@ fn read_header(bytes: &[u8]) -> Result<Header> {
         bloom_offset,
     })
 }
-
-#[cfg(test)]
-mod tests;

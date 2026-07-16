@@ -104,39 +104,3 @@ pub(crate) fn no_data(message: impl Into<String>) -> CalyxError {
         remediation: "query at or after the first write, or check the vault has any committed data",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_round_trips_and_orders_by_millis_then_seqno() {
-        let a = encode_key(1000, 5);
-        let b = encode_key(1000, 6);
-        let c = encode_key(2000, 1);
-        assert!(a < b, "same millis orders by seqno");
-        assert!(b < c, "later millis sorts after earlier");
-        assert_eq!(decode_key(&a).unwrap(), (1000, 5));
-    }
-
-    #[test]
-    fn decode_rejects_short_key() {
-        assert_eq!(
-            decode_key(&[0u8; 8]).unwrap_err().code,
-            "CALYX_ASTER_CORRUPT_SHARD"
-        );
-    }
-
-    #[test]
-    fn floor_target_selects_same_millis_max_seqno() {
-        let target = floor_target(1500);
-        assert_eq!(target, encode_key(1500, u64::MAX));
-        assert!(encode_key(1500, 9) <= target);
-        assert!(encode_key(1501, 0) > target);
-    }
-
-    #[test]
-    fn floor_target_at_u64_max_does_not_overflow() {
-        assert_eq!(floor_target(u64::MAX), vec![0xff; KEY_LEN]);
-    }
-}

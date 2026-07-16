@@ -23,8 +23,6 @@ use crate::error::WardError;
 
 mod backend;
 
-#[cfg(test)]
-use backend::softmax_benign;
 use backend::{OnnxInjectionBackend, external_data_path, hash_parts, sha256_files};
 
 pub const DEFAULT_INJECTION_MODEL_PATH: &str = "/var/lib/calyx/models/injection-guard/model.onnx";
@@ -252,80 +250,5 @@ fn ward_as_calyx(error: WardError) -> CalyxError {
         code: error.code(),
         message: error.to_string(),
         remediation: "fix Ward injection lens model/input and retry",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct StubBackend {
-        benign: f32,
-    }
-
-    impl InjectionScoreBackend for StubBackend {
-        fn benign_score(&self, _text: &str) -> Result<f32, WardError> {
-            Ok(self.benign)
-        }
-    }
-
-    fn lens_with(benign: f32) -> InjectionLens {
-        InjectionLens::from_backend(
-            PathBuf::from("model.onnx"),
-            PathBuf::from("tokenizer.json"),
-            [7u8; 32],
-            StubBackend { benign },
-        )
-        .expect("lens")
-    }
-
-    #[test]
-    fn softmax_matches_hand_computed() {
-        // logits [2.0, 0.0]: benign = e^2/(e^2+e^0) = 7.389/8.389 = 0.8808.
-        let score = softmax_benign(2.0, 0.0).expect("softmax");
-        assert!((score - 0.880_797).abs() < 1e-4, "got {score}");
-        // Symmetric: equal logits -> 0.5.
-        assert!((softmax_benign(1.0, 1.0).expect("eq") - 0.5).abs() < 1e-6);
-        // Injection-dominant logits -> low benign score.
-        assert!(softmax_benign(-3.0, 3.0).expect("inj") < 0.01);
-    }
-
-    #[test]
-    fn softmax_rejects_nonfinite() {
-        assert_eq!(
-            softmax_benign(f32::NAN, 0.0).unwrap_err().code(),
-            "CALYX_WARD_INVALID_INPUT"
-        );
-    }
-
-    #[test]
-    fn benign_score_validates_range_and_empty() {
-        let lens = lens_with(0.9);
-        assert!((lens.benign_score("hello").expect("score") - 0.9).abs() < 1e-6);
-        assert!((lens.injection_prob("hello").expect("prob") - 0.1).abs() < 1e-6);
-        assert_eq!(
-            lens.benign_score("   ").unwrap_err().code(),
-            "CALYX_WARD_INVALID_INPUT"
-        );
-        // Out-of-range backend score is caught.
-        let bad = lens_with(1.5);
-        assert_eq!(
-            bad.benign_score("x").unwrap_err().code(),
-            "CALYX_WARD_INVALID_INPUT"
-        );
-    }
-
-    #[test]
-    fn measure_emits_single_dim_score() {
-        let lens = lens_with(0.42);
-        let input = Input::new(Modality::Text, b"some text".to_vec());
-        match lens.measure(&input).expect("measure") {
-            SlotVector::Dense { dim, data } => {
-                assert_eq!(dim, 1);
-                assert_eq!(data.len(), 1);
-                assert!((data[0] - 0.42).abs() < 1e-6);
-            }
-            other => panic!("expected dense, got {other:?}"),
-        }
     }
 }

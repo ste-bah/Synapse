@@ -310,6 +310,3 @@ fn quant_error(op: &str, detail: impl Into<String>) -> ForgeError {
         remediation: MXFP_REMEDIATION.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests;

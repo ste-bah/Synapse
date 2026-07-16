@@ -35,11 +35,6 @@ impl LinearCkaTuplePlan {
     pub(super) fn digest_hex(&self) -> String {
         blake3::Hash::from_bytes(self.digest).to_hex().to_string()
     }
-
-    #[cfg(test)]
-    pub(super) fn tuples(&self) -> &[[usize; 4]] {
-        &self.tuples
-    }
 }
 
 pub fn linear_cka_tuple_plan(row_count: usize) -> Result<LinearCkaTuplePlan> {

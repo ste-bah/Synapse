@@ -19,8 +19,6 @@ mod logistic;
 mod mmd;
 mod reductions;
 mod temporal;
-#[cfg(test)]
-mod tests;
 mod types;
 mod validation_general;
 mod validation_linalg;

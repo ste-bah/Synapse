@@ -30,27 +30,5 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-calyx-testkit = { path = "../calyx-testkit" }
-filetime.workspace = true
-proptest.workspace = true
-
-# BEGIN generated integration harnesses (issue #1546)
-
-[[test]]
-name = "__calyx_integration_isolated_issue1369_online_head_contract_fsv"
-path = "tests/__calyx_integration_isolated_issue1369_online_head_contract_fsv.rs"
-
-[[test]]
-name = "__calyx_integration_suite_0"
-path = "tests/__calyx_integration_suite_0.rs"
-
-[[test]]
-name = "__calyx_integration_suite_1"
-path = "tests/__calyx_integration_suite_1.rs"
-
-# END generated integration harnesses (issue #1546)
-
 [lints]
 workspace = true

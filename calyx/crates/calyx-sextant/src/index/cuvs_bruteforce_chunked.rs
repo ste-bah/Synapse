@@ -216,7 +216,3 @@ fn unavailable() -> Result<CuvsChunkedExactTopK> {
 #[cfg(sextant_cuvs)]
 #[path = "cuvs_bruteforce_chunked/cuda.rs"]
 mod cuda;
-
-#[cfg(test)]
-#[path = "cuvs_bruteforce_chunked/tests.rs"]
-mod tests;

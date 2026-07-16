@@ -95,11 +95,6 @@ pub(super) fn decode_manifest(bytes: &[u8]) -> Result<BlobManifest> {
 }
 
 pub(super) fn hash_payload(data: &[u8]) -> [u8; HASH_BYTES] {
-    #[cfg(test)]
-    {
-        HASH_CALLS.set(HASH_CALLS.get() + 1);
-        HASHED_BYTES.set(HASHED_BYTES.get() + data.len());
-    }
     *blake3::hash(data).as_bytes()
 }
 

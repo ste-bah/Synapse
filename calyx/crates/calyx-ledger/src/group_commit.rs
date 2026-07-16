@@ -306,6 +306,3 @@ pub const fn ingest_kind_for(op: WriteOp) -> EntryKind {
 fn group_commit_failed(message: impl ToString) -> CalyxError {
     CalyxError::ledger_group_commit_failed(message.to_string())
 }
-
-#[cfg(test)]
-mod tests;

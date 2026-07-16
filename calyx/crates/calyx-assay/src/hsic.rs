@@ -342,7 +342,3 @@ pub fn hsic_permutation_test_cuda_strict(
         n_samples: core.n_samples,
     })
 }
-
-#[cfg(test)]
-#[path = "hsic_tests.rs"]
-mod tests;

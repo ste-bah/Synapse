@@ -81,11 +81,3 @@ pub use types::{
     DEFAULT_CONSEQUENCE_TREE_MAX_DEPTH, DomainId, OracleSelfConsistency, Prediction, SlotSet,
     SlotTag, SufficiencyBound, TaggedSlot, UnitInterval,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-oracle");
-    }
-}

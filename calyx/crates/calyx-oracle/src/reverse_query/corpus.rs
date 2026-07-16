@@ -115,14 +115,6 @@ impl ReverseCorpus {
         counts
     }
 
-    #[cfg(test)]
-    pub(super) fn action_edges(&self, action_id: &str) -> &[OccurrenceEdge] {
-        self.by_action
-            .get(action_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
     fn collect_structural_edges(
         &mut self,
         cx: &Constellation,

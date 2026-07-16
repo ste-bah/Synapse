@@ -2,8 +2,6 @@ mod repair_all;
 mod runtime;
 mod static_contract;
 pub use static_contract::derive_runtime_contract_from_spec;
-#[cfg(test)]
-mod tests;
 
 use std::path::Path;
 

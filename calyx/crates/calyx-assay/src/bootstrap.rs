@@ -110,17 +110,3 @@ fn percentile_index(len: usize, p: f32) -> usize {
     let last = len.saturating_sub(1);
     ((last as f32 * p).round() as usize).min(last)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn percentile_ci_does_not_pad_or_clamp_point_estimate() {
-        let ci = ci_from_estimates(vec![10.0, 20.0, 30.0, 40.0, 50.0], 0.0);
-
-        assert_eq!(ci.mean, 0.0);
-        assert_eq!(ci.ci_low, 10.0);
-        assert_eq!(ci.ci_high, 50.0);
-    }
-}

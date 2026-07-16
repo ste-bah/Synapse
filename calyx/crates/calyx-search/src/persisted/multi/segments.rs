@@ -1,8 +1,5 @@
 use super::*;
 
-#[cfg(test)]
-use crate::persisted::RebuildProgress;
-
 #[path = "segments/path.rs"]
 mod path;
 use path::{checked_rel, checked_segment_path};
@@ -11,23 +8,13 @@ mod manifest;
 use manifest::validate_segments_manifest_shape;
 #[path = "segments/bounds.rs"]
 mod bounds;
-#[cfg(test)]
-#[path = "segments/reuse.rs"]
-mod reuse;
 #[path = "segments/search.rs"]
 mod search;
-#[cfg(test)]
-#[path = "segments/summary.rs"]
-mod summary;
 #[path = "segments/writer.rs"]
 mod writer;
 pub(super) use bounds::ensure_entry_bounded;
 pub(in crate::persisted) use bounds::ensure_streaming_row_bounded;
-#[cfg(test)]
-use reuse::reusable_segments;
 pub(super) use search::search_segments;
-#[cfg(test)]
-use summary::summarize_segment_files;
 pub(in crate::persisted) use writer::{SegmentFlush, StreamingSegmentsWriter};
 
 const MULTI_SEGMENTS_FORMAT: &str = "calyx-search-multi-maxsim-segments-v1";
@@ -54,14 +41,6 @@ pub(super) struct MultiSegmentRef {
     pub(super) ids: Vec<CxId>,
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-struct ReusedMultiSegments {
-    refs: Vec<MultiSegmentRef>,
-    ids: BTreeSet<CxId>,
-    token_count: usize,
-}
-
 struct SegmentManifestBuild {
     token_dim: u32,
     row_count: usize,
@@ -76,95 +55,6 @@ pub(super) struct EncodedMultiRow {
     pub(super) bytes: Vec<u8>,
 }
 
-#[cfg(test)]
-pub(in crate::persisted) fn write(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    rows: MultiSlotRows,
-    base_seq: u64,
-    previous: Option<&SearchIndexEntry>,
-    on_event: &mut dyn FnMut(RebuildProgress<'_>) -> CliResult,
-) -> CliResult<SearchIndexEntry> {
-    let row_count = rows.rows.len();
-    let token_count = rows.rows.iter().map(|row| row.1.len()).sum::<usize>();
-    let current_ids = rows
-        .rows
-        .iter()
-        .map(|(cx_id, _)| *cx_id)
-        .collect::<BTreeSet<_>>();
-    if let Some(reused) = reusable_segments(
-        vault_dir,
-        slot,
-        rows.token_dim,
-        &current_ids,
-        previous,
-        on_event,
-    )? {
-        let mut refs = reused.refs;
-        let mut segment_token_count = reused.token_count;
-        let missing = rows
-            .rows
-            .iter()
-            .filter(|(cx_id, _)| !reused.ids.contains(cx_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            let segments = write_binary_segments(
-                vault_dir,
-                root,
-                slot,
-                rows.token_dim,
-                &missing,
-                base_seq,
-                refs.len(),
-            )?;
-            segment_token_count += segments
-                .iter()
-                .map(|segment| segment.token_count)
-                .sum::<usize>();
-            refs.extend(segments);
-        }
-        if refs.iter().map(|segment| segment.row_count).sum::<usize>() == row_count
-            && segment_token_count == token_count
-        {
-            return write_segments_manifest(
-                vault_dir,
-                root,
-                slot,
-                SegmentManifestBuild {
-                    token_dim: rows.token_dim,
-                    row_count,
-                    token_count,
-                    base_seq,
-                    segments: refs,
-                },
-            );
-        }
-    }
-    let segments = write_binary_segments(
-        vault_dir,
-        root,
-        slot,
-        rows.token_dim,
-        &rows.rows,
-        base_seq,
-        0,
-    )?;
-    write_segments_manifest(
-        vault_dir,
-        root,
-        slot,
-        SegmentManifestBuild {
-            token_dim: rows.token_dim,
-            row_count,
-            token_count,
-            base_seq,
-            segments,
-        },
-    )
-}
-
 pub(super) fn referenced_segment_artifacts(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
@@ -176,60 +66,6 @@ pub(super) fn referenced_segment_artifacts(
         .iter()
         .map(|segment| checked_segment_path(vault_dir, &segment.index_rel, slot))
         .collect()
-}
-
-#[cfg(test)]
-fn write_binary_segments(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    token_dim: u32,
-    rows: &[(CxId, Vec<Vec<f32>>)],
-    base_seq: u64,
-    start_ordinal: usize,
-) -> CliResult<Vec<MultiSegmentRef>> {
-    bounds::split_row_ranges_by_segment_budget(slot, token_dim, rows)?
-        .into_iter()
-        .enumerate()
-        .map(|(offset, range)| {
-            write_binary_segment(
-                vault_dir,
-                root,
-                slot,
-                token_dim,
-                &rows[range],
-                base_seq,
-                start_ordinal + offset,
-            )
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn write_binary_segment(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    token_dim: u32,
-    rows: &[(CxId, Vec<Vec<f32>>)],
-    base_seq: u64,
-    ordinal: usize,
-) -> CliResult<MultiSegmentRef> {
-    let path = root.join(format!(
-        "slot_{:05}_seq_{base_seq:020}_seg_{ordinal:05}_n_{:010}.multi.bin",
-        slot.get(),
-        rows.len()
-    ));
-    let token_count = rows.iter().map(|row| row.1.len()).sum::<usize>();
-    let sha256 = binary::write_binary_atomic_hashed(&path, slot, token_dim, rows, base_seq)?;
-    Ok(MultiSegmentRef {
-        index_rel: rel(vault_dir, &path)?,
-        sha256,
-        base_seq,
-        row_count: rows.len(),
-        token_count,
-        ids: rows.iter().map(|(cx_id, _)| *cx_id).collect(),
-    })
 }
 
 fn write_encoded_binary_segment(

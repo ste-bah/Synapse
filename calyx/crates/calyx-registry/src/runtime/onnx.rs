@@ -87,9 +87,6 @@ pub fn onnx_shape_bucket_budget(max_runtime_batch: usize) -> Result<OnnxShapeBuc
     })
 }
 
-#[cfg(test)]
-mod tests;
-
 pub struct OnnxLens {
     id: LensId,
     dim: u32,

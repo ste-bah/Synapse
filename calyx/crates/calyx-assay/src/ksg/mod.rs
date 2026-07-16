@@ -406,8 +406,3 @@ fn ksg_bits_from_cuda_counts(n: usize, k: usize, nx: &[usize], ny: &[usize]) -> 
     }
     Ok(mean(&local_bits).max(0.0))
 }
-
-#[cfg(test)]
-mod coverage_tests;
-#[cfg(test)]
-mod tests;

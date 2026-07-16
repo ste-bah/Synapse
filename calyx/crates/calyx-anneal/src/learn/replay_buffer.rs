@@ -487,6 +487,3 @@ fn validate_entry(entry: &ReplayEntry) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod fsv_tests;

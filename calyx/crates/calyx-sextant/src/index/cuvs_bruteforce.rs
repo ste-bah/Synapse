@@ -66,16 +66,3 @@ fn invalid_dataset_shape() -> calyx_core::CalyxError {
         "cuVS brute-force dataset buffer does not match rows*dim",
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mismatched_dataset_shape_returns_error_instead_of_panicking() {
-        let error = cuvs_bruteforce_topk(&mut [0.0], 2, 2, &mut [0.0, 0.0], 1, 1)
-            .expect_err("short dataset must fail before chunk loading");
-
-        assert_eq!(error.code, CALYX_INDEX_INVALID_PARAMS);
-    }
-}

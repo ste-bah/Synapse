@@ -59,11 +59,3 @@ pub use tombstone::{
 pub use verify::{
     DecodedLedgerSnapshot, VerifyResult, verify_chain, verify_decoded_snapshot, verify_snapshot,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-ledger");
-    }
-}

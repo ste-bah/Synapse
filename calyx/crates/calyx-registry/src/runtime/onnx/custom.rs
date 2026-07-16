@@ -19,8 +19,6 @@ use super::{OnnxFileSpec, OnnxLens, OnnxModelFiles, PoolingPolicy, config_invali
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::common::hash_files;
 use batch::{TokenBatch, session_inputs, stream_token_batches, token_batches};
-#[cfg(test)]
-pub(super) use output::pool_output;
 pub(crate) use output::pooling_from_config;
 use output::{CustomOutput, output_from_session, vectors_from_output};
 use pipeline::{

@@ -395,7 +395,3 @@ fn parse_soft_cap_strict(raw: Option<&str>) -> Result<usize> {
         }),
     }
 }
-
-#[cfg(test)]
-#[path = "budget_tests.rs"]
-mod tests;

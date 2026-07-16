@@ -24,10 +24,10 @@
 | Storage `SCHEMA_VERSION` | 1 | `crates/synapse-core/src/defaults.rs` |
 | Error codes (catalog) | ~120 across 9 groups | `crates/synapse-core/src/error_codes.rs` |
 | Telemetry metrics | 19 (12 counter / 5 gauge / 2 histogram) | [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) |
-| Test functions (`#[test]`) | 1,922 | grep over `crates` |
-| Async test functions (`#[tokio::test]`) | 241 | grep over `crates` |
-| Total test functions | 2,163 | sum of the above |
-| Test files (`tests/*.rs` + `tests.rs`) | 160 | `find` over `crates` |
+| Test functions (`#[test]`) | 0 | removed by operator policy; see [17_test_suite.md](17_test_suite.md) |
+| Async test functions (`#[tokio::test]`) | 0 | removed by operator policy; see [17_test_suite.md](17_test_suite.md) |
+| Total test functions | 0 | source inventory |
+| Test files (`tests/*.rs` + `tests.rs`) | 0 | source inventory |
 | Binaries / entry points | 3 | `synapse-mcp`, `synapse-overlay`, `synapse-chrome-native-host` |
 
 ### 1.1 Source files per crate
@@ -46,7 +46,6 @@
 | synapse-audio | 12 |
 | synapse-models | 8 |
 | synapse-telemetry | 5 |
-| synapse-test-utils | 3 |
 | synapse-overlay | 1 |
 
 ---
@@ -57,7 +56,7 @@
 |---|---|---|---|
 | MCP tools | 238 `#[tool(` macros | 206 distinct tools (doc 16) | Some tools are feature-gated (`storage_*` debug tools behind `SYNAPSE_DEBUG_TOOLS`); macro count also includes router plumbing. |
 | MCP tools (README) | 81 (badge) | 206 | The README badge is **stale**. |
-| Test functions | 2,163 (`#[test]`+`#[tokio::test]`) | "~1,590" estimate in an earlier draft of doc 17 | The grep-measured **2,163** is authoritative; doc 17's prose figure was a conservative estimate. |
+| Automated tests | 0 tracked test functions/files | Earlier snapshots listed Rust test suites | The operator policy now removes automated tests and requires manual FSV for behavior. |
 
 ---
 
@@ -65,7 +64,7 @@
 
 | Control | Status |
 |---|---|
-| Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide in production code; allowed in tests via `clippy.toml` (`allow-unwrap-in-tests = true`, `allow-expect-in-tests = true`). |
+| Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide. |
 | Pre-push gate | `.githooks/pre-push` runs root fmt/clippy for root Rust/Cargo changes and separate Calyx fmt/clippy with `--manifest-path calyx/Cargo.toml` for `calyx/` Rust/Cargo changes. |
 | Calyx CUDA build env | `scripts/synapse-setup.ps1` publishes `NVCC_CCBIN` and appends `-Xcompiler=/Zc:preprocessor` to `NVCC_APPEND_FLAGS` when CUDA is installed so Windows CUDA 13.x dependency kernels fail loudly only on real compiler/config errors. |
 | Dependency/license gate | `cargo-deny` (`deny.toml`): targets x86_64 linux-gnu + windows-msvc; allowed licenses MIT, Apache-2.0 (+LLVM-exception), BSD-2/3-Clause, MPL-2.0; advisories version 2. |
@@ -74,16 +73,16 @@
 
 ---
 
-## 4. Test results
+## 4. Behavioral Verification
 
 | Item | Result |
 |---|---|
-| Test run executed in this pass | No — tests were not executed (building requires `libclang.dll` on PATH per project memory; Windows-gated tests require an interactive desktop). |
-| Pass/fail | Not determined from source. |
-| Run command | `cargo test --workspace` (Windows-only tests are `#[ignore]`d; run with `-- --ignored`). |
+| Automated test run executed in this pass | No - automated tests were removed by operator policy. |
+| Pass/fail | Determined only by manual Full State Verification for the behavior under review. |
+| Run command | None. `cargo test` is not a supported acceptance path in this repo. |
 | Shipping gate | Manual Full State Verification ("FSV") performed by the agent on the configured Windows host; surfaces in code only as `minimum_manual_fsv` manifest metadata. It is never automated. |
 
-See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
+See [17_test_suite.md](17_test_suite.md) for the no-test policy and structural-check limits.
 
 ---
 

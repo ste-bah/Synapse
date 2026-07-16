@@ -36,16 +36,12 @@ impl OrphanReconciler {
                     while entry_cursor < report.orphan_index_entries.len()
                         && report.orphan_index_entries[entry_cursor].cx_id < cx_id
                     {
-                        #[cfg(test)]
-                        super::record_report_entry_visit();
                         entry_cursor += 1;
                     }
                     let start = entry_cursor;
                     while entry_cursor < report.orphan_index_entries.len()
                         && report.orphan_index_entries[entry_cursor].cx_id == cx_id
                     {
-                        #[cfg(test)]
-                        super::record_report_entry_visit();
                         entry_cursor += 1;
                     }
                     let group_len = entry_cursor - start;

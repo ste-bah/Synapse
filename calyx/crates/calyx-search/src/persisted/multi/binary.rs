@@ -15,54 +15,6 @@ pub(super) fn is_binary_sidecar(index_rel: &str) -> bool {
     index_rel.ends_with(".multi.bin")
 }
 
-#[cfg(test)]
-pub(super) fn write_binary_atomic_hashed(
-    path: &Path,
-    slot: SlotId,
-    token_dim: u32,
-    rows: &[(CxId, Vec<Vec<f32>>)],
-    base_seq: u64,
-) -> CliResult<String> {
-    let token_count = rows.iter().map(|row| row.1.len()).sum::<usize>();
-    write_atomic_hashed(path, |writer| {
-        writer.write_all(MULTI_BINARY_MAGIC)?;
-        write_u16(writer, slot.get())?;
-        write_u32(writer, token_dim)?;
-        write_u64(writer, base_seq)?;
-        write_u64(writer, rows.len() as u64)?;
-        write_u64(writer, token_count as u64)?;
-        for (cx_id, tokens) in rows {
-            writer.write_all(cx_id.as_bytes())?;
-            write_u32(
-                writer,
-                tokens.len().try_into().map_err(|_| {
-                    stale(format!(
-                        "slot {slot} cx {cx_id} has too many multi tokens for binary sidecar"
-                    ))
-                })?,
-            )?;
-            for token in tokens {
-                if token.len() != token_dim as usize {
-                    return Err(stale(format!(
-                        "slot {slot} cx {cx_id} multi token len {} != token_dim {token_dim}",
-                        token.len()
-                    )));
-                }
-                for value in token {
-                    if !value.is_finite() {
-                        return Err(CalyxError::lens_numerical_invariant(format!(
-                            "slot {slot} cx {cx_id} has non-finite multi token component"
-                        ))
-                        .into());
-                    }
-                    writer.write_all(&value.to_le_bytes())?;
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
 pub(super) fn write_encoded_binary_atomic_hashed(
     path: &Path,
     slot: SlotId,
@@ -184,8 +136,6 @@ pub(super) fn search_binary(
 #[path = "binary/segments.rs"]
 mod segments;
 
-#[cfg(test)]
-pub(super) use segments::summarize_binary_entry;
 pub(super) use segments::summarize_binary_path;
 
 pub(super) fn read_binary_header_unhashed(path: &Path) -> CliResult<BinaryHeader> {

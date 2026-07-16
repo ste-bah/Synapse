@@ -305,7 +305,3 @@ fn sorted_lens_ids(ids: impl IntoIterator<Item = LensId>) -> Vec<LensId> {
     ids.dedup();
     ids
 }
-
-#[cfg(test)]
-#[path = "types_tests.rs"]
-mod tests;

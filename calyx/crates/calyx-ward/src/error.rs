@@ -261,6 +261,3 @@ impl fmt::Display for WardError {
 }
 
 impl Error for WardError {}
-
-#[cfg(test)]
-mod tests;

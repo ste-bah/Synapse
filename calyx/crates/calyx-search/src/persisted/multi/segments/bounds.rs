@@ -1,6 +1,3 @@
-#[cfg(test)]
-use std::ops::Range;
-
 use calyx_core::{CxId, SlotId};
 
 use super::super::{stale, unbounded_multi_sidecar};
@@ -64,47 +61,6 @@ pub(super) fn ensure_segment_ref_bounded(
     )
 }
 
-#[cfg(test)]
-pub(super) fn segment_ref_is_bounded(
-    slot: SlotId,
-    token_dim: u32,
-    segment: &MultiSegmentRef,
-) -> bool {
-    ensure_segment_ref_bounded(slot, token_dim, segment).is_ok()
-}
-
-#[cfg(test)]
-pub(super) fn split_row_ranges_by_segment_budget(
-    slot: SlotId,
-    token_dim: u32,
-    rows: &[(CxId, Vec<Vec<f32>>)],
-) -> CliResult<Vec<Range<usize>>> {
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    let mut bytes = BINARY_HEADER_BYTES;
-    for (idx, (cx_id, tokens)) in rows.iter().enumerate() {
-        let row_bytes = row_estimated_bytes(token_dim, tokens.len())?;
-        if BINARY_HEADER_BYTES + row_bytes > DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES {
-            return Err(unbounded_multi_sidecar(format!(
-                "persistent multi row {cx_id} for slot {slot} is estimated {} bytes; exceeds search binary segment limit {} bytes (tokens={}, token_dim={token_dim})",
-                BINARY_HEADER_BYTES + row_bytes,
-                DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES,
-                tokens.len()
-            )));
-        }
-        if idx > start && bytes + row_bytes > DEFAULT_MAX_MULTI_BINARY_SEGMENT_BYTES {
-            ranges.push(start..idx);
-            start = idx;
-            bytes = BINARY_HEADER_BYTES;
-        }
-        bytes += row_bytes;
-    }
-    if start < rows.len() {
-        ranges.push(start..rows.len());
-    }
-    Ok(ranges)
-}
-
 fn ensure_bounded(
     slot: SlotId,
     rel: &str,
@@ -148,47 +104,4 @@ pub(super) fn row_estimated_bytes(token_dim: u32, token_count: usize) -> CliResu
     ROW_HEADER_BYTES
         .checked_add(payload)
         .ok_or_else(|| stale("persistent binary multi row byte count overflow"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_rows_keeps_each_range_within_budget() {
-        let rows = (0..3)
-            .map(|idx| (CxId::from_bytes([idx; 16]), vec![vec![1.0; 2]; 2]))
-            .collect::<Vec<_>>();
-        let ranges = split_row_ranges_by_limit(SlotId::new(2), 2, &rows, 90).unwrap();
-        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
-    }
-
-    fn split_row_ranges_by_limit(
-        slot: SlotId,
-        token_dim: u32,
-        rows: &[(CxId, Vec<Vec<f32>>)],
-        limit: u64,
-    ) -> CliResult<Vec<Range<usize>>> {
-        let mut ranges = Vec::new();
-        let mut start = 0usize;
-        let mut bytes = BINARY_HEADER_BYTES;
-        for (idx, (cx_id, tokens)) in rows.iter().enumerate() {
-            let row_bytes = row_estimated_bytes(token_dim, tokens.len())?;
-            if BINARY_HEADER_BYTES + row_bytes > limit {
-                return Err(unbounded_multi_sidecar(format!(
-                    "persistent multi row {cx_id} for slot {slot} exceeds test limit"
-                )));
-            }
-            if idx > start && bytes + row_bytes > limit {
-                ranges.push(start..idx);
-                start = idx;
-                bytes = BINARY_HEADER_BYTES;
-            }
-            bytes += row_bytes;
-        }
-        if start < rows.len() {
-            ranges.push(start..rows.len());
-        }
-        Ok(ranges)
-    }
 }

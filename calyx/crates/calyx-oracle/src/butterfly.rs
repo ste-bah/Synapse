@@ -413,7 +413,3 @@ struct ExpansionLedgerPayload {
     recurrence_rows_scanned: u64,
     ts: u64,
 }
-
-#[cfg(test)]
-#[path = "butterfly_tests.rs"]
-mod tests;

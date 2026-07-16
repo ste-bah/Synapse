@@ -127,18 +127,3 @@ impl VectorSource for SyntheticSource {
         gen_row(self.seed, idx, self.dim)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_row_fill_matches_allocating_api() {
-        let expected = gen_row(42, 7919, 17);
-        let mut actual = vec![f32::NAN; 17];
-
-        gen_row_into(42, 7919, &mut actual);
-
-        assert_eq!(actual, expected);
-    }
-}

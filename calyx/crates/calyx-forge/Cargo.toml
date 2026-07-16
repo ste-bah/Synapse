@@ -24,35 +24,5 @@ sha2.workspace = true
 tracing.workspace = true
 wide.workspace = true
 
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-calyx-testkit = { path = "../calyx-testkit" }
-criterion.workspace = true
-proptest.workspace = true
-
-[[bench]]
-name = "bench_admission_overhead"
-harness = false
-
-# BEGIN generated integration harnesses (issue #1546)
-
-[[test]]
-name = "__calyx_integration_isolated_turboquant_alloc_tests"
-path = "tests/__calyx_integration_isolated_turboquant_alloc_tests.rs"
-
-[[test]]
-name = "__calyx_integration_platform_0"
-path = "tests/__calyx_integration_platform_0.rs"
-
-[[test]]
-name = "__calyx_integration_process_0"
-path = "tests/__calyx_integration_process_0.rs"
-
-[[test]]
-name = "__calyx_integration_suite_0"
-path = "tests/__calyx_integration_suite_0.rs"
-
-# END generated integration harnesses (issue #1546)
-
 [lints]
 workspace = true

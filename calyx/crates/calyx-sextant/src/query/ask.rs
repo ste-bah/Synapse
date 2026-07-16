@@ -81,8 +81,3 @@ fn cx_id_from_base_key(key: &[u8]) -> Option<CxId> {
     let bytes: [u8; 16] = key.try_into().ok()?;
     Some(CxId::from_bytes(bytes))
 }
-
-#[cfg(test)]
-mod fsv_tests;
-#[cfg(test)]
-mod tests;

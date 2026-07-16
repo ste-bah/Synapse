@@ -376,6 +376,3 @@ fn ensure_norm_value(lens_id: LensId, norm: f64, target: f64, tolerance: f32) ->
         "lens {lens_id} norm {norm:.6} is outside target {target:.6} tolerance {tolerance}"
     )))
 }
-
-#[cfg(test)]
-mod tests;

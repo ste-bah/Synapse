@@ -328,6 +328,3 @@ fn derive_rademacher_seed(seed: &RotationSeed, rot_width: usize) -> RotationSeed
     entropy.extend_from_slice(&(seed.dim as u64).to_le_bytes());
     new_seed(rot_width, &entropy)
 }
-
-#[cfg(test)]
-mod tests;

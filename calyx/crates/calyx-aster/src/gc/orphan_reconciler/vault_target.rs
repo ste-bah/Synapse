@@ -82,8 +82,6 @@ where
                     let mut affected = BTreeSet::new();
                     let mut outcomes = Vec::with_capacity(repairs.len());
                     for repair in repairs {
-                        #[cfg(test)]
-                        super::record_orphan_point_read();
                         if self
                             .vault
                             .read_cf_snapshot(
@@ -113,8 +111,6 @@ where
                         {
                             let cf = ColumnFamily::slot(slot);
                             let key = slot_key(repair.cx_id);
-                            #[cfg(test)]
-                            super::record_orphan_point_read();
                             if self.vault.read_cf_snapshot(snapshot, cf, &key)?.is_some() {
                                 rows.push(WriteRow {
                                     cf,
@@ -138,16 +134,8 @@ where
                             purged_rows,
                         });
                     }
-                    #[cfg(test)]
-                    let commit_counts = (
-                        rows.len(),
-                        rows.iter().map(|row| row.key.len() + row.value.len()).sum(),
-                        ledger.len(),
-                    );
                     self.vault
                         .write_cf_batch_with_ledger_entries_locked(rows, ledger)?;
-                    #[cfg(test)]
-                    super::record_orphan_commit(commit_counts.0, commit_counts.1, commit_counts.2);
                     Ok((outcomes, affected.into_iter().collect::<Vec<_>>()))
                 })
         })?;
@@ -169,8 +157,6 @@ where
                     let mut outcomes = Vec::with_capacity(cx_ids.len());
                     for cx_id in cx_ids {
                         let key = base_key(*cx_id);
-                        #[cfg(test)]
-                        super::record_orphan_point_read();
                         let Some(bytes) =
                             self.vault
                                 .read_cf_snapshot(snapshot, ColumnFamily::Base, &key)?
@@ -221,20 +207,8 @@ where
                             degraded: true,
                         });
                     }
-                    #[cfg(test)]
-                    let commit_counts = (
-                        rows.len(),
-                        rows.iter().map(|row| row.key.len() + row.value.len()).sum(),
-                        ledger.len(),
-                    );
                     self.vault
                         .write_cf_batch_with_ledger_entries_locked(rows, ledger)?;
-                    #[cfg(test)]
-                    super::record_orphan_commit(
-                        commit_counts.0,
-                        commit_counts.1,
-                        commit_counts.2,
-                    );
                     Ok(outcomes)
                 })
         })
@@ -257,8 +231,6 @@ where
         // Keep the set intact until every CF compaction succeeds. If this
         // fails, tombstones and audit rows are already durable and a retry on
         // this target will attempt the same deduplicated finalization again.
-        #[cfg(test)]
-        super::record_orphan_compactions(&affected);
         self.vault.purge_tombstoned_cfs(&affected)?;
         let mut pending = self
             .pending_compaction_cfs

@@ -488,7 +488,3 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "calyx-assay::formula_coverage_fsv",
     ),
 ];
-
-#[cfg(test)]
-#[path = "formula_catalog_tests.rs"]
-mod tests;

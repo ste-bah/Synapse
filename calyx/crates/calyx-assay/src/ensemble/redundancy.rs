@@ -370,22 +370,3 @@ fn row_signature(rows: &[Vec<f32>]) -> Result<Vec<f32>> {
         })
         .collect()
 }
-
-#[cfg(test)]
-pub(super) fn test_tuple_z(rows: [&[f32]; 4]) -> Result<[f64; 3]> {
-    sketch::tuple_z(rows, 1.0)
-}
-
-#[cfg(test)]
-pub(super) fn test_pair_estimate(
-    left: &LinearCkaSketch,
-    right: &LinearCkaSketch,
-    exact: bool,
-) -> Result<super::model::LinearCkaEstimate> {
-    sketch::estimate_pair(left, right, exact)
-}
-
-#[cfg(test)]
-pub(super) fn test_tuples(plan: &LinearCkaTuplePlan) -> &[[usize; 4]] {
-    plan.tuples()
-}

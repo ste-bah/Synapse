@@ -252,7 +252,3 @@ fn driver_alloc_error(err: cudarc::driver::result::DriverError) -> CudaAllocErro
         }
     }
 }
-
-#[cfg(test)]
-#[path = "oom_guard_tests.rs"]
-mod tests;

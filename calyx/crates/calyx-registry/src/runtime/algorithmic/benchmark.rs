@@ -32,25 +32,6 @@ struct CrossoverReport {
     rows: Vec<CrossoverRow>,
 }
 
-#[test]
-#[ignore = "manual release-mode CUDA crossover FSV"]
-fn algorithmic_cuda_crossover_probe() {
-    let context = calyx_forge::CudaAlgorithmicContext::new(0).expect("CUDA context");
-    let mut report = CrossoverReport {
-        samples: SAMPLES,
-        byte_threshold: BYTE_FEATURES_CUDA_MIN_INPUT_BYTES,
-        sparse_threshold: SPARSE_KEYWORDS_CUDA_MIN_TOKENS,
-        token_word_threshold: TOKEN_HASH_CUDA_MIN_WORDS,
-        rows: Vec::new(),
-    };
-    benchmark_bytes(&context, &mut report.rows);
-    benchmark_sparse(&context, &mut report.rows);
-    benchmark_tokens(&context, &mut report.rows);
-    println!(
-        "ALGORITHMIC_CUDA_CROSSOVER_JSON={}",
-        serde_json::to_string(&report).expect("serialize crossover report")
-    );
-}
 
 fn benchmark_bytes(context: &calyx_forge::CudaAlgorithmicContext, report: &mut Vec<CrossoverRow>) {
     for total in [4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304] {

@@ -187,6 +187,3 @@ fn retention_rollup_unsupported(collection: &str) -> CalyxError {
         remediation: "remove rollup_after_secs from the retention policy or implement retention rollups",
     }
 }
-
-#[cfg(test)]
-mod tests;

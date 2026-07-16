@@ -36,8 +36,6 @@ mod snapshot_lease;
 mod store;
 mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange};
-#[cfg(test)]
-use crate::cf::{anchor_key, base_key, ledger_key};
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
@@ -45,8 +43,6 @@ use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
 use crate::wal::TornTail;
-#[cfg(test)]
-use calyx_core::{Anchor, SlotId, VaultStore};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
 use std::{path::Path, sync::Mutex};
 
@@ -261,14 +257,6 @@ where
         &self.dedup_policy
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_wal_append_for_test(&self) {
-        self.durable
-            .as_ref()
-            .expect("test WAL failpoint requires durable vault")
-            .fail_next_wal_append();
-    }
-
     /// Reads one raw CF row at `snapshot`.
     pub fn read_cf_at(
         &self,
@@ -443,11 +431,6 @@ where
         crate::timetravel::TimeTravelSnapshot::open(self, t_millis)
     }
 
-    #[cfg(test)]
-    pub(crate) fn clock_ref(&self) -> &C {
-        &self.clock
-    }
-
     /// Collects the aggregate resource status for this vault (PRD 18 §4).
     ///
     /// `vault_dir` is the durable root this vault was opened from; `vram` is
@@ -472,33 +455,3 @@ where
         self.rows.read_barriers()
     }
 }
-
-#[cfg(test)]
-mod anchor_merge_tests;
-#[cfg(test)]
-mod compaction_tests;
-#[cfg(test)]
-#[path = "vault/encode_tests.rs"]
-mod encode_tests;
-#[cfg(test)]
-mod ledger_atomicity_tests;
-#[cfg(test)]
-mod ledger_checkpoint_tests;
-#[cfg(test)]
-mod ledger_integration_tests;
-#[cfg(test)]
-mod ledger_timestamp_tests;
-#[cfg(test)]
-mod recovery_stranding_tests;
-#[cfg(test)]
-mod recovery_tests;
-#[cfg(test)]
-mod seq_domain_tests;
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod issue1547_tests;
-#[cfg(test)]
-#[path = "vault/issue1799_tests.rs"]
-mod issue1799_tests;
