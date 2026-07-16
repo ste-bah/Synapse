@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -20,7 +20,7 @@ use synapse_calyx::{
 };
 use synapse_core::{
     error_codes,
-    retention::{DEFAULTS, RetentionTtl},
+    retention::{DEFAULTS, RetentionDefault, RetentionTtl},
 };
 
 use crate::{
@@ -39,12 +39,17 @@ const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
 const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 const CALYX_KV_DISC: u8 = 0x03;
-const CALYX_KV_VALUE_VERSION: u8 = 0x01;
-const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8;
+const CALYX_KV_VALUE_VERSION_V1: u8 = 0x01;
+const CALYX_KV_VALUE_VERSION: u8 = 0x02;
+const CALYX_KV_VALUE_V1_HEADER_BYTES: usize = 1 + 8;
+const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8 + 8;
 const CALYX_KV_NAMESPACE: u64 = 0;
 const CALYX_COLLECTION_ID_BASE: u64 = 0x5359_4e43_4600_0000;
 const CALYX_METADATA_COLLECTION_ID: u64 = CALYX_COLLECTION_ID_BASE | 0xffff;
 const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports the byte-preserving Db read/write/scan/delete surface from #1656, but this maintenance API is intentionally unavailable until the Calyx pressure/GC/compaction parity issues #1658/#1659 land";
+const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
+const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
+const MIB_U64: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -689,12 +694,7 @@ impl CalyxBackend {
             return Ok(());
         }
         self.with_vault(cf_name, "commit Calyx KV rows", true, |vault| {
-            vault
-                .write_cf_batch(rows)
-                .map_err(|source| calyx_write_failed(cf_name, "write Calyx CF batch", &source))?;
-            vault
-                .flush()
-                .map_err(|source| calyx_write_failed(cf_name, "flush Calyx CF batch", &source))
+            commit_calyx_rows_to_vault(vault, cf_name, rows)
         })
     }
 
@@ -767,25 +767,60 @@ impl StorageBackend for CalyxBackend {
 
     fn put_batch_pressure_bypass(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()> {
         let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
-        let rows = rows
-            .into_iter()
-            .map(|(key, value)| calyx_put_row(cf_name, collection_id, &key, &value))
-            .collect::<StorageResult<Vec<_>>>()?;
-        self.commit_rows(cf_name, rows)
+        self.with_vault(cf_name, "write Calyx KV batch", true, |vault| {
+            let now_ms = calyx_clock_now_for_write(vault, cf_name)?;
+            let rows = rows
+                .into_iter()
+                .map(|(key, value)| calyx_put_row(cf_name, collection_id, &key, &value, now_ms))
+                .collect::<StorageResult<Vec<_>>>()?;
+            preflight_calyx_retention_for_cf(vault, cf_name, collection_id, now_ms)?;
+            commit_calyx_rows_to_vault(vault, cf_name, rows)?;
+            enforce_calyx_retention_for_cf(vault, cf_name, now_ms)
+        })
     }
 
     fn put_cf_batches_pressure_bypass(&self, batches: Vec<OwnedCfWriteBatch>) -> StorageResult<()> {
         if batches.iter().all(|(_cf_name, rows)| rows.is_empty()) {
             return Ok(());
         }
-        let mut writes = Vec::new();
-        for (cf_name, rows) in batches {
-            let collection_id = calyx_collection_id_for_cf_write(&cf_name)?;
-            for (key, value) in rows {
-                writes.push(calyx_put_row(&cf_name, collection_id, &key, &value)?);
-            }
-        }
-        self.commit_rows("<multi-cf>", writes)
+        self.with_vault(
+            "<multi-cf>",
+            "write Calyx multi-CF KV batch",
+            true,
+            |vault| {
+                let now_ms = calyx_clock_now_for_write(vault, "<multi-cf>")?;
+                let mut writes = Vec::new();
+                let mut affected_cfs = BTreeSet::new();
+                for (cf_name, rows) in batches {
+                    let collection_id = calyx_collection_id_for_cf_write(&cf_name)?;
+                    if !rows.is_empty() {
+                        affected_cfs.insert(cf_name.clone());
+                    }
+                    for (key, value) in rows {
+                        writes.push(calyx_put_row(
+                            &cf_name,
+                            collection_id,
+                            &key,
+                            &value,
+                            now_ms,
+                        )?);
+                    }
+                }
+                for cf_name in &affected_cfs {
+                    preflight_calyx_retention_for_cf(
+                        vault,
+                        cf_name,
+                        calyx_collection_id_for_cf_write(cf_name)?,
+                        now_ms,
+                    )?;
+                }
+                commit_calyx_rows_to_vault(vault, "<multi-cf>", writes)?;
+                for cf_name in affected_cfs {
+                    enforce_calyx_retention_for_cf(vault, &cf_name, now_ms)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
@@ -796,9 +831,10 @@ impl StorageBackend for CalyxBackend {
             let value = vault
                 .read_cf_at(snapshot, ColumnFamily::Kv, &key)
                 .map_err(|source| calyx_read_failed(cf_name, "read Calyx CF row", &source))?;
-            value
-                .map(|bytes| decode_calyx_value_for_read(cf_name, &bytes))
-                .transpose()
+            let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
+            value.map_or(Ok(None), |bytes| {
+                decode_calyx_value_for_read(cf_name, &bytes, now_ms)
+            })
         })
     }
 
@@ -809,14 +845,25 @@ impl StorageBackend for CalyxBackend {
         puts: Vec<RawRow>,
     ) -> StorageResult<()> {
         let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
-        let mut rows = Vec::with_capacity(deletes.len().saturating_add(puts.len()));
-        for key in deletes {
-            rows.push(calyx_delete_row(cf_name, collection_id, &key)?);
-        }
-        for (key, value) in puts {
-            rows.push(calyx_put_row(cf_name, collection_id, &key, &value)?);
-        }
-        self.commit_rows(cf_name, rows)
+        self.with_vault(cf_name, "mutate Calyx KV batch", true, |vault| {
+            let now_ms = calyx_clock_now_for_write(vault, cf_name)?;
+            let put_count = puts.len();
+            let mut rows = Vec::with_capacity(deletes.len().saturating_add(put_count));
+            for key in deletes {
+                rows.push(calyx_delete_row(cf_name, collection_id, &key)?);
+            }
+            for (key, value) in puts {
+                rows.push(calyx_put_row(cf_name, collection_id, &key, &value, now_ms)?);
+            }
+            if put_count > 0 {
+                preflight_calyx_retention_for_cf(vault, cf_name, collection_id, now_ms)?;
+            }
+            commit_calyx_rows_to_vault(vault, cf_name, rows)?;
+            if put_count == 0 {
+                return Ok(());
+            }
+            enforce_calyx_retention_for_cf(vault, cf_name, now_ms)
+        })
     }
 
     fn delete_batch(&self, cf_name: &str, keys: Vec<Vec<u8>>) -> StorageResult<()> {
@@ -1011,7 +1058,7 @@ fn verify_calyx_schema_version(
             let row = SynapseCalyxCfWrite::new(
                 ColumnFamily::Kv,
                 key,
-                encode_calyx_value(&schema_version.to_be_bytes()),
+                encode_calyx_value(0, 0, &schema_version.to_be_bytes()),
             );
             vault
                 .write_cf_batch(vec![row])
@@ -1023,7 +1070,7 @@ fn verify_calyx_schema_version(
         Some(value) => {
             let payload = decode_calyx_value_raw(&value)
                 .map_err(|detail| calyx_open_failed_detail(path, detail))?;
-            let actual = decode_schema_version(payload);
+            let actual = decode_schema_version(payload.payload);
             if actual == Some(schema_version) {
                 Ok(())
             } else {
@@ -1047,10 +1094,12 @@ fn read_all_rows_from_vault(
         .scan_cf_range_at(snapshot, ColumnFamily::Kv, &range)
         .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV namespace", &source))?;
     let mut decoded = Vec::with_capacity(rows.len());
+    let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
     for (key, value) in rows {
         let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
-        let payload = decode_calyx_value_for_read(cf_name, &value)?;
-        decoded.push((user_key, payload));
+        if let Some(payload) = decode_calyx_value_for_read(cf_name, &value, now_ms)? {
+            decoded.push((user_key, payload));
+        }
     }
     decoded.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(decoded)
@@ -1058,6 +1107,44 @@ fn read_all_rows_from_vault(
 
 fn latest_calyx_seq(vault: &SynapseCalyxVault) -> u64 {
     vault.status().latest_seq.unwrap_or_default()
+}
+
+fn commit_calyx_rows_to_vault(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    rows: Vec<SynapseCalyxCfWrite>,
+) -> StorageResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    vault
+        .write_cf_batch(rows)
+        .map_err(|source| calyx_write_failed(cf_name, "write Calyx CF batch", &source))?;
+    vault
+        .flush()
+        .map_err(|source| calyx_write_failed(cf_name, "flush Calyx CF batch", &source))
+}
+
+fn preflight_calyx_retention_for_cf(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    collection_id: u64,
+    now_ms: u64,
+) -> StorageResult<()> {
+    let protected = calyx_cf_protected_from_auto_delete(cf_name);
+    collect_calyx_retention_state(vault, cf_name, collection_id, now_ms, protected).map(|_| ())
+}
+
+fn calyx_clock_now_for_read(vault: &SynapseCalyxVault, cf_name: &str) -> StorageResult<u64> {
+    vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))
+}
+
+fn calyx_clock_now_for_write(vault: &SynapseCalyxVault, cf_name: &str) -> StorageResult<u64> {
+    vault
+        .clock_now_ms()
+        .map_err(|source| calyx_write_failed(cf_name, "read Calyx vault clock", &source))
 }
 
 fn calyx_collection_id_for_cf(cf_name: &str) -> Option<u64> {
@@ -1083,16 +1170,405 @@ fn calyx_collection_id_for_cf_write(cf_name: &str) -> StorageResult<u64> {
     })
 }
 
+#[derive(Debug)]
+struct CalyxRetentionLiveEntry {
+    full_key: Vec<u8>,
+    user_key: Vec<u8>,
+    live_bytes: u64,
+    written_at_ms: u64,
+}
+
+#[derive(Debug)]
+struct CalyxRetentionState {
+    live_entries: Vec<CalyxRetentionLiveEntry>,
+    tombstones: Vec<SynapseCalyxCfWrite>,
+    before_live_bytes: u64,
+    expired_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalyxRetentionCaps {
+    soft_cap_bytes: u64,
+    hard_cap_bytes: u64,
+    protected: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalyxRetentionOutcome {
+    after_live_bytes: u64,
+    cap_evicted_rows: u64,
+    hard_cap_reached: bool,
+}
+
+fn enforce_calyx_retention_for_cf(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    now_ms: u64,
+) -> StorageResult<()> {
+    let retention = calyx_retention_default_for_write(cf_name)?;
+    let (soft_cap_bytes, hard_cap_bytes) = calyx_retention_cap_bytes_for_write(retention)?;
+    let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
+    let caps = CalyxRetentionCaps {
+        soft_cap_bytes,
+        hard_cap_bytes,
+        protected: calyx_cf_protected_from_auto_delete(cf_name),
+    };
+    let mut state =
+        collect_calyx_retention_state(vault, cf_name, collection_id, now_ms, caps.protected)?;
+    let hard_cap_reached = log_calyx_hard_cap_if_reached(
+        cf_name,
+        state.before_live_bytes,
+        caps.soft_cap_bytes,
+        caps.hard_cap_bytes,
+        caps.protected,
+    );
+    let (after_live_bytes, cap_evicted_rows) = apply_calyx_cap_eviction(
+        cf_name,
+        &mut state,
+        caps.soft_cap_bytes,
+        caps.hard_cap_bytes,
+        caps.protected,
+    )?;
+    let outcome = CalyxRetentionOutcome {
+        after_live_bytes,
+        cap_evicted_rows,
+        hard_cap_reached,
+    };
+
+    if !state.tombstones.is_empty() {
+        let tombstones = std::mem::take(&mut state.tombstones);
+        commit_calyx_rows_to_vault(vault, cf_name, tombstones)?;
+    }
+    emit_calyx_retention_enforced(cf_name, &state, caps, outcome);
+    Ok(())
+}
+
+fn collect_calyx_retention_state(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    collection_id: u64,
+    now_ms: u64,
+    protected: bool,
+) -> StorageResult<CalyxRetentionState> {
+    let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let rows = vault
+        .scan_cf_range_at(latest_calyx_seq(vault), ColumnFamily::Kv, &range)
+        .map_err(|source| {
+            calyx_write_failed(
+                cf_name,
+                "scan Calyx KV namespace for retention enforcement",
+                &source,
+            )
+        })?;
+    let mut state = CalyxRetentionState {
+        live_entries: Vec::new(),
+        tombstones: Vec::new(),
+        before_live_bytes: 0,
+        expired_rows: 0,
+    };
+    for (full_key, value) in rows {
+        let user_key = decode_calyx_user_key(collection_id, &full_key).map_err(|detail| {
+            calyx_write_failed_detail(
+                cf_name,
+                format!("decode Calyx retention scan key: {detail}"),
+            )
+        })?;
+        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_WRITE_FAILED,
+                cf = cf_name,
+                detail,
+                "Calyx storage backend rejected malformed KV retention envelope during enforcement"
+            );
+            calyx_write_failed_detail(
+                cf_name,
+                format!("decode Calyx retention envelope: {detail}"),
+            )
+        })?;
+        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            if !protected {
+                state.tombstones.push(SynapseCalyxCfWrite::new(
+                    ColumnFamily::Kv,
+                    full_key,
+                    tombstone_value(),
+                ));
+                state.expired_rows = state.expired_rows.saturating_add(1);
+            }
+            continue;
+        }
+        let live_bytes = calyx_live_row_bytes(cf_name, &user_key, envelope.payload)?;
+        state.before_live_bytes =
+            state
+                .before_live_bytes
+                .checked_add(live_bytes)
+                .ok_or_else(|| {
+                    calyx_write_failed_detail(
+                        cf_name,
+                        format!("Calyx retention live-byte accounting overflow in {cf_name}"),
+                    )
+                })?;
+        state.live_entries.push(CalyxRetentionLiveEntry {
+            full_key,
+            user_key,
+            live_bytes,
+            written_at_ms: envelope.written_at_ms,
+        });
+    }
+    Ok(state)
+}
+
+fn log_calyx_hard_cap_if_reached(
+    cf_name: &str,
+    before_live_bytes: u64,
+    soft_cap_bytes: u64,
+    hard_cap_bytes: u64,
+    protected: bool,
+) -> bool {
+    let hard_cap_reached = before_live_bytes >= hard_cap_bytes;
+    if hard_cap_reached {
+        tracing::warn!(
+            code = error_codes::STORAGE_CF_HARD_CAP_REACHED,
+            cf = cf_name,
+            before_live_bytes,
+            soft_cap_bytes,
+            hard_cap_bytes,
+            protected,
+            "Calyx retention hard cap reached"
+        );
+    }
+    hard_cap_reached
+}
+
+fn apply_calyx_cap_eviction(
+    cf_name: &str,
+    state: &mut CalyxRetentionState,
+    soft_cap_bytes: u64,
+    hard_cap_bytes: u64,
+    protected: bool,
+) -> StorageResult<(u64, u64)> {
+    let before_live_bytes = state.before_live_bytes;
+    let mut after_live_bytes = state.before_live_bytes;
+    let mut cap_evicted_rows = 0_u64;
+    if protected && before_live_bytes > soft_cap_bytes {
+        tracing::warn!(
+            code = "STORAGE_CALYX_RETENTION_PROTECTED_CAP_SKIPPED",
+            cf = cf_name,
+            before_live_bytes,
+            soft_cap_bytes,
+            hard_cap_bytes,
+            "Calyx retention skipped cap eviction for protected operator-owned column family"
+        );
+    } else if before_live_bytes > soft_cap_bytes {
+        state.live_entries.sort_by(|left, right| {
+            left.written_at_ms
+                .cmp(&right.written_at_ms)
+                .then_with(|| left.user_key.cmp(&right.user_key))
+        });
+        for entry in state.live_entries.drain(..) {
+            if after_live_bytes <= soft_cap_bytes {
+                break;
+            }
+            after_live_bytes = after_live_bytes.checked_sub(entry.live_bytes).ok_or_else(|| {
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!(
+                        "Calyx retention byte accounting underflow while evicting {} bytes from {cf_name}",
+                        entry.live_bytes
+                    ),
+                )
+            })?;
+            state.tombstones.push(SynapseCalyxCfWrite::new(
+                ColumnFamily::Kv,
+                entry.full_key,
+                tombstone_value(),
+            ));
+            cap_evicted_rows = cap_evicted_rows.saturating_add(1);
+        }
+        if before_live_bytes > hard_cap_bytes && after_live_bytes > hard_cap_bytes {
+            let detail = format!(
+                "Calyx retention could not reduce {cf_name} below hard cap: before_live_bytes={before_live_bytes} after_live_bytes={after_live_bytes} hard_cap_bytes={hard_cap_bytes}"
+            );
+            tracing::error!(
+                code = error_codes::STORAGE_WRITE_FAILED,
+                cf = cf_name,
+                before_live_bytes,
+                after_live_bytes,
+                hard_cap_bytes,
+                detail,
+                "Calyx retention hard cap enforcement failed"
+            );
+            return Err(calyx_write_failed_detail(cf_name, detail));
+        }
+    }
+    Ok((after_live_bytes, cap_evicted_rows))
+}
+
+fn emit_calyx_retention_enforced(
+    cf_name: &str,
+    state: &CalyxRetentionState,
+    caps: CalyxRetentionCaps,
+    outcome: CalyxRetentionOutcome,
+) {
+    if state.expired_rows > 0 || outcome.cap_evicted_rows > 0 || outcome.hard_cap_reached {
+        tracing::info!(
+            code = "STORAGE_CALYX_RETENTION_ENFORCED",
+            cf = cf_name,
+            expired_rows = state.expired_rows,
+            cap_evicted_rows = outcome.cap_evicted_rows,
+            before_live_bytes = state.before_live_bytes,
+            after_live_bytes = outcome.after_live_bytes,
+            soft_cap_bytes = caps.soft_cap_bytes,
+            hard_cap_bytes = caps.hard_cap_bytes,
+            protected = caps.protected,
+            "Calyx retention enforcement completed"
+        );
+    }
+    if outcome.cap_evicted_rows > 0 {
+        synapse_telemetry::metrics::counter!(
+            "cache_evictions_total",
+            "cf" => cf_name.to_owned(),
+            "reason" => "soft_cap"
+        )
+        .increment(outcome.cap_evicted_rows);
+    }
+}
+
+fn calyx_retention_default_for_write(cf_name: &str) -> StorageResult<RetentionDefault> {
+    DEFAULTS
+        .iter()
+        .copied()
+        .find(|default| default.cf == cf_name)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                cf_name,
+                format!("missing RetentionDefault mapping for Calyx column family {cf_name}"),
+            )
+        })
+}
+
+fn calyx_retention_cap_bytes_for_write(retention: RetentionDefault) -> StorageResult<(u64, u64)> {
+    let soft = retention.soft_cap_mb.checked_mul(MIB_U64).ok_or_else(|| {
+        calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "soft cap overflow for {}: {} MiB",
+                retention.cf, retention.soft_cap_mb
+            ),
+        )
+    })?;
+    let hard = retention.hard_cap_mb.checked_mul(MIB_U64).ok_or_else(|| {
+        calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "hard cap overflow for {}: {} MiB",
+                retention.cf, retention.hard_cap_mb
+            ),
+        )
+    })?;
+    if hard < soft {
+        return Err(calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "invalid RetentionDefault for {}: hard cap {} bytes is below soft cap {} bytes",
+                retention.cf, hard, soft
+            ),
+        ));
+    }
+    Ok((soft, hard))
+}
+
+fn calyx_expires_at_ms_for_write(cf_name: &str, now_ms: u64) -> StorageResult<u64> {
+    let retention = calyx_retention_default_for_write(cf_name)?;
+    let Some(ttl_ms) = calyx_ttl_millis_for_write(cf_name, retention.ttl)? else {
+        return Ok(0);
+    };
+    now_ms.checked_add(ttl_ms).ok_or_else(|| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!("Calyx retention expires_at_ms overflow: now_ms={now_ms} ttl_ms={ttl_ms}"),
+        )
+    })
+}
+
+fn calyx_ttl_millis_for_write(cf_name: &str, ttl: RetentionTtl) -> StorageResult<Option<u64>> {
+    match ttl {
+        RetentionTtl::None | RetentionTtl::LruOnly => Ok(None),
+        RetentionTtl::Hours(hours) => {
+            if hours == 0 {
+                return Err(calyx_write_failed_detail(
+                    cf_name,
+                    "RetentionDefault Hours(0) is invalid for Calyx TTL".to_owned(),
+                ));
+            }
+            hours.checked_mul(MILLIS_PER_HOUR).map(Some).ok_or_else(|| {
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!("Calyx retention Hours({hours}) overflows milliseconds"),
+                )
+            })
+        }
+        RetentionTtl::Days(days) => {
+            if days == 0 {
+                return Err(calyx_write_failed_detail(
+                    cf_name,
+                    "RetentionDefault Days(0) is invalid for Calyx TTL".to_owned(),
+                ));
+            }
+            days.checked_mul(MILLIS_PER_DAY).map(Some).ok_or_else(|| {
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!("Calyx retention Days({days}) overflows milliseconds"),
+                )
+            })
+        }
+    }
+}
+
+fn calyx_live_row_bytes(cf_name: &str, user_key: &[u8], payload: &[u8]) -> StorageResult<u64> {
+    let key_bytes = u64::try_from(user_key.len()).map_err(|_error| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx retention key length does not fit in u64: {}",
+                user_key.len()
+            ),
+        )
+    })?;
+    let payload_bytes = u64::try_from(payload.len()).map_err(|_error| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx retention payload length does not fit in u64: {}",
+                payload.len()
+            ),
+        )
+    })?;
+    key_bytes.checked_add(payload_bytes).ok_or_else(|| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx retention row byte accounting overflow: key_bytes={key_bytes} payload_bytes={payload_bytes}"
+            ),
+        )
+    })
+}
+
+fn calyx_cf_protected_from_auto_delete(cf_name: &str) -> bool {
+    cf_name == cf::CF_ROUTINE_STATE
+}
+
 fn calyx_put_row(
     cf_name: &str,
     collection_id: u64,
     key: &[u8],
     value: &[u8],
+    now_ms: u64,
 ) -> StorageResult<SynapseCalyxCfWrite> {
+    let expires_at_ms = calyx_expires_at_ms_for_write(cf_name, now_ms)?;
     Ok(SynapseCalyxCfWrite::new(
         ColumnFamily::Kv,
         encode_calyx_key_for_write(cf_name, collection_id, key)?,
-        encode_calyx_value(value),
+        encode_calyx_value(expires_at_ms, now_ms, value),
     ))
 }
 
@@ -1181,44 +1657,94 @@ fn decode_calyx_user_key(collection_id: u64, full_key: &[u8]) -> Result<Vec<u8>,
     Ok(user_key.to_vec())
 }
 
-fn encode_calyx_value(payload: &[u8]) -> Vec<u8> {
+fn encode_calyx_value(expires_at_ms: u64, written_at_ms: u64, payload: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(CALYX_KV_VALUE_HEADER_BYTES + payload.len());
     value.push(CALYX_KV_VALUE_VERSION);
-    value.extend_from_slice(&0_u64.to_be_bytes());
+    value.extend_from_slice(&expires_at_ms.to_be_bytes());
+    value.extend_from_slice(&written_at_ms.to_be_bytes());
     value.extend_from_slice(payload);
     value
 }
 
-fn decode_calyx_value_for_read(cf_name: &str, value: &[u8]) -> StorageResult<Vec<u8>> {
-    decode_calyx_value_raw(value)
-        .map(<[u8]>::to_vec)
-        .map_err(|detail| StorageError::ReadFailed {
+fn decode_calyx_value_for_read(
+    cf_name: &str,
+    value: &[u8],
+    now_ms: u64,
+) -> StorageResult<Option<Vec<u8>>> {
+    let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+        tracing::error!(
+            code = error_codes::STORAGE_READ_FAILED,
+            cf = cf_name,
+            detail,
+            "Calyx storage backend rejected malformed KV retention envelope"
+        );
+        StorageError::ReadFailed {
             cf_name: cf_name.to_owned(),
             detail,
-        })
+        }
+    })?;
+    if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+        return Ok(None);
+    }
+    Ok(Some(envelope.payload.to_vec()))
 }
 
-fn decode_calyx_value_raw(value: &[u8]) -> Result<&[u8], String> {
-    if value.len() < CALYX_KV_VALUE_HEADER_BYTES {
-        return Err(format!(
-            "Calyx KV value is shorter than its {CALYX_KV_VALUE_HEADER_BYTES} byte header"
-        ));
+#[derive(Debug)]
+struct CalyxValueEnvelope<'a> {
+    expires_at_ms: u64,
+    written_at_ms: u64,
+    payload: &'a [u8],
+}
+
+fn decode_calyx_value_raw(value: &[u8]) -> Result<CalyxValueEnvelope<'_>, String> {
+    let Some(version) = value.first().copied() else {
+        return Err(
+            "Calyx KV value is empty and missing its retention envelope version".to_owned(),
+        );
+    };
+    match version {
+        CALYX_KV_VALUE_VERSION_V1 => decode_calyx_value_v1(value),
+        CALYX_KV_VALUE_VERSION => decode_calyx_value_v2(value),
+        other => Err(format!(
+            "Calyx KV value version {other} is unsupported; expected {CALYX_KV_VALUE_VERSION_V1} or {CALYX_KV_VALUE_VERSION}"
+        )),
     }
-    if value[0] != CALYX_KV_VALUE_VERSION {
+}
+
+fn decode_calyx_value_v1(value: &[u8]) -> Result<CalyxValueEnvelope<'_>, String> {
+    if value.len() < CALYX_KV_VALUE_V1_HEADER_BYTES {
         return Err(format!(
-            "Calyx KV value version {} is unsupported; expected {}",
-            value[0], CALYX_KV_VALUE_VERSION
+            "Calyx KV v1 value is shorter than its {CALYX_KV_VALUE_V1_HEADER_BYTES} byte header"
         ));
     }
     let mut expires_at_bytes = [0_u8; 8];
     expires_at_bytes.copy_from_slice(&value[1..9]);
-    let expires_at = u64::from_be_bytes(expires_at_bytes);
-    if expires_at != 0 {
+    Ok(CalyxValueEnvelope {
+        expires_at_ms: u64::from_be_bytes(expires_at_bytes),
+        written_at_ms: 0,
+        payload: &value[CALYX_KV_VALUE_V1_HEADER_BYTES..],
+    })
+}
+
+fn decode_calyx_value_v2(value: &[u8]) -> Result<CalyxValueEnvelope<'_>, String> {
+    if value.len() < CALYX_KV_VALUE_HEADER_BYTES {
         return Err(format!(
-            "Calyx storage backend found TTL-bearing value expires_at_ms={expires_at}; TTL parity belongs to #1657"
+            "Calyx KV v2 value is shorter than its {CALYX_KV_VALUE_HEADER_BYTES} byte header"
         ));
     }
-    Ok(&value[CALYX_KV_VALUE_HEADER_BYTES..])
+    let mut expires_at_bytes = [0_u8; 8];
+    expires_at_bytes.copy_from_slice(&value[1..9]);
+    let mut written_at_bytes = [0_u8; 8];
+    written_at_bytes.copy_from_slice(&value[9..17]);
+    Ok(CalyxValueEnvelope {
+        expires_at_ms: u64::from_be_bytes(expires_at_bytes),
+        written_at_ms: u64::from_be_bytes(written_at_bytes),
+        payload: &value[CALYX_KV_VALUE_HEADER_BYTES..],
+    })
+}
+
+const fn calyx_value_is_expired(expires_at_ms: u64, now_ms: u64) -> bool {
+    expires_at_ms != 0 && now_ms >= expires_at_ms
 }
 
 fn calyx_read_failed(
@@ -1258,6 +1784,20 @@ fn calyx_write_failed(
     StorageError::WriteFailed {
         cf_name: cf_name.to_owned(),
         detail: format!("{action}: {source}"),
+    }
+}
+
+fn calyx_write_failed_detail(cf_name: &str, detail: impl Into<String>) -> StorageError {
+    let detail = detail.into();
+    tracing::error!(
+        code = error_codes::STORAGE_WRITE_FAILED,
+        cf_name,
+        detail,
+        "Calyx storage backend write failed"
+    );
+    StorageError::WriteFailed {
+        cf_name: cf_name.to_owned(),
+        detail,
     }
 }
 

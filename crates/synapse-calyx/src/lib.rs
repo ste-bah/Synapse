@@ -698,6 +698,30 @@ impl SynapseCalyxVault {
         status_from_vault(&self.config, &self.vault, self.math_runtime.status())
     }
 
+    /// Returns the same millisecond clock source used by this opened vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured config error if the vault somehow contains an
+    /// invalid fixed-clock configuration after startup validation.
+    pub fn clock_now_ms(&self) -> Result<Ts, SynapseCalyxError> {
+        match self.config.tuning.clock_mode {
+            SynapseCalyxClockMode::System => Ok(SystemClock.now()),
+            SynapseCalyxClockMode::Fixed => {
+                self.config
+                    .tuning
+                    .fixed_clock_unix_ms
+                    .ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_CLOCK_INVALID",
+                            "clock_mode=fixed is missing fixed_clock_unix_ms after validation",
+                            "inspect the Calyx tuning config and restart after fixing the fixed clock fields",
+                        )
+                    })
+            }
+        }
+    }
+
     /// Writes raw CF rows through Aster's durable WAL/MVCC commit path.
     ///
     /// This is synchronous by construction. Tokio callers must use
