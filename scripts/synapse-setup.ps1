@@ -3025,14 +3025,15 @@ function Read-SynapseSetupTokenForRestartGuard {
 function Read-SynapseHealthForRestartGuard {
     param(
         [Parameter(Mandatory=$true)][string]$Bind,
-        [Parameter(Mandatory=$true)][string]$Token
+        [Parameter(Mandatory=$true)][string]$Token,
+        [ValidateRange(1, 300)][int]$TimeoutSec = 4
     )
 
     try {
-        $health = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
-        [pscustomobject]@{ Ok = $true; Health = $health; Error = $null }
+        $health = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec $TimeoutSec
+        [pscustomobject]@{ Ok = $true; Health = $health; Error = $null; TimeoutSec = $TimeoutSec }
     } catch {
-        [pscustomobject]@{ Ok = $false; Health = $null; Error = $_.Exception.Message }
+        [pscustomobject]@{ Ok = $false; Health = $null; Error = $_.Exception.Message; TimeoutSec = $TimeoutSec }
     }
 }
 
@@ -3453,6 +3454,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     }
     $deadlineMs = [int64]$nowMs + [int64]$postStartWaitMs
     $attempt = 0
+    $lastWaitHealthError = $null
     while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadlineMs) {
         if ($detail -notmatch 'no_active_chrome_bridge_host') {
             break
@@ -3471,11 +3473,14 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
             ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })),
             $waitRemainingMs)
         Start-Sleep -Seconds 2
-        try {
-            $currentHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
-        } catch {
-            Die "SYNAPSE_CHROME_BRIDGE_WAIT_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before Chrome bridge wait but /health failed during reconnect wait"
+        $healthTimeoutSec = [Math]::Min(10, [Math]::Max(4, [int][Math]::Ceiling($waitRemainingMs / 1000)))
+        $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec $healthTimeoutSec
+        if (-not $healthRead.Ok) {
+            $lastWaitHealthError = $healthRead.Error
+            Info "WARN: Chrome bridge wait health read failed attempt=$attempt timeout_s=$($healthRead.TimeoutSec) wait_remaining_ms=$waitRemainingMs error=$lastWaitHealthError"
+            continue
         }
+        $currentHealth = $healthRead.Health
         $chromeBridge = $currentHealth.subsystems.chrome_bridge
         $status = [string]$chromeBridge.status
         $detail = [string]$chromeBridge.detail
@@ -3488,12 +3493,13 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     if ($detail -match 'no_active_chrome_bridge_host') {
         if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
             $timeoutMs = [Math]::Max(0, [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$nowMs)
-            Die ("SYNAPSE_CHROME_BRIDGE_ALARM_RECONNECT_TIMEOUT status={0} detail={1} waited_ms={2} pause_until_unix_ms={3} resume_probe_after_unix_ms={4} remediation=setup requested a maintenance reconnect pause before daemon restart and then waited for the installed MV3 alarmReconnect path to observe the replacement daemon and re-register. It did not. Inspect the Chrome extension service-worker console for maintenance resume probe logs and daemon /health chrome_bridge detail; setup refuses to hide the reconnect failure with foreground UI reload." -f `
+            Die ("SYNAPSE_CHROME_BRIDGE_ALARM_RECONNECT_TIMEOUT status={0} detail={1} waited_ms={2} pause_until_unix_ms={3} resume_probe_after_unix_ms={4} last_health_error={5} remediation=setup requested a maintenance reconnect pause before daemon restart and then waited for the installed MV3 alarmReconnect path to observe the replacement daemon and re-register. It did not. Inspect the Chrome extension service-worker console for maintenance resume probe logs and daemon /health chrome_bridge detail; setup refuses to hide the reconnect failure with foreground UI reload." -f `
                 $status,
                 $detail,
                 $timeoutMs,
                 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
-                ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })))
+                ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })),
+                ($(if ([string]::IsNullOrWhiteSpace($lastWaitHealthError)) { '<none>' } else { $lastWaitHealthError })))
         }
         Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
         $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
@@ -3502,14 +3508,19 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         $repairReason = [string]$uiRepairReadback.synapse_chrome_auto_install.reason
         $uiDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
         $uiAttempt = 0
+        $lastUiHealthError = $null
         do {
             $uiAttempt += 1
             Start-Sleep -Seconds 2
-            try {
-                $currentHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
-            } catch {
-                Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before Chrome bridge UI repair but /health failed afterward"
+            $waitRemainingMs = [Math]::Max(0, [int64]$uiDeadlineMs - [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+            $healthTimeoutSec = [Math]::Min(10, [Math]::Max(4, [int][Math]::Ceiling($waitRemainingMs / 1000)))
+            $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec $healthTimeoutSec
+            if (-not $healthRead.Ok) {
+                $lastUiHealthError = $healthRead.Error
+                Info "WARN: Chrome bridge UI repair health read failed attempt=$uiAttempt timeout_s=$($healthRead.TimeoutSec) wait_remaining_ms=$waitRemainingMs error=$lastUiHealthError"
+                continue
             }
+            $currentHealth = $healthRead.Health
             $chromeBridge = $currentHealth.subsystems.chrome_bridge
             $status = [string]$chromeBridge.status
             $detail = [string]$chromeBridge.detail
@@ -3518,7 +3529,6 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 Info "Chrome bridge OK after existing-Chrome UI repair: reason=$repairReason stale=false capability=pageScreenshot"
                 return $currentHealth
             }
-            $waitRemainingMs = [Math]::Max(0, [int64]$uiDeadlineMs - [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
             Info ("Chrome bridge still not clean after UI repair; waiting for registration attempt={0} repair_reason={1} status={2} wait_remaining_ms={3} detail={4}" -f `
                 $uiAttempt,
                 $repairReason,
@@ -3528,7 +3538,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $uiDeadlineMs)
 
         $repairAutoInstall = $uiRepairReadback.synapse_chrome_auto_install | ConvertTo-Json -Depth 12 -Compress
-        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_UI_REPAIR status=$status detail=$detail ui_repair=$repairAutoInstall remediation=setup invoked the already-open Chrome extension UI reload/install path and still did not observe an active bridge host in /health; inspect the Chrome extension details UI, service-worker console, and daemon chrome_bridge health before accepting setup"
+        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_UI_REPAIR status=$status detail=$detail last_health_error=$(if ([string]::IsNullOrWhiteSpace($lastUiHealthError)) { '<none>' } else { $lastUiHealthError }) ui_repair=$repairAutoInstall remediation=setup invoked the already-open Chrome extension UI reload/install path and still did not observe an active bridge host in /health; inspect the Chrome extension details UI, service-worker console, and daemon chrome_bridge health before accepting setup"
     }
 
     Info "WARN: Chrome bridge not clean after daemon start; requesting in-place browser_debugger.reload_bridge through the new live MCP daemon. status=$status detail=$detail"
@@ -3548,10 +3558,25 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $afterBuild = if ($reloadReadback -and $reloadReadback.after) { [string]$reloadReadback.after.extension_build_id } else { 'unknown' }
     Info "Chrome bridge reload completed through public browser_debugger facade after_build_id=$afterBuild"
 
-    try {
-        $afterHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
-    } catch {
-        Die "SYNAPSE_CHROME_BRIDGE_POST_RELOAD_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before bridge reload but /health failed afterward"
+    $postReloadDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
+    $postReloadAttempt = 0
+    $lastPostReloadHealthError = $null
+    $afterHealth = $null
+    do {
+        $postReloadAttempt += 1
+        $waitRemainingMs = [Math]::Max(0, [int64]$postReloadDeadlineMs - [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $healthTimeoutSec = [Math]::Min(10, [Math]::Max(4, [int][Math]::Ceiling($waitRemainingMs / 1000)))
+        $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec $healthTimeoutSec
+        if ($healthRead.Ok) {
+            $afterHealth = $healthRead.Health
+            break
+        }
+        $lastPostReloadHealthError = $healthRead.Error
+        Info "WARN: Chrome bridge post-reload health read failed attempt=$postReloadAttempt timeout_s=$($healthRead.TimeoutSec) wait_remaining_ms=$waitRemainingMs error=$lastPostReloadHealthError"
+        Start-Sleep -Seconds 2
+    } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $postReloadDeadlineMs)
+    if ($null -eq $afterHealth) {
+        Die "SYNAPSE_CHROME_BRIDGE_POST_RELOAD_HEALTH_FAILED bind=$Bind attempts=$postReloadAttempt last_error=$(if ([string]::IsNullOrWhiteSpace($lastPostReloadHealthError)) { '<none>' } else { $lastPostReloadHealthError }) remediation=daemon was live before bridge reload but /health did not return before the bounded post-reload deadline"
     }
     $afterBridge = $afterHealth.subsystems.chrome_bridge
     $afterStatus = [string]$afterBridge.status
