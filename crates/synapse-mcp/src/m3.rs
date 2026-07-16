@@ -62,6 +62,7 @@ const REFLEX_FORCE_DEGRADED_ENV: &str = "SYNAPSE_REFLEX_FORCE_DEGRADED";
 const STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV: &str = "SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE";
 const CALYX_VAULT_ENV: &str = "SYNAPSE_CALYX_VAULT";
 const CALYX_VAULT_DIR_ENV: &str = "SYNAPSE_CALYX_VAULT_DIR";
+const CALYX_CONFIG_ENV: &str = "SYNAPSE_CALYX_CONFIG";
 const ENABLE_AUDIO_ENV: &str = "SYNAPSE_ENABLE_AUDIO";
 const ALLOW_UNKNOWN_PROFILE_ENV: &str = "SYNAPSE_ALLOW_UNKNOWN_PROFILE";
 const ALLOWED_PERMISSIONS_ENV: &str = "SYNAPSE_MCP_ALLOWED_PERMISSIONS";
@@ -91,6 +92,7 @@ pub struct M3ServiceConfig {
     pub storage_pressure_free_bytes_sample: Option<u64>,
     pub calyx_vault: bool,
     pub calyx_vault_dir: Option<PathBuf>,
+    pub calyx_config_path: Option<PathBuf>,
 }
 
 impl M3ServiceConfig {
@@ -129,6 +131,7 @@ impl M3ServiceConfig {
             storage_pressure_free_bytes_sample,
             calyx_vault: true,
             calyx_vault_dir: None,
+            calyx_config_path: None,
         }
     }
 
@@ -165,6 +168,7 @@ impl M3ServiceConfig {
                 .as_deref()
                 .map_or(Ok(true), |raw| parse_bool_env(CALYX_VAULT_ENV, Some(raw)))?,
             calyx_vault_dir: std::env::var_os(CALYX_VAULT_DIR_ENV).map(PathBuf::from),
+            calyx_config_path: std::env::var_os(CALYX_CONFIG_ENV).map(PathBuf::from),
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
             max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
@@ -416,6 +420,7 @@ impl M3State {
             config.storage_pressure_free_bytes_sample,
             config.calyx_vault,
             config.calyx_vault_dir,
+            config.calyx_config_path,
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
@@ -437,6 +442,7 @@ impl M3State {
         storage_pressure_free_bytes_sample: Option<u64>,
         calyx_vault_enabled: bool,
         calyx_vault_dir: Option<PathBuf>,
+        calyx_config_path: Option<PathBuf>,
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
@@ -449,9 +455,12 @@ impl M3State {
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
         let calyx_vault_config = if calyx_vault_enabled {
-            Some(synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir(
-                calyx_vault_dir,
-            )?)
+            Some(
+                synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
+                    calyx_vault_dir,
+                    calyx_config_path,
+                )?,
+            )
         } else {
             None
         };

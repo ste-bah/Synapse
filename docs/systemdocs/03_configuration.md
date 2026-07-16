@@ -16,7 +16,7 @@
 - `crates/synapse-models/src/download.rs`, `crates/synapse-a11y/src/cdp.rs`, `crates/synapse-overlay/src/main.rs`
 - `scripts/synapse-setup.ps1`
 
-Synapse has **no TOML/JSON config file** for the daemon itself. All configuration is via (1) CLI flags, (2) environment variables, and (3) on-disk locations derived from `%LOCALAPPDATA%` / `%APPDATA%`. The one file read for config is the bearer-token file `%APPDATA%\synapse\token.txt`. Many flags accept a matching `env =` fallback through `clap`.
+Synapse has **no global TOML/JSON config file** for the daemon itself. Most configuration is via (1) CLI flags, (2) environment variables, and (3) on-disk locations derived from `%LOCALAPPDATA%` / `%APPDATA%`. The daemon also reads two scoped files: the bearer-token file `%APPDATA%\synapse\token.txt`, and an optional Calyx-only TOML file supplied by `--calyx-config` / `SYNAPSE_CALYX_CONFIG` whose only accepted section is `[calyx]`. Many flags accept a matching `env =` fallback through `clap`.
 
 See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB store, and [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for the server/daemon model.
 
@@ -64,6 +64,9 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | read-only (`READ_EVENTS`, `READ_REFLEX`, `READ_PROFILE`, `READ_STORAGE`; plus `READ_AUDIO` only when audio is enabled) | Explicit M3 permission grant allowlist; write/input permissions require opt-in. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | bool | `false` | Force reflex into degraded mode (testing/diagnostic). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | u64 (BYTES) | none | Inject a synthetic free-bytes value for disk-pressure logic. |
+| `--calyx-vault` | `SYNAPSE_CALYX_VAULT` | bool | `true` | Enable the embedded Calyx vault. |
+| `--calyx-vault-dir` | `SYNAPSE_CALYX_VAULT_DIR` | path | `%APPDATA%\synapse\vault` | Durable Calyx vault directory. Empty value is a hard startup error. |
+| `--calyx-config` | `SYNAPSE_CALYX_CONFIG` | path | none | Optional TOML file with exactly one `[calyx]` section. Unknown keys, missing section, unreadable file, invalid values, and contradictory clock settings fail startup with remediation. |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | NonZeroUsize | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | Cap on event-bus subscriptions. |
 | `--allow-shell` (repeatable) | `SYNAPSE_ALLOW_SHELL` (comma-sep) | regex list | empty | Allowlist regexes for `act_run_shell` command lines (merged with env, §1). |
 | `--allow-launch` (repeatable) | `SYNAPSE_ALLOW_LAUNCH` (comma-sep) | regex list | empty | Allowlist regexes for `act_launch` targets (merged with env, §1). |
@@ -114,6 +117,39 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `SYNAPSE_SHELL_SESSION_DIR` | `m4.rs` (`SHELL_SESSION_DIR_ENV`) | path | derived (§4) | Per-session shell working/session dir override. |
 | `SYNAPSE_SHELL_WORKING_DIR` | `m4.rs` (`SHELL_WORKING_DIR_ENV`) | path | none | Working dir for shell jobs. |
 | `XDG_STATE_HOME`, `HOME` | telemetry, m4 (non-Windows) | path | none | Non-Windows fallbacks for log/state dirs. |
+
+### 3.2.1 Calyx `[calyx]` section
+
+`SYNAPSE_CALYX_CONFIG` / `--calyx-config` points at an optional TOML file with exactly one top-level section:
+
+```toml
+[calyx]
+bit_floor_bits = 0.05
+correlation_ceiling = 0.6
+guard_far_identity = 0.01
+guard_far_content = 0.03
+guard_far_stylistic = 0.05
+guard_cold_start_tau = 0.7
+kernel_fraction = 0.01
+kernel_recall_gate = 0.95
+fusion_k = 60
+temporal_boost_min = 0.0
+temporal_boost_max = 0.10
+vram_budget_bytes = 12884901888
+math_backend = "auto"
+clock_mode = "system"
+rng_seed = 6491761763268826774
+```
+
+For manual deterministic runtime checks, use:
+
+```toml
+[calyx]
+clock_mode = "fixed"
+fixed_clock_unix_ms = 1720000000123
+```
+
+All omitted keys use the defaults above. Unknown keys, a missing `[calyx]` section, `clock_mode = "fixed"` without `fixed_clock_unix_ms`, `fixed_clock_unix_ms` with `clock_mode = "system"`, non-finite floats, zero `fusion_k`, zero `vram_budget_bytes`, and out-of-range guard/temporal values fail startup. The `health` subsystem `calyx_vault` reports the effective values as the runtime readback surface.
 
 ### 3.3 Logging / telemetry
 

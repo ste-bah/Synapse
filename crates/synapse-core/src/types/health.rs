@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{CaptureRuntimeReadback, ObservationCaptureConfig, PerceptionMode, ProfileId};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
     pub ok: bool,
@@ -27,7 +27,7 @@ pub struct Health {
     pub subsystems: BTreeMap<String, SubsystemHealth>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubsystemHealth {
     pub status: String,
@@ -93,9 +93,43 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault_last_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_last_calyx_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault_last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault_remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_bit_floor_bits: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_correlation_ceiling: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_guard_far_identity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_guard_far_content: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_guard_far_stylistic: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_guard_cold_start_tau: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_kernel_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_kernel_recall_gate: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_fusion_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_temporal_boost_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_temporal_boost_max: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_clock_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_fixed_clock_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_rng_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

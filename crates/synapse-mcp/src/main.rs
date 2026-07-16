@@ -166,6 +166,8 @@ struct Cli {
     calyx_vault: bool,
     #[arg(long, env = "SYNAPSE_CALYX_VAULT_DIR", value_name = "PATH")]
     calyx_vault_dir: Option<PathBuf>,
+    #[arg(long, env = "SYNAPSE_CALYX_CONFIG", value_name = "PATH")]
+    calyx_config: Option<PathBuf>,
     #[arg(
         long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
@@ -291,6 +293,7 @@ impl Cli {
         );
         config.calyx_vault = self.calyx_vault;
         config.calyx_vault_dir = self.calyx_vault_dir.clone();
+        config.calyx_config_path = self.calyx_config.clone();
         config
     }
 

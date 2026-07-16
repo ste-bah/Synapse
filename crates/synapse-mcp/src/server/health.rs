@@ -201,10 +201,11 @@ impl SynapseService {
         } else {
             "starting"
         };
+        let tuning = status.tuning;
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} remediation={}",
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -217,6 +218,10 @@ impl SynapseService {
                 status.last_recovered_seq,
                 status.torn_tail.as_deref().unwrap_or("none"),
                 status.last_error_code.as_deref().unwrap_or("none"),
+                status.last_calyx_error_code.as_deref().unwrap_or("none"),
+                tuning.map_or("none", |config| config.clock_mode.as_str()),
+                tuning.map(|config| config.bit_floor_bits),
+                tuning.map(|config| config.correlation_ceiling),
                 status.remediation.as_deref().unwrap_or("none")
             )),
             calyx_vault_open: Some(status.open),
@@ -233,8 +238,25 @@ impl SynapseService {
             calyx_vault_last_recovered_seq: status.last_recovered_seq,
             calyx_vault_torn_tail: status.torn_tail,
             calyx_vault_last_error_code: status.last_error_code,
+            calyx_vault_last_calyx_error_code: status.last_calyx_error_code,
             calyx_vault_last_error: status.last_error,
             calyx_vault_remediation: status.remediation,
+            calyx_bit_floor_bits: tuning.map(|config| config.bit_floor_bits),
+            calyx_correlation_ceiling: tuning.map(|config| config.correlation_ceiling),
+            calyx_guard_far_identity: tuning.map(|config| config.guard_far_identity),
+            calyx_guard_far_content: tuning.map(|config| config.guard_far_content),
+            calyx_guard_far_stylistic: tuning.map(|config| config.guard_far_stylistic),
+            calyx_guard_cold_start_tau: tuning.map(|config| config.guard_cold_start_tau),
+            calyx_kernel_fraction: tuning.map(|config| config.kernel_fraction),
+            calyx_kernel_recall_gate: tuning.map(|config| config.kernel_recall_gate),
+            calyx_fusion_k: tuning.map(|config| config.fusion_k),
+            calyx_temporal_boost_min: tuning.map(|config| config.temporal_boost_min),
+            calyx_temporal_boost_max: tuning.map(|config| config.temporal_boost_max),
+            calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
+            calyx_math_backend: tuning.map(|config| config.math_backend.as_str().to_owned()),
+            calyx_clock_mode: tuning.map(|config| config.clock_mode.as_str().to_owned()),
+            calyx_fixed_clock_unix_ms: tuning.and_then(|config| config.fixed_clock_unix_ms),
+            calyx_rng_seed: tuning.map(|config| config.rng_seed),
             ..SubsystemHealth::default()
         }
     }

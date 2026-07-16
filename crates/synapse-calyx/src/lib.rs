@@ -1,6 +1,7 @@
 //! Synapse-owned lifecycle wrapper for the embedded Calyx Aster vault.
 
 mod async_vault;
+mod error_bridge;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -12,7 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Seq, VaultId};
+use calyx_core::{Clock, Seq, SystemClock, Ts, VaultId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -42,11 +43,211 @@ const LOCK_REMEDIATION: &str =
 const OPEN_REMEDIATION: &str =
     "inspect the vault directory, recovery report, and Calyx error; repair storage before restart";
 const CLOSE_REMEDIATION: &str = "inspect the vault directory and shutdown logs; do not start a successor until the lock and PID readback are clean";
+const CONFIG_REMEDIATION: &str =
+    "fix the [calyx] configuration file or unset SYNAPSE_CALYX_CONFIG to use handbook defaults";
+
+const DEFAULT_BIT_FLOOR_BITS: f32 = 0.05;
+const DEFAULT_CORRELATION_CEILING: f32 = 0.6;
+const DEFAULT_GUARD_FAR_IDENTITY: f32 = 0.01;
+const DEFAULT_GUARD_FAR_CONTENT: f32 = 0.03;
+const DEFAULT_GUARD_FAR_STYLISTIC: f32 = 0.05;
+const DEFAULT_GUARD_COLD_START_TAU: f32 = 0.7;
+const DEFAULT_KERNEL_FRACTION: f32 = 0.01;
+const DEFAULT_KERNEL_RECALL_GATE: f32 = 0.95;
+const DEFAULT_FUSION_K: u32 = 60;
+const DEFAULT_TEMPORAL_BOOST_MIN: f32 = 0.0;
+const DEFAULT_TEMPORAL_BOOST_MAX: f32 = 0.10;
+const DEFAULT_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const DEFAULT_RNG_SEED: u64 = 0x5A17_5EED_CA1A_1696;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxMathBackend {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl SynapseCalyxMathBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxClockMode {
+    System,
+    Fixed,
+}
+
+impl SynapseCalyxClockMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Fixed => "fixed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SynapseCalyxTuningConfig {
+    pub bit_floor_bits: f32,
+    pub correlation_ceiling: f32,
+    pub guard_far_identity: f32,
+    pub guard_far_content: f32,
+    pub guard_far_stylistic: f32,
+    pub guard_cold_start_tau: f32,
+    pub kernel_fraction: f32,
+    pub kernel_recall_gate: f32,
+    pub fusion_k: u32,
+    pub temporal_boost_min: f32,
+    pub temporal_boost_max: f32,
+    pub vram_budget_bytes: u64,
+    pub math_backend: SynapseCalyxMathBackend,
+    pub clock_mode: SynapseCalyxClockMode,
+    pub fixed_clock_unix_ms: Option<Ts>,
+    pub rng_seed: u64,
+}
+
+impl Default for SynapseCalyxTuningConfig {
+    fn default() -> Self {
+        Self {
+            bit_floor_bits: DEFAULT_BIT_FLOOR_BITS,
+            correlation_ceiling: DEFAULT_CORRELATION_CEILING,
+            guard_far_identity: DEFAULT_GUARD_FAR_IDENTITY,
+            guard_far_content: DEFAULT_GUARD_FAR_CONTENT,
+            guard_far_stylistic: DEFAULT_GUARD_FAR_STYLISTIC,
+            guard_cold_start_tau: DEFAULT_GUARD_COLD_START_TAU,
+            kernel_fraction: DEFAULT_KERNEL_FRACTION,
+            kernel_recall_gate: DEFAULT_KERNEL_RECALL_GATE,
+            fusion_k: DEFAULT_FUSION_K,
+            temporal_boost_min: DEFAULT_TEMPORAL_BOOST_MIN,
+            temporal_boost_max: DEFAULT_TEMPORAL_BOOST_MAX,
+            vram_budget_bytes: DEFAULT_VRAM_BUDGET_BYTES,
+            math_backend: SynapseCalyxMathBackend::Auto,
+            clock_mode: SynapseCalyxClockMode::System,
+            fixed_clock_unix_ms: None,
+            rng_seed: DEFAULT_RNG_SEED,
+        }
+    }
+}
+
+impl SynapseCalyxTuningConfig {
+    /// Validates every exposed Calyx tuning knob before daemon startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when any value is non-finite, outside the
+    /// accepted range, or when clock settings contradict each other.
+    pub fn validate(self) -> Result<Self, SynapseCalyxError> {
+        validate_f32("bit_floor_bits", self.bit_floor_bits, 0.0, f32::INFINITY)?;
+        validate_f32("correlation_ceiling", self.correlation_ceiling, 0.0, 1.0)?;
+        validate_f32(
+            "guard_far_identity",
+            self.guard_far_identity,
+            0.0,
+            DEFAULT_GUARD_FAR_IDENTITY,
+        )?;
+        validate_f32(
+            "guard_far_content",
+            self.guard_far_content,
+            0.0,
+            DEFAULT_GUARD_FAR_CONTENT,
+        )?;
+        validate_f32(
+            "guard_far_stylistic",
+            self.guard_far_stylistic,
+            0.0,
+            DEFAULT_GUARD_FAR_STYLISTIC,
+        )?;
+        validate_f32("guard_cold_start_tau", self.guard_cold_start_tau, 0.0, 1.0)?;
+        validate_f32("kernel_fraction", self.kernel_fraction, 0.0, 1.0)?;
+        if self.kernel_fraction == 0.0 {
+            return Err(invalid_config("kernel_fraction must be greater than 0.0"));
+        }
+        validate_f32("kernel_recall_gate", self.kernel_recall_gate, 0.0, 1.0)?;
+        if self.fusion_k == 0 {
+            return Err(invalid_config("fusion_k must be positive"));
+        }
+        validate_f32(
+            "temporal_boost_min",
+            self.temporal_boost_min,
+            0.0,
+            DEFAULT_TEMPORAL_BOOST_MAX,
+        )?;
+        validate_f32(
+            "temporal_boost_max",
+            self.temporal_boost_max,
+            self.temporal_boost_min,
+            DEFAULT_TEMPORAL_BOOST_MAX,
+        )?;
+        if self.vram_budget_bytes == 0 {
+            return Err(invalid_config("vram_budget_bytes must be positive"));
+        }
+        match (self.clock_mode, self.fixed_clock_unix_ms) {
+            (SynapseCalyxClockMode::System, Some(_)) => {
+                return Err(invalid_config(
+                    "fixed_clock_unix_ms is only valid when clock_mode = \"fixed\"",
+                ));
+            }
+            (SynapseCalyxClockMode::Fixed, None) => {
+                return Err(invalid_config(
+                    "clock_mode = \"fixed\" requires fixed_clock_unix_ms",
+                ));
+            }
+            (SynapseCalyxClockMode::System, None) | (SynapseCalyxClockMode::Fixed, Some(_)) => {}
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SynapseCalyxClock {
+    System,
+    Fixed(Ts),
+}
+
+impl SynapseCalyxClock {
+    fn from_tuning(config: &SynapseCalyxTuningConfig) -> Result<Self, SynapseCalyxError> {
+        match config.clock_mode {
+            SynapseCalyxClockMode::System => Ok(Self::System),
+            SynapseCalyxClockMode::Fixed => {
+                config.fixed_clock_unix_ms.map(Self::Fixed).ok_or_else(|| {
+                    invalid_config("clock_mode = \"fixed\" requires fixed_clock_unix_ms")
+                })
+            }
+        }
+    }
+}
+
+impl Clock for SynapseCalyxClock {
+    fn now(&self) -> Ts {
+        match self {
+            Self::System => SystemClock.now(),
+            Self::Fixed(ts) => *ts,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SynapseCalyxConfigFile {
+    calyx: SynapseCalyxTuningConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SynapseCalyxConfig {
     pub vault_dir: PathBuf,
     pub machine_salt_path: PathBuf,
+    pub tuning: SynapseCalyxTuningConfig,
 }
 
 impl SynapseCalyxConfig {
@@ -61,14 +262,21 @@ impl SynapseCalyxConfig {
     /// Returns an error when `APPDATA` is absent.
     pub fn from_default_roaming() -> Result<Self, SynapseCalyxError> {
         let data_dir = roaming_synapse_dir()?;
-        Ok(Self {
-            vault_dir: data_dir.join(VAULT_DIR_NAME),
-            machine_salt_path: data_dir.join(MACHINE_SALT_FILE_NAME),
-        })
+        let tuning = SynapseCalyxTuningConfig::default().validate()?;
+        Self::from_paths_with_tuning(
+            data_dir.join(VAULT_DIR_NAME),
+            data_dir.join(MACHINE_SALT_FILE_NAME),
+            tuning,
+        )
     }
 
     #[must_use]
     pub fn from_vault_dir(vault_dir: PathBuf) -> Self {
+        Self::from_vault_dir_with_tuning(vault_dir, SynapseCalyxTuningConfig::default())
+    }
+
+    #[must_use]
+    fn from_vault_dir_with_tuning(vault_dir: PathBuf, tuning: SynapseCalyxTuningConfig) -> Self {
         let salt_parent = vault_dir
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -76,6 +284,7 @@ impl SynapseCalyxConfig {
         Self {
             vault_dir,
             machine_salt_path: salt_parent.join(MACHINE_SALT_FILE_NAME),
+            tuning,
         }
     }
 
@@ -86,16 +295,87 @@ impl SynapseCalyxConfig {
     /// Returns an error when no explicit path is supplied and the default
     /// roaming path cannot be resolved, or when the explicit path is empty.
     pub fn from_optional_vault_dir(vault_dir: Option<PathBuf>) -> Result<Self, SynapseCalyxError> {
+        Self::from_optional_vault_dir_and_config_path(vault_dir, None)
+    }
+
+    /// Resolves the configured vault directory and optional `[calyx]` config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path/config is invalid or when the Calyx
+    /// error-code bridge has drifted from the upstream catalog.
+    pub fn from_optional_vault_dir_and_config_path(
+        vault_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self, SynapseCalyxError> {
+        error_bridge::validate_calyx_error_bridge()?;
+        let tuning = match config_path {
+            Some(path) => read_tuning_config(&path)?,
+            None => SynapseCalyxTuningConfig::default().validate()?,
+        };
         match vault_dir {
             Some(path) if path.as_os_str().is_empty() => Err(SynapseCalyxError::new(
                 "SYNAPSE_CALYX_VAULT_DIR_EMPTY",
                 "configured Calyx vault directory is empty",
                 "set SYNAPSE_CALYX_VAULT_DIR to an absolute durable path or unset it for the default APPDATA path",
             )),
-            Some(path) => Ok(Self::from_vault_dir(path)),
-            None => Self::from_default_roaming(),
+            Some(path) => Ok(Self::from_vault_dir_with_tuning(path, tuning)),
+            None => {
+                let data_dir = roaming_synapse_dir()?;
+                Self::from_paths_with_tuning(
+                    data_dir.join(VAULT_DIR_NAME),
+                    data_dir.join(MACHINE_SALT_FILE_NAME),
+                    tuning,
+                )
+            }
         }
     }
+
+    fn from_paths_with_tuning(
+        vault_dir: PathBuf,
+        machine_salt_path: PathBuf,
+        tuning: SynapseCalyxTuningConfig,
+    ) -> Result<Self, SynapseCalyxError> {
+        error_bridge::validate_calyx_error_bridge()?;
+        Ok(Self {
+            vault_dir,
+            machine_salt_path,
+            tuning: tuning.validate()?,
+        })
+    }
+}
+
+fn read_tuning_config(path: &Path) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        SynapseCalyxError::with_io(
+            "SYNAPSE_CALYX_CONFIG_READ_FAILED",
+            "read Calyx config",
+            path,
+            &error,
+            CONFIG_REMEDIATION,
+        )
+    })?;
+    let file: SynapseCalyxConfigFile = toml::from_str(&text).map_err(|error| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CONFIG_PARSE_FAILED",
+            format!("parse Calyx config {}: {error}", path.display()),
+            CONFIG_REMEDIATION,
+        )
+    })?;
+    file.calyx.validate()
+}
+
+fn validate_f32(name: &str, value: f32, min: f32, max: f32) -> Result<(), SynapseCalyxError> {
+    if value.is_finite() && value >= min && value <= max {
+        return Ok(());
+    }
+    Err(invalid_config(format!(
+        "{name} must be finite and in [{min}, {max}], got {value}"
+    )))
+}
+
+fn invalid_config(message: impl Into<String>) -> SynapseCalyxError {
+    SynapseCalyxError::new("SYNAPSE_CALYX_CONFIG_INVALID", message, CONFIG_REMEDIATION)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,6 +383,8 @@ pub struct SynapseCalyxError {
     pub code: &'static str,
     pub message: String,
     pub remediation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_code: Option<&'static str>,
 }
 
 impl SynapseCalyxError {
@@ -112,6 +394,7 @@ impl SynapseCalyxError {
             code,
             message: message.into(),
             remediation,
+            source_code: None,
         }
     }
 
@@ -132,27 +415,49 @@ impl SynapseCalyxError {
 
     #[must_use]
     pub fn from_calyx(action: &str, error: &calyx_core::CalyxError) -> Self {
-        Self::new(
-            error.code,
-            format!("{action}: {}", error.message),
-            error.remediation,
-        )
+        let code = error_bridge::map_calyx_error_code(error.code).unwrap_or_else(|| {
+            tracing::error!(
+                code = error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR,
+                calyx_code = error.code,
+                action,
+                "unmapped Calyx error reached the Synapse bridge"
+            );
+            error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR
+        });
+        Self {
+            code,
+            message: format!("{action}: {}", error.message),
+            remediation: error.remediation,
+            source_code: Some(error.code),
+        }
+    }
+
+    #[must_use]
+    pub fn is_from_calyx_code(&self, calyx_code: &str) -> bool {
+        self.source_code == Some(calyx_code)
     }
 }
 
 impl std::fmt::Display for SynapseCalyxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {}; remediation={}",
-            self.code, self.message, self.remediation
-        )
+        match self.source_code {
+            Some(source_code) => write!(
+                f,
+                "{}: {}; source_code={}; remediation={}",
+                self.code, self.message, source_code, self.remediation
+            ),
+            None => write!(
+                f,
+                "{}: {}; remediation={}",
+                self.code, self.message, self.remediation
+            ),
+        }
     }
 }
 
 impl std::error::Error for SynapseCalyxError {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SynapseCalyxVaultStatus {
     pub enabled: bool,
     pub phase: String,
@@ -167,8 +472,10 @@ pub struct SynapseCalyxVaultStatus {
     pub last_recovered_seq: Option<u64>,
     pub torn_tail: Option<String>,
     pub last_error_code: Option<String>,
+    pub last_calyx_error_code: Option<String>,
     pub last_error: Option<String>,
     pub remediation: Option<String>,
+    pub tuning: Option<SynapseCalyxTuningConfig>,
 }
 
 impl SynapseCalyxVaultStatus {
@@ -204,6 +511,7 @@ impl SynapseCalyxVaultStatus {
             enabled: true,
             phase: phase.to_owned(),
             last_error_code: Some(error.code.to_owned()),
+            last_calyx_error_code: error.source_code.map(str::to_owned),
             last_error: Some(error.message.clone()),
             remediation: Some(error.remediation.to_owned()),
             ..Self::default()
@@ -220,6 +528,7 @@ impl SynapseCalyxVaultStatus {
         self.machine_salt_path = Some(config.machine_salt_path.clone());
         self.lock_path = Some(lock_path(&config.vault_dir));
         self.pid_path = Some(pid_path(&config.vault_dir));
+        self.tuning = Some(config.tuning);
     }
 }
 
@@ -274,7 +583,7 @@ impl SynapseCalyxVaultCloseReadback {
 #[derive(Debug)]
 pub struct SynapseCalyxVault {
     config: SynapseCalyxConfig,
-    vault: AsterVault,
+    vault: AsterVault<SynapseCalyxClock>,
     lock: VaultLockGuard,
 }
 
@@ -287,6 +596,8 @@ impl SynapseCalyxVault {
     /// Returns an error when directories, identity files, the machine-local
     /// salt, the single-instance lock, or Calyx recovery/open fail.
     pub fn open(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+        error_bridge::validate_calyx_error_bridge()?;
+        let clock = SynapseCalyxClock::from_tuning(&config.tuning)?;
         create_dir_all(&config.vault_dir)?;
         create_parent_dir(&config.machine_salt_path)?;
         let lock = VaultLockGuard::acquire(&config.vault_dir)?;
@@ -298,11 +609,12 @@ impl SynapseCalyxVault {
             Ok(vault_id) => vault_id,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
         };
-        let vault = match AsterVault::open(
+        let vault = match AsterVault::open_with_clock(
             &config.vault_dir,
             vault_id,
             identity.machine_salt,
             VaultOptions::default(),
+            clock,
         ) {
             Ok(vault) => vault,
             Err(error) => {
@@ -322,6 +634,9 @@ impl SynapseCalyxVault {
             latest_seq = status.latest_seq,
             last_recovered_seq = status.last_recovered_seq,
             torn_tail = status.torn_tail.as_deref().unwrap_or("none"),
+            clock_mode = ?config.tuning.clock_mode,
+            fixed_clock_unix_ms = config.tuning.fixed_clock_unix_ms,
+            rng_seed = config.tuning.rng_seed,
             "opened durable Calyx Aster vault"
         );
         Ok(Self {
@@ -694,7 +1009,10 @@ impl VaultLockGuard {
     }
 }
 
-fn status_from_vault(config: &SynapseCalyxConfig, vault: &AsterVault) -> SynapseCalyxVaultStatus {
+fn status_from_vault(
+    config: &SynapseCalyxConfig,
+    vault: &AsterVault<SynapseCalyxClock>,
+) -> SynapseCalyxVaultStatus {
     let recovery_report = vault.recovery_report();
     let mut status = SynapseCalyxVaultStatus {
         enabled: true,

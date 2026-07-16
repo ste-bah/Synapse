@@ -909,7 +909,7 @@ fn release_if_expired<T>(
     if result
         .as_ref()
         .err()
-        .is_some_and(|error| error.code == "CALYX_READER_LEASE_EXPIRED")
+        .is_some_and(|error| error.is_from_calyx_code("CALYX_READER_LEASE_EXPIRED"))
     {
         pinned.remove(&lease_id);
         let released = vault.release_reader(lease_id);
