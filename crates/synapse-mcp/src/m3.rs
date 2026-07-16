@@ -658,7 +658,6 @@ impl M3State {
         &mut self,
     ) -> std::result::Result<(), synapse_storage::StorageError> {
         let db = self.ensure_storage()?;
-        let calyx_backend = db.backend_kind() == StorageBackendKind::Calyx;
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
@@ -682,20 +681,6 @@ impl M3State {
             }
         }
         if self.storage_gc_task.is_none() {
-            if calyx_backend {
-                let reason =
-                    "storage backend calyx has pressure parity; public GC maintenance remains unavailable until #1659"
-                        .to_owned();
-                tracing::warn!(
-                    code = "STORAGE_CALYX_GC_MAINTENANCE_UNSUPPORTED",
-                    backend = db.backend_name(),
-                    %reason,
-                    "skipping Calyx storage GC task until GC parity lands"
-                );
-                self.storage_maintenance_unsupported = Some(reason);
-                self.storage_last_error = None;
-                return Ok(());
-            }
             match db.spawn_gc_task() {
                 Ok(task) => {
                     self.storage_gc_task = Some(task);

@@ -46,7 +46,11 @@ const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8 + 8;
 const CALYX_KV_NAMESPACE: u64 = 0;
 const CALYX_COLLECTION_ID_BASE: u64 = 0x5359_4e43_4600_0000;
 const CALYX_METADATA_COLLECTION_ID: u64 = CALYX_COLLECTION_ID_BASE | 0xffff;
-const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports the byte-preserving Db read/write/scan/delete/pressure surface, but this public GC/compaction maintenance API is intentionally unavailable until the Calyx GC/maintenance report parity issue #1659 lands";
+const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports Db read/write/scan/delete/pressure/GC parity; direct compact_cf and compact_cf_range are unavailable because Synapse column families are logical namespaces inside the physical Calyx KV column family";
+const CALYX_GC_CF: &str = "storage_gc";
+const CALYX_GC_PROTECTED_CF_POLICY_SKIPPED: &str = "protected_cf_policy_skipped";
+const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
+const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
 const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
 const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
 const MIB_U64: u64 = 1024 * 1024;
@@ -777,6 +781,59 @@ impl pressure::PressureMaintenance for CalyxPressureMaintenance {
     }
 }
 
+struct CalyxGcRunner {
+    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+}
+
+impl CalyxGcRunner {
+    const fn new(vault: Arc<Mutex<Option<SynapseCalyxVault>>>) -> Self {
+        Self { vault }
+    }
+
+    fn run_default_once(&self) -> StorageResult<gc::GcReport> {
+        let budgets = calyx_gc_default_budgets()?;
+        self.run_with_budgets(&budgets)
+    }
+
+    fn run_row_cap_once(
+        &self,
+        cf_name: &'static str,
+        soft_cap_rows: u64,
+        hard_cap_rows: u64,
+    ) -> StorageResult<gc::GcReport> {
+        let budget = calyx_gc_row_budget(cf_name, soft_cap_rows, hard_cap_rows)?;
+        self.run_with_budgets(std::slice::from_ref(&budget))
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the vault mutex intentionally serializes physical Calyx GC scans, tombstone writes, and tombstone purges"
+    )]
+    fn run_with_budgets(&self, budgets: &[CalyxGcBudget]) -> StorageResult<gc::GcReport> {
+        let guard = self.vault.lock().map_err(|poisoned| {
+            calyx_operation_failed(
+                CALYX_GC_CF,
+                true,
+                format!("run Calyx GC: vault mutex poisoned: {poisoned}"),
+            )
+        })?;
+        let Some(vault) = guard.as_ref() else {
+            return Err(calyx_operation_failed(
+                CALYX_GC_CF,
+                true,
+                "run Calyx GC: vault handle has already been closed".to_owned(),
+            ));
+        };
+        run_calyx_gc_budgets(vault, budgets)
+    }
+}
+
+impl gc::GcRunner for CalyxGcRunner {
+    fn run_once(&self) -> StorageResult<gc::GcReport> {
+        self.run_default_once()
+    }
+}
+
 impl StorageBackend for CalyxBackend {
     fn kind(&self) -> StorageBackendKind {
         StorageBackendKind::Calyx
@@ -931,20 +988,28 @@ impl StorageBackend for CalyxBackend {
     }
 
     fn run_gc_once(&self) -> StorageResult<gc::GcReport> {
-        Err(calyx_unsupported_maintenance("run_gc_once"))
+        CalyxGcRunner::new(Arc::clone(&self.vault)).run_default_once()
     }
 
     fn run_gc_once_with_row_caps(
         &self,
-        _cf_name: &'static str,
-        _soft_cap_rows: u64,
-        _hard_cap_rows: u64,
+        cf_name: &'static str,
+        soft_cap_rows: u64,
+        hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport> {
-        Err(calyx_unsupported_maintenance("run_gc_once_with_row_caps"))
+        CalyxGcRunner::new(Arc::clone(&self.vault)).run_row_cap_once(
+            cf_name,
+            soft_cap_rows,
+            hard_cap_rows,
+        )
     }
 
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask> {
-        Err(calyx_unsupported_maintenance("spawn_gc_task"))
+        let config = gc::GcConfig::from_retention_defaults();
+        gc::spawn_runner(
+            Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault))),
+            config.interval(),
+        )
     }
 
     fn pressure_level(&self) -> pressure::DiskPressureLevel {
@@ -1258,6 +1323,350 @@ struct CalyxRetentionOutcome {
     after_live_bytes: u64,
     cap_evicted_rows: u64,
     hard_cap_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalyxGcBudget {
+    cf_name: &'static str,
+    soft_cap: u64,
+    hard_cap: u64,
+    unit: CalyxGcUnit,
+    protected: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CalyxGcUnit {
+    Bytes,
+    Rows,
+}
+
+impl CalyxGcUnit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Rows => "rows",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CalyxGcCapOutcome {
+    after_value: u64,
+    cap_evicted_rows: u64,
+    eviction_skipped_reason: Option<&'static str>,
+}
+
+fn calyx_gc_default_budgets() -> StorageResult<Vec<CalyxGcBudget>> {
+    DEFAULTS
+        .iter()
+        .copied()
+        .map(|retention| {
+            let (soft_cap, hard_cap) = calyx_retention_cap_bytes_for_write(retention)?;
+            calyx_gc_budget(retention.cf, soft_cap, hard_cap, CalyxGcUnit::Bytes)
+        })
+        .collect()
+}
+
+fn calyx_gc_row_budget(
+    cf_name: &'static str,
+    soft_cap_rows: u64,
+    hard_cap_rows: u64,
+) -> StorageResult<CalyxGcBudget> {
+    calyx_gc_budget(cf_name, soft_cap_rows, hard_cap_rows, CalyxGcUnit::Rows)
+}
+
+fn calyx_gc_budget(
+    cf_name: &'static str,
+    soft_cap: u64,
+    hard_cap: u64,
+    unit: CalyxGcUnit,
+) -> StorageResult<CalyxGcBudget> {
+    calyx_collection_id_for_cf_write(cf_name)?;
+    if soft_cap == 0 || hard_cap == 0 {
+        return Err(calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "invalid Calyx GC {} cap: soft_cap={soft_cap} hard_cap={hard_cap}; both caps must be non-zero",
+                unit.as_str()
+            ),
+        ));
+    }
+    if hard_cap < soft_cap {
+        return Err(calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "invalid Calyx GC {} cap: hard_cap={hard_cap} is below soft_cap={soft_cap}",
+                unit.as_str()
+            ),
+        ));
+    }
+    Ok(CalyxGcBudget {
+        cf_name,
+        soft_cap,
+        hard_cap,
+        unit,
+        protected: calyx_cf_protected_from_auto_delete(cf_name),
+    })
+}
+
+fn run_calyx_gc_budgets(
+    vault: &SynapseCalyxVault,
+    budgets: &[CalyxGcBudget],
+) -> StorageResult<gc::GcReport> {
+    let now_ms = calyx_clock_now_for_write(vault, CALYX_GC_CF)?;
+    let mut cf_reports = Vec::with_capacity(budgets.len());
+    let mut tombstones = Vec::new();
+    for budget in budgets {
+        cf_reports.push(run_calyx_gc_budget(
+            vault,
+            *budget,
+            now_ms,
+            &mut tombstones,
+        )?);
+    }
+
+    if !tombstones.is_empty() {
+        let tombstone_rows =
+            calyx_len_to_u64(CALYX_GC_CF, "Calyx GC tombstones", tombstones.len())?;
+        commit_calyx_rows_to_vault(vault, CALYX_GC_CF, tombstones)?;
+        vault.purge_kv_tombstones().map_err(|source| {
+            calyx_write_failed(CALYX_GC_CF, "purge Calyx KV tombstones after GC", &source)
+        })?;
+        tracing::info!(
+            code = "STORAGE_CALYX_GC_TOMBSTONES_PURGED",
+            tombstone_rows,
+            "Calyx storage GC purged committed KV tombstones"
+        );
+    }
+
+    Ok(gc::GcReport { cf_reports })
+}
+
+fn run_calyx_gc_budget(
+    vault: &SynapseCalyxVault,
+    budget: CalyxGcBudget,
+    now_ms: u64,
+    pending_tombstones: &mut Vec<SynapseCalyxCfWrite>,
+) -> StorageResult<gc::GcCfReport> {
+    let collection_id = calyx_collection_id_for_cf_write(budget.cf_name)?;
+    let mut state = collect_calyx_retention_state(
+        vault,
+        budget.cf_name,
+        collection_id,
+        now_ms,
+        budget.protected,
+    )?;
+    let before_live_rows = calyx_len_to_u64(
+        budget.cf_name,
+        "Calyx GC live row count",
+        state.live_entries.len(),
+    )?;
+    let before_estimated_num_keys = before_live_rows
+        .checked_add(state.expired_rows)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                budget.cf_name,
+                format!(
+                    "Calyx GC key-count accounting overflow: live_rows={before_live_rows} expired_rows={}",
+                    state.expired_rows
+                ),
+            )
+        })?;
+    let before_value = match budget.unit {
+        CalyxGcUnit::Bytes => state.before_live_bytes,
+        CalyxGcUnit::Rows => before_live_rows,
+    };
+    let hard_cap_reached = log_calyx_gc_hard_cap_if_reached(budget, before_value);
+    let cap_outcome = apply_calyx_gc_cap_eviction(budget, &mut state, before_value)?;
+    let evicted_rows = state
+        .expired_rows
+        .checked_add(cap_outcome.cap_evicted_rows)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                budget.cf_name,
+                format!(
+                    "Calyx GC evicted-row accounting overflow: expired_rows={} cap_evicted_rows={}",
+                    state.expired_rows, cap_outcome.cap_evicted_rows
+                ),
+            )
+        })?;
+    let after_estimated_num_keys = before_estimated_num_keys.saturating_sub(evicted_rows);
+    emit_calyx_gc_report(budget, &state, &cap_outcome, before_value, hard_cap_reached);
+    if cap_outcome.cap_evicted_rows > 0 {
+        emit_calyx_gc_eviction_metric(
+            budget,
+            cap_outcome.cap_evicted_rows,
+            before_value,
+            cap_outcome.after_value,
+        );
+    }
+    pending_tombstones.append(&mut state.tombstones);
+
+    Ok(gc::GcCfReport {
+        cf_name: budget.cf_name.to_owned(),
+        before_value,
+        after_value: cap_outcome.after_value,
+        before_estimated_num_keys: Some(before_estimated_num_keys),
+        after_estimated_num_keys: Some(after_estimated_num_keys),
+        examined_rows: before_estimated_num_keys,
+        scan_limited: false,
+        evicted_rows,
+        eviction_skipped_reason: cap_outcome.eviction_skipped_reason,
+        hard_cap_reached,
+        hard_cap_code: hard_cap_reached.then_some(error_codes::STORAGE_CF_HARD_CAP_REACHED),
+    })
+}
+
+fn apply_calyx_gc_cap_eviction(
+    budget: CalyxGcBudget,
+    state: &mut CalyxRetentionState,
+    before_value: u64,
+) -> StorageResult<CalyxGcCapOutcome> {
+    let mut outcome = CalyxGcCapOutcome {
+        after_value: before_value,
+        cap_evicted_rows: 0,
+        eviction_skipped_reason: None,
+    };
+    if before_value <= budget.soft_cap {
+        return Ok(outcome);
+    }
+    if budget.protected {
+        tracing::warn!(
+            code = "STORAGE_CALYX_GC_PROTECTED_CAP_SKIPPED",
+            cf = budget.cf_name,
+            unit = budget.unit.as_str(),
+            before_value,
+            soft_cap = budget.soft_cap,
+            hard_cap = budget.hard_cap,
+            reason = CALYX_GC_PROTECTED_CF_POLICY_SKIPPED,
+            "Calyx storage GC skipped cap eviction for protected operator-owned column family"
+        );
+        outcome.eviction_skipped_reason = Some(CALYX_GC_PROTECTED_CF_POLICY_SKIPPED);
+        return Ok(outcome);
+    }
+
+    state.live_entries.sort_by(|left, right| {
+        left.written_at_ms
+            .cmp(&right.written_at_ms)
+            .then_with(|| left.user_key.cmp(&right.user_key))
+    });
+    for entry in state.live_entries.drain(..) {
+        if outcome.after_value <= budget.soft_cap {
+            break;
+        }
+        let removed_value = match budget.unit {
+            CalyxGcUnit::Bytes => entry.live_bytes,
+            CalyxGcUnit::Rows => 1,
+        };
+        outcome.after_value = outcome.after_value.checked_sub(removed_value).ok_or_else(|| {
+            calyx_write_failed_detail(
+                budget.cf_name,
+                format!(
+                    "Calyx GC {} accounting underflow while evicting value {removed_value} from {}",
+                    budget.unit.as_str(),
+                    budget.cf_name
+                ),
+            )
+        })?;
+        state.tombstones.push(SynapseCalyxCfWrite::new(
+            ColumnFamily::Kv,
+            entry.full_key,
+            tombstone_value(),
+        ));
+        outcome.cap_evicted_rows = outcome.cap_evicted_rows.saturating_add(1);
+    }
+
+    if before_value > budget.hard_cap && outcome.after_value > budget.hard_cap {
+        let detail = format!(
+            "Calyx GC could not reduce {cf} below hard cap: unit={unit} before_value={before_value} after_value={after_value} hard_cap={hard_cap}",
+            cf = budget.cf_name,
+            unit = budget.unit.as_str(),
+            after_value = outcome.after_value,
+            hard_cap = budget.hard_cap
+        );
+        tracing::error!(
+            code = error_codes::STORAGE_WRITE_FAILED,
+            cf = budget.cf_name,
+            unit = budget.unit.as_str(),
+            before_value,
+            after_value = outcome.after_value,
+            hard_cap = budget.hard_cap,
+            detail,
+            "Calyx storage GC hard cap enforcement failed"
+        );
+        return Err(calyx_write_failed_detail(budget.cf_name, detail));
+    }
+    Ok(outcome)
+}
+
+fn log_calyx_gc_hard_cap_if_reached(budget: CalyxGcBudget, before_value: u64) -> bool {
+    let hard_cap_reached = before_value >= budget.hard_cap;
+    if hard_cap_reached {
+        tracing::warn!(
+            code = error_codes::STORAGE_CF_HARD_CAP_REACHED,
+            cf = budget.cf_name,
+            unit = budget.unit.as_str(),
+            before_value,
+            soft_cap = budget.soft_cap,
+            hard_cap = budget.hard_cap,
+            protected = budget.protected,
+            "Calyx storage GC hard cap reached"
+        );
+    }
+    hard_cap_reached
+}
+
+fn emit_calyx_gc_report(
+    budget: CalyxGcBudget,
+    state: &CalyxRetentionState,
+    cap_outcome: &CalyxGcCapOutcome,
+    before_value: u64,
+    hard_cap_reached: bool,
+) {
+    if state.expired_rows > 0
+        || cap_outcome.cap_evicted_rows > 0
+        || cap_outcome.eviction_skipped_reason.is_some()
+        || hard_cap_reached
+    {
+        tracing::info!(
+            code = "STORAGE_CALYX_GC_COMPLETED",
+            cf = budget.cf_name,
+            unit = budget.unit.as_str(),
+            expired_rows = state.expired_rows,
+            cap_evicted_rows = cap_outcome.cap_evicted_rows,
+            before_value,
+            after_value = cap_outcome.after_value,
+            soft_cap = budget.soft_cap,
+            hard_cap = budget.hard_cap,
+            hard_cap_reached,
+            eviction_skipped_reason = cap_outcome.eviction_skipped_reason.unwrap_or("none"),
+            "Calyx storage GC report completed"
+        );
+    }
+}
+
+fn emit_calyx_gc_eviction_metric(
+    budget: CalyxGcBudget,
+    cap_evicted_rows: u64,
+    before_value: u64,
+    after_value: u64,
+) {
+    synapse_telemetry::metrics::counter!(
+        CALYX_GC_CACHE_EVICTIONS_TOTAL,
+        "cf" => budget.cf_name,
+        "reason" => CALYX_GC_SOFT_CAP_REASON
+    )
+    .increment(cap_evicted_rows);
+    tracing::info!(
+        code = "STORAGE_CACHE_EVICTIONS_TOTAL_INCREMENTED",
+        metric_name = CALYX_GC_CACHE_EVICTIONS_TOTAL,
+        cf = budget.cf_name,
+        reason = CALYX_GC_SOFT_CAP_REASON,
+        delta = cap_evicted_rows,
+        before_value,
+        after_value,
+        "Calyx storage GC cache eviction counter incremented"
+    );
 }
 
 fn enforce_calyx_retention_for_cf(
@@ -1610,6 +2019,12 @@ fn calyx_live_row_bytes(cf_name: &str, user_key: &[u8], payload: &[u8]) -> Stora
                 "Calyx retention row byte accounting overflow: key_bytes={key_bytes} payload_bytes={payload_bytes}"
             ),
         )
+    })
+}
+
+fn calyx_len_to_u64(cf_name: &str, context: &'static str, len: usize) -> StorageResult<u64> {
+    u64::try_from(len).map_err(|_error| {
+        calyx_write_failed_detail(cf_name, format!("{context} does not fit in u64: {len}"))
     })
 }
 

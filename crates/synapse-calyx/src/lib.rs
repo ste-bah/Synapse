@@ -741,6 +741,18 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("compact Calyx KV CF", &error))
     }
 
+    /// Prunes durable MVCC tombstones from the Synapse KV storage CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the vault cannot flush,
+    /// compact, rewrite compacted SST output, or reclaim superseded inputs.
+    pub fn purge_kv_tombstones(&self) -> Result<(), SynapseCalyxError> {
+        self.vault
+            .purge_tombstoned_cfs(&[ColumnFamily::Kv])
+            .map_err(|error| SynapseCalyxError::from_calyx("purge Calyx KV tombstones", &error))
+    }
+
     /// Writes raw CF rows through Aster's durable WAL/MVCC commit path.
     ///
     /// This is synchronous by construction. Tokio callers must use

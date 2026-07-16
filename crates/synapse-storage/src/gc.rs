@@ -155,6 +155,10 @@ impl GcConfig {
             unsupported_byte_cap_budgets: Vec::new(),
         }
     }
+
+    pub(crate) const fn interval(&self) -> Duration {
+        self.interval
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,7 +175,27 @@ enum CapUnit {
     Rows,
 }
 
+pub trait GcRunner: Send + Sync + 'static {
+    fn run_once(&self) -> StorageResult<GcReport>;
+}
+
+struct RocksDbGcRunner {
+    db: Arc<DB>,
+    config: GcConfig,
+}
+
+impl GcRunner for RocksDbGcRunner {
+    fn run_once(&self) -> StorageResult<GcReport> {
+        run_once(&self.db, &self.config)
+    }
+}
+
 pub fn spawn(db: Arc<DB>, config: GcConfig) -> StorageResult<GcTask> {
+    let interval = config.interval();
+    spawn_runner(Arc::new(RocksDbGcRunner { db, config }), interval)
+}
+
+pub fn spawn_runner(runner: Arc<dyn GcRunner>, interval: Duration) -> StorageResult<GcTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
             cf_name: "storage_gc".to_owned(),
@@ -181,12 +205,12 @@ pub fn spawn(db: Arc<DB>, config: GcConfig) -> StorageResult<GcTask> {
     let state = Arc::new(GcTaskState::default());
     let task_state = Arc::clone(&state);
     let task = handle.spawn(async move {
-        let mut interval = tokio::time::interval(config.interval);
+        let mut interval = tokio::time::interval(interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let started = mark_gc_tick_started(&task_state);
-                    let result = run_once(&db, &config);
+                    let result = runner.run_once();
                     mark_gc_tick_completed(&task_state, started, &result);
                     if let Err(error) = result {
                         tracing::warn!(error = %error, "storage GC tick failed");
