@@ -10,9 +10,9 @@ use calyx_core::CxId;
 use serde::{Deserialize, Serialize};
 
 use crate::grounding_gaps::{CALYX_KERNEL_EMPTY, CALYX_KERNEL_UNGROUNDED};
-use crate::{FsKernelStore, Kernel, LodestarError, RecallTestParams, Result};
+use crate::{FsKernelStore, Kernel, LodestarError, RecallEvalParams, Result};
 
-pub const KERNEL_ARTIFACT_FORMAT_VERSION: u32 = 1;
+pub const KERNEL_ARTIFACT_FORMAT_VERSION: u32 = 2;
 
 /// Persistence boundary for the full Kernel artifact (`kernel.json`),
 /// the sibling of the kernel index (`index.json`).
@@ -155,10 +155,10 @@ pub fn kernel_health_from_kernel(kernel: &Kernel) -> KernelHealth {
 fn recall_health(kernel: &Kernel) -> KernelRecallHealth {
     let recall = &kernel.recall;
     let min_recall_ratio = recall
-        .recall_test_params
+        .recall_eval_params
         .as_ref()
         .map(|params| params.min_recall_ratio)
-        .unwrap_or_else(|| RecallTestParams::default().min_recall_ratio);
+        .unwrap_or_else(|| RecallEvalParams::default().min_recall_ratio);
     let pass_mode = if recall.n_queries_tested == 0 {
         RecallPassMode::Untested
     } else if recall.warning.is_none() && recall.ratio >= min_recall_ratio {

@@ -37,7 +37,9 @@ use crate::error::LodestarError;
 use crate::kernel::KernelParams;
 use crate::kernel_graph::KernelGraphParams;
 use crate::multi_scope::build_kernel;
-use crate::recall_test::{AnnIndex, CorpusReader, RecallTestParams, kernel_recall_test_with_clock};
+use crate::recall_eval::{
+    AnnIndex, CorpusReader, RecallEvalParams, measure_kernel_recall_with_clock,
+};
 use crate::scope::{AssocStore, Scope, materialize_scope, scope_hash};
 use crate::scope_cache::ScopeCache;
 use crate::{EmbeddingStore, Kernel, build_kernel_index};
@@ -121,7 +123,7 @@ pub struct SummarizeRecall<'a> {
     pub embeddings: &'a dyn EmbeddingStore,
     pub full_index: &'a dyn AnnIndex,
     pub corpus: &'a dyn CorpusReader,
-    pub params: RecallTestParams,
+    pub params: RecallEvalParams,
 }
 
 impl fmt::Display for SummarizeResult {
@@ -295,7 +297,7 @@ fn apply_measured_recall(
     let tau_star_estimate = kernel.recall.tau_star_estimate;
     let tau_star_exact = kernel.recall.tau_star_exact;
     let index = build_kernel_index(kernel, recall.embeddings).map_err(to_calyx)?;
-    let mut measured = kernel_recall_test_with_clock(
+    let mut measured = measure_kernel_recall_with_clock(
         &index,
         recall.full_index,
         recall.corpus,

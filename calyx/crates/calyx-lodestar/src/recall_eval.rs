@@ -29,14 +29,14 @@ pub trait CorpusReader {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RecallTestParams {
+pub struct RecallEvalParams {
     pub held_out_fraction: f32,
     pub top_k: usize,
     pub rng_seed: u64,
     pub min_recall_ratio: f32,
 }
 
-impl Default for RecallTestParams {
+impl Default for RecallEvalParams {
     fn default() -> Self {
         Self {
             held_out_fraction: DEFAULT_HELD_OUT_FRACTION,
@@ -61,7 +61,7 @@ pub struct RecallSupportReport {
     pub candidate_hits: usize,
 }
 
-pub type RecallTestReport = RecallReport;
+pub type RecallEvaluationReport = RecallReport;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InMemoryCorpus {
@@ -145,21 +145,21 @@ impl AnnIndex for HnswIndex {
     }
 }
 
-pub fn kernel_recall_test(
+pub fn measure_kernel_recall(
     kernel_index: &KernelIndex,
     full_index: &dyn AnnIndex,
     corpus: &dyn CorpusReader,
-    params: &RecallTestParams,
-) -> Result<RecallTestReport> {
-    kernel_recall_test_with_clock(kernel_index, full_index, corpus, params, &SystemClock)
+    params: &RecallEvalParams,
+) -> Result<RecallEvaluationReport> {
+    measure_kernel_recall_with_clock(kernel_index, full_index, corpus, params, &SystemClock)
 }
 
 pub fn kernel_recall_gate(
     kernel_index: &KernelIndex,
     full_index: &dyn AnnIndex,
     corpus: &dyn CorpusReader,
-    params: &RecallTestParams,
-) -> Result<RecallTestReport> {
+    params: &RecallEvalParams,
+) -> Result<RecallEvaluationReport> {
     kernel_recall_gate_with_clock(kernel_index, full_index, corpus, params, &SystemClock)
 }
 
@@ -167,20 +167,20 @@ pub fn kernel_recall_gate_with_clock(
     kernel_index: &KernelIndex,
     full_index: &dyn AnnIndex,
     corpus: &dyn CorpusReader,
-    params: &RecallTestParams,
+    params: &RecallEvalParams,
     clock: &dyn Clock,
-) -> Result<RecallTestReport> {
-    let report = kernel_recall_test_with_clock(kernel_index, full_index, corpus, params, clock)?;
+) -> Result<RecallEvaluationReport> {
+    let report = measure_kernel_recall_with_clock(kernel_index, full_index, corpus, params, clock)?;
     enforce_recall_gate(report, params.min_recall_ratio)
 }
 
-pub fn kernel_recall_test_with_clock(
+pub fn measure_kernel_recall_with_clock(
     kernel_index: &KernelIndex,
     full_index: &dyn AnnIndex,
     corpus: &dyn CorpusReader,
-    params: &RecallTestParams,
+    params: &RecallEvalParams,
     clock: &dyn Clock,
-) -> Result<RecallTestReport> {
+) -> Result<RecallEvaluationReport> {
     validate_params(params)?;
     if corpus.is_empty() {
         return Err(LodestarError::RecallEmptyCorpus);
@@ -212,14 +212,14 @@ pub fn kernel_recall_test_with_clock(
     let kernel_only = total_recall / held_out.len() as f32;
     let full = 1.0_f32;
     let ratio = kernel_only / full;
-    Ok(RecallTestReport {
+    Ok(RecallEvaluationReport {
         kernel_only,
         full,
         ratio,
         approx_factor: 1.0,
         tau_star_estimate: 0,
         tau_star_exact: true,
-        recall_test_params: Some(params.clone()),
+        recall_eval_params: Some(params.clone()),
         corpus_name: Some(corpus.name().to_string()),
         n_queries_tested: held_out.len(),
         held_out,
@@ -230,7 +230,7 @@ pub fn kernel_recall_test_with_clock(
 pub fn full_topk_support_set(
     full_index: &dyn AnnIndex,
     corpus: &dyn CorpusReader,
-    params: &RecallTestParams,
+    params: &RecallEvalParams,
 ) -> Result<RecallSupportReport> {
     validate_params(params)?;
     if corpus.is_empty() {
@@ -264,9 +264,9 @@ pub fn full_topk_support_set(
 }
 
 pub fn enforce_recall_gate(
-    report: RecallTestReport,
+    report: RecallEvaluationReport,
     min_recall_ratio: f32,
-) -> Result<RecallTestReport> {
+) -> Result<RecallEvaluationReport> {
     if report.ratio < min_recall_ratio {
         Err(LodestarError::RecallBelowGate {
             ratio: report.ratio,
@@ -277,7 +277,7 @@ pub fn enforce_recall_gate(
     }
 }
 
-fn validate_params(params: &RecallTestParams) -> Result<()> {
+fn validate_params(params: &RecallEvalParams) -> Result<()> {
     if !params.held_out_fraction.is_finite()
         || params.held_out_fraction < 0.0
         || params.held_out_fraction > 1.0

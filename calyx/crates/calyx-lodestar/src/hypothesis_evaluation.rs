@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LodestarError, Result};
 
-pub const HYPOTHESIS_EVALUATION_SCHEMA_VERSION: u32 = 1;
+pub const HYPOTHESIS_EVALUATION_SCHEMA_VERSION: u32 = 2;
 const PLAUSIBILITY_WEIGHT: f32 = 0.35;
 const NOVELTY_WEIGHT: f32 = 0.25;
 const TESTABILITY_WEIGHT: f32 = 0.25;
@@ -45,6 +45,7 @@ pub struct RetrievedEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluatorRun {
     pub prompt_id: String,
     pub temperature_x100: u16,
@@ -53,7 +54,7 @@ pub struct EvaluatorRun {
     pub testability_score: f32,
     pub falsifiability_score: f32,
     pub justification: String,
-    pub falsification_test: String,
+    pub falsification_probe: String,
     pub cited_evidence_ids: Vec<String>,
 }
 
@@ -79,6 +80,7 @@ pub enum HypothesisEvaluationVerdict {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HypothesisEvaluation {
     pub hypothesis_id: String,
     pub a: CxId,
@@ -97,7 +99,7 @@ pub struct HypothesisEvaluation {
     pub aggregate_score: f32,
     pub verdict: HypothesisEvaluationVerdict,
     pub justifications: Vec<String>,
-    pub falsification_tests: Vec<String>,
+    pub falsification_probes: Vec<String>,
     pub cited_evidence: Vec<RetrievedEvidence>,
     pub provenance: Vec<String>,
 }
@@ -196,10 +198,10 @@ fn evaluate_one(
             .iter()
             .map(|run| run.justification.clone())
             .collect(),
-        falsification_tests: input
+        falsification_probes: input
             .evaluator_runs
             .iter()
-            .map(|run| run.falsification_test.clone())
+            .map(|run| run.falsification_probe.clone())
             .collect(),
         cited_evidence,
         provenance: input.chain_provenance.clone(),
@@ -254,10 +256,10 @@ fn validate_runs(runs: &[EvaluatorRun]) -> Result<()> {
     for run in runs {
         if run.prompt_id.trim().is_empty()
             || run.justification.trim().is_empty()
-            || run.falsification_test.trim().is_empty()
+            || run.falsification_probe.trim().is_empty()
         {
             return invalid_params(
-                "evaluator runs require prompt, justification, and falsification",
+                "evaluator runs require prompt, justification, and falsification probe",
             );
         }
         if run.cited_evidence_ids.is_empty() {

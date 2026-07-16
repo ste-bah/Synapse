@@ -6,8 +6,8 @@ use calyx_assay::PanelSufficiency;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, CxId, LensId, Panel};
 use calyx_lodestar::{
-    AnnIndex, CorpusReader, KernelIndex, LodestarError, RecallReport, RecallTestParams,
-    kernel_recall_test_with_clock,
+    AnnIndex, CorpusReader, KernelIndex, LodestarError, RecallEvalParams, RecallReport,
+    measure_kernel_recall_with_clock,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,7 +103,7 @@ pub struct KernelRecallGate<'a> {
     kernel_index: &'a KernelIndex,
     full_index: &'a dyn AnnIndex,
     corpus: &'a dyn CorpusReader,
-    params: RecallTestParams,
+    params: RecallEvalParams,
 }
 
 impl<'a> KernelRecallGate<'a> {
@@ -111,7 +111,7 @@ impl<'a> KernelRecallGate<'a> {
         kernel_index: &'a KernelIndex,
         full_index: &'a dyn AnnIndex,
         corpus: &'a dyn CorpusReader,
-        mut params: RecallTestParams,
+        mut params: RecallEvalParams,
     ) -> Self {
         params.min_recall_ratio = KERNEL_RECALL_RATIO;
         Self {
@@ -130,7 +130,7 @@ impl KernelRecallSource for KernelRecallGate<'_> {
         clock: &dyn Clock,
     ) -> Result<RecallReport, LodestarError> {
         validate_held_out(held_out)?;
-        kernel_recall_test_with_clock(
+        measure_kernel_recall_with_clock(
             self.kernel_index,
             self.full_index,
             self.corpus,

@@ -9,7 +9,7 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 
-use crate::recall_test::{InMemoryAnnIndex, InMemoryCorpus, RecallQuery, RecallTestParams};
+use crate::recall_eval::{InMemoryAnnIndex, InMemoryCorpus, RecallEvalParams, RecallQuery};
 use crate::scope::{AssocStore, CollectionId, FilterExpr, Scope, TenantId};
 use crate::summarize::{
     CALYX_TIMETRAVEL_BEFORE_HORIZON, SUMMARIZE_INVOKED_MARKER, SummarizeParams, SummarizeRecall,
@@ -68,7 +68,7 @@ pub struct AsterRecallInputs {
     embeddings: BTreeMap<CxId, Vec<f32>>,
     corpus: InMemoryCorpus,
     full_index: InMemoryAnnIndex,
-    params: RecallTestParams,
+    params: RecallEvalParams,
 }
 
 pub struct PhysicalAsterAssocSnapshot {
@@ -81,7 +81,7 @@ pub struct AsterSummarizeRequest<'a> {
     pub collection: &'a str,
     pub scope: Scope,
     pub params: Option<SummarizeParams>,
-    pub recall_params: RecallTestParams,
+    pub recall_params: RecallEvalParams,
 }
 
 impl AsterRecallInputs {
@@ -127,7 +127,7 @@ impl<'a, C: Clock> AsterAssocSnapshot<'a, C> {
 
     pub fn recall_inputs(
         &self,
-        params: RecallTestParams,
+        params: RecallEvalParams,
     ) -> std::result::Result<Option<AsterRecallInputs>, CalyxError> {
         let graph = self.full_graph().map_err(to_calyx)?;
         if graph.is_empty() {
@@ -359,7 +359,7 @@ fn summarize_snapshot<C: Clock>(
     snapshot: &AsterAssocSnapshot<'_, C>,
     scope: Scope,
     params: Option<SummarizeParams>,
-    recall_params: RecallTestParams,
+    recall_params: RecallEvalParams,
     cache: &mut ScopeCache,
     clock: &dyn Clock,
 ) -> std::result::Result<SummarizeResult, CalyxError> {

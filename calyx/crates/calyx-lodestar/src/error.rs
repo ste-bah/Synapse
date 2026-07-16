@@ -66,7 +66,7 @@ pub enum LodestarError {
     },
     #[error("CALYX_KERNEL_LOOM_AGREEMENT_INVALID: {detail}")]
     KernelLoomAgreementInvalid { detail: String },
-    #[error("CALYX_RECALL_EMPTY_CORPUS: recall test has no held-out queries")]
+    #[error("CALYX_RECALL_EMPTY_CORPUS: recall evaluation has no held-out queries")]
     RecallEmptyCorpus,
     #[error("CALYX_RECALL_INVALID_PARAMS: {detail}")]
     RecallInvalidParams { detail: String },

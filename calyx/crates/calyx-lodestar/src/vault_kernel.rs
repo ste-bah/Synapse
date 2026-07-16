@@ -5,7 +5,7 @@
 //! vector (the source of truth — no mock, no fabricated recall). Associations
 //! are derived as the embedding k-NN graph (concepts the panel measures as
 //! close). The kernel is selected by [`build_kernel_pipeline`] and its recall is
-//! MEASURED by [`kernel_recall_test`] against the full corpus index. Fails loud
+//! MEASURED by [`measure_kernel_recall`] against the full corpus index. Fails loud
 //! on a too-small / unanchored / unembedded vault.
 
 use std::collections::BTreeMap;
@@ -19,8 +19,8 @@ use calyx_sextant::{HnswIndex, SextantIndex};
 use crate::error::{LodestarError, Result};
 use crate::{
     AnnIndex, GroundednessReport, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelParams,
-    RecallQuery, RecallReport, RecallTestParams, build_kernel_index, build_kernel_pipeline,
-    kernel_recall_test,
+    RecallEvalParams, RecallQuery, RecallReport, build_kernel_index, build_kernel_pipeline,
+    measure_kernel_recall,
 };
 
 /// A real kernel plus its MEASURED kernel-only recall, both computed from the
@@ -56,7 +56,7 @@ pub fn measured_kernel_from_vault<C: Clock>(
     vault: &AsterVault<C>,
     content_slot: SlotId,
     kernel_params: &KernelParams,
-    recall_params: &RecallTestParams,
+    recall_params: &RecallEvalParams,
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<MeasuredVaultKernel> {
@@ -69,7 +69,7 @@ pub fn measured_kernel_from_vault<C: Clock>(
         VaultKernelMode::Strict,
     )?;
     let kernel_index = build_kernel_index(&inputs.kernel, &inputs.embeddings)?;
-    let recall = kernel_recall_test(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
+    let recall = measure_kernel_recall(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
     Ok(MeasuredVaultKernel {
         kernel: inputs.kernel,
         recall,
@@ -90,12 +90,12 @@ pub fn measured_kernel_from_vault<C: Clock>(
 /// The corpus/full index are built once and reused, so the cost is `n` extra
 /// recall tests over the same corpus (the caller caches the result — #1898).
 /// The sole-member case reports the full baseline (removing it leaves no kernel
-/// to test). NOT fabricated — every value is a real `kernel_recall_test`.
+/// to evaluate). NOT fabricated — every value is a real `measure_kernel_recall`.
 pub fn measured_kernel_with_contributions_from_vault<C: Clock>(
     vault: &AsterVault<C>,
     content_slot: SlotId,
     kernel_params: &KernelParams,
-    recall_params: &RecallTestParams,
+    recall_params: &RecallEvalParams,
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
@@ -122,7 +122,7 @@ pub fn measured_kernel_with_contributions_from_vault_allow_partial<C: Clock>(
     vault: &AsterVault<C>,
     content_slot: SlotId,
     kernel_params: &KernelParams,
-    recall_params: &RecallTestParams,
+    recall_params: &RecallEvalParams,
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
@@ -139,10 +139,10 @@ pub fn measured_kernel_with_contributions_from_vault_allow_partial<C: Clock>(
 
 fn measured_kernel_with_contributions_from_inputs(
     inputs: VaultKernelInputs,
-    recall_params: &RecallTestParams,
+    recall_params: &RecallEvalParams,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
     let kernel_index = build_kernel_index(&inputs.kernel, &inputs.embeddings)?;
-    let recall = kernel_recall_test(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
+    let recall = measure_kernel_recall(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
     let baseline = recall.kernel_only;
 
     let mut contributions: Vec<(CxId, f32)> = Vec::with_capacity(inputs.kernel.members.len());
@@ -156,7 +156,7 @@ fn measured_kernel_with_contributions_from_inputs(
             leave_one_out.members.retain(|m| m != member);
             let loo_index = build_kernel_index(&leave_one_out, &inputs.embeddings)?;
             let loo_recall =
-                kernel_recall_test(&loo_index, &inputs.full, &inputs.corpus, recall_params)?;
+                measure_kernel_recall(&loo_index, &inputs.full, &inputs.corpus, recall_params)?;
             baseline - loo_recall.kernel_only
         };
         contributions.push((*member, drop));

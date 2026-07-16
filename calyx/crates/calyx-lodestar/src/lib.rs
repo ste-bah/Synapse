@@ -30,7 +30,7 @@ pub mod multi_scope;
 pub mod probe_matrix;
 pub mod provenance;
 pub mod ranked_hypotheses;
-pub mod recall_test;
+pub mod recall_eval;
 pub mod refusal_expansion;
 pub mod scope;
 pub mod scope_cache;
@@ -163,11 +163,11 @@ pub use ranked_hypotheses::{
     RANKED_HYPOTHESIS_SCHEMA_VERSION, RankedHypothesis, RankedHypothesisParams,
     RankedHypothesisReport, TraceableHypothesisInput, rank_traceable_hypotheses,
 };
-pub use recall_test::{
+pub use recall_eval::{
     AnnIndex, CALYX_KERNEL_RECALL_BELOW_GATE, CorpusReader, InMemoryAnnIndex, InMemoryCorpus,
-    RecallQuery, RecallSupportReport, RecallTestParams, RecallTestReport, enforce_recall_gate,
-    full_topk_support_set, kernel_recall_gate, kernel_recall_gate_with_clock, kernel_recall_test,
-    kernel_recall_test_with_clock,
+    RecallEvalParams, RecallEvaluationReport, RecallQuery, RecallSupportReport,
+    enforce_recall_gate, full_topk_support_set, kernel_recall_gate, kernel_recall_gate_with_clock,
+    measure_kernel_recall, measure_kernel_recall_with_clock,
 };
 pub use refusal_expansion::{
     REFUSAL_EXPANSION_SCHEMA_VERSION, RefusalExpansionAction, RefusalExpansionActionKind,

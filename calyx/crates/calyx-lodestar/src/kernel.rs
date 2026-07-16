@@ -7,7 +7,7 @@ use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::grounding_gaps::{CALYX_KERNEL_EMPTY, grounding_gaps_for_members};
-use crate::recall_test::RecallTestParams;
+use crate::recall_eval::RecallEvalParams;
 use crate::temporal_kernel::apply_frequency_bonuses;
 use crate::{
     DfvsResult, KernelGraph, KernelGraphParams, LpRoundParams, Result, dfvs_approx,
@@ -28,6 +28,7 @@ pub struct GroundednessReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecallReport {
     pub kernel_only: f32,
     pub full: f32,
@@ -35,7 +36,7 @@ pub struct RecallReport {
     pub approx_factor: f64,
     pub tau_star_estimate: usize,
     pub tau_star_exact: bool,
-    pub recall_test_params: Option<RecallTestParams>,
+    pub recall_eval_params: Option<RecallEvalParams>,
     pub corpus_name: Option<String>,
     pub n_queries_tested: usize,
     pub held_out: Vec<CxId>,
@@ -51,7 +52,7 @@ impl Default for RecallReport {
             approx_factor: 1.0,
             tau_star_estimate: 0,
             tau_star_exact: true,
-            recall_test_params: None,
+            recall_eval_params: None,
             corpus_name: None,
             n_queries_tested: 0,
             held_out: Vec::new(),
