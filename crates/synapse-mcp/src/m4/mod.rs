@@ -1938,17 +1938,9 @@ fn direct_shell_background_reason(
 }
 
 pub fn validate_run_shell_execution_plan(
-    params: &ActRunShellParams,
-    inline_await_limit_ms: u64,
+    _params: &ActRunShellParams,
+    _inline_await_limit_ms: u64,
 ) -> Result<(), ErrorData> {
-    if let Some(background_reason) = direct_shell_background_reason(params, inline_await_limit_ms) {
-        reject_new_durable_ssh_promotion(
-            &params.command,
-            &params.args,
-            Some(background_reason),
-            None,
-        )?;
-    }
     Ok(())
 }
 
@@ -2182,16 +2174,6 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActRunShellStartResponse, ErrorData> {
     let _ = unresolved_shell_child_owner_report();
-    // This gate deliberately precedes request hashing and job-directory
-    // creation. A refused SSH durable promotion must not spawn a local/remote
-    // process or leave a synthetic tracked-job artifact that recovery could
-    // later mistake for acquired ownership.
-    reject_new_durable_ssh_promotion(
-        &params.command,
-        &params.args,
-        Some("explicit_act_run_shell_start"),
-        params.job_id.as_deref(),
-    )?;
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let request_sha256 = run_shell_start_request_sha256(&params)?;
@@ -12524,12 +12506,19 @@ fn shell_job_spawn_plan(
     params: &ActRunShellStartParams,
     job_id: &str,
 ) -> Result<ShellJobSpawnPlan, ErrorData> {
-    reject_new_durable_ssh_promotion(
-        &params.command,
-        &params.args,
-        Some("durable_spawn_plan"),
-        Some(job_id),
-    )?;
+    if let Some(invocation) = direct_ssh_command_invocation(&params.command, &params.args) {
+        return tracked_direct_ssh_shell_job_spawn_plan(params, job_id, invocation);
+    }
+    if let Some(source_evidence) = durable_ssh_promotion_evidence(&params.command, &params.args) {
+        return Err(durable_ssh_tracking_preflight_error(
+            "ssh_durable_tracking_requires_direct_ssh_argv",
+            "durable SSH tracking only accepts a direct ssh executable with literal argv; shell-wrapped SSH is ambiguous after shell expansion and is refused before spawning",
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(source_evidence),
+        ));
+    }
     Ok(ShellJobSpawnPlan {
         command: params.command.clone(),
         args: params.args.clone(),
@@ -12537,48 +12526,196 @@ fn shell_job_spawn_plan(
     })
 }
 
+fn direct_ssh_command_invocation(command: &str, args: &[String]) -> Option<SshCommandInvocation> {
+    (ssh_family_client_for_executable(command) == Some("ssh")).then(|| SshCommandInvocation {
+        command: command.to_owned(),
+        args: args.to_vec(),
+        evidence: "direct_command_ssh",
+    })
+}
+
 fn shell_job_ssh_command_invocation(
     command: &str,
     args: &[String],
 ) -> Option<SshCommandInvocation> {
-    if ssh_family_client_for_executable(command) == Some("ssh") {
-        return Some(SshCommandInvocation {
-            command: command.to_owned(),
-            args: args.to_vec(),
-            evidence: "direct_command_ssh",
-        });
+    if let Some(invocation) = direct_ssh_command_invocation(command, args) {
+        return Some(invocation);
     }
     shell_wrapped_ssh_command_invocation(command, args)
 }
 
-fn reject_new_durable_ssh_promotion(
+fn tracked_direct_ssh_shell_job_spawn_plan(
+    params: &ActRunShellStartParams,
+    job_id: &str,
+    invocation: SshCommandInvocation,
+) -> Result<ShellJobSpawnPlan, ErrorData> {
+    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
+        return Err(durable_ssh_tracking_preflight_error(
+            "ssh_destination_missing",
+            "direct durable SSH requires a parseable SSH destination before the remote command",
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        ));
+    };
+    let Some(remote_command) = parts.remote_command.as_deref() else {
+        return Err(durable_ssh_tracking_preflight_error(
+            "ssh_remote_command_required",
+            "interactive durable SSH is refused because the shell start facade owns stdin as null and cannot preserve a terminal or prompt contract; provide a remote command argv after the destination",
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        ));
+    };
+    if let Some(reason) = parts.tracking_unsupported_reason {
+        return Err(durable_ssh_tracking_preflight_error(
+            reason,
+            "this SSH mode changes the remote channel or process lifetime in a way that cannot be bound to one cleanup handle",
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        ));
+    }
+    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
+        return Err(durable_ssh_tracking_preflight_error(
+            "ssh_control_args_not_replay_safe",
+            &format!(
+                "automatic SSH cleanup refused the control argv before spawn because it could not be replayed safely: {reason}"
+            ),
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        ));
+    }
+    let trusted_command =
+        trusted_ssh_automatic_replay_executable(&invocation.command).ok_or_else(|| {
+            durable_ssh_tracking_preflight_error(
+                "ssh_executable_not_trusted_for_cleanup_replay",
+                "direct durable SSH requires a canonical OpenSSH client that Synapse can replay for liveness and cleanup; the requested executable is outside the trusted platform locations",
+                &params.command,
+                &params.args,
+                Some(job_id),
+                Some(invocation.evidence.to_owned()),
+            )
+        })?;
+    let trusted_command = trusted_command.to_string_lossy().into_owned();
+
+    let request_config = ssh_effective_config_readback(&trusted_command, &parts.control_args)
+        .map_err(|detail| {
+            durable_ssh_tracking_preflight_error(
+                "ssh_effective_config_read_failed",
+                &detail,
+                &params.command,
+                &params.args,
+                Some(job_id),
+                Some(invocation.evidence.to_owned()),
+            )
+        })?;
+    let mut isolated_request_args = Vec::with_capacity(parts.control_args.len() + 2);
+    isolated_request_args.push("-F".to_owned());
+    isolated_request_args.push(SSH_AUTOMATIC_REPLAY_DISABLED_CONFIG.to_owned());
+    isolated_request_args.extend_from_slice(&parts.control_args);
+    let isolated_request_config =
+        ssh_effective_config_readback(&trusted_command, &isolated_request_args).map_err(
+            |detail| {
+                durable_ssh_tracking_preflight_error(
+                    "ssh_isolated_effective_config_read_failed",
+                    &detail,
+                    &params.command,
+                    &params.args,
+                    Some(job_id),
+                    Some(invocation.evidence.to_owned()),
+                )
+            },
+        )?;
+    if request_config.fingerprint != isolated_request_config.fingerprint {
+        return Err(durable_ssh_tracking_preflight_error(
+            "ssh_config_dependency_unsupported",
+            "direct durable SSH refused before spawn because the caller's effective ssh_config differs from the config-isolated argv; pass explicit replay-safe -o/-i/-l/-p options instead of relying on mutable ssh_config Host entries",
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        ));
+    }
+
+    let effective_control_args =
+        hardened_ssh_automatic_replay_args(&parts.control_args).map_err(|detail| {
+            durable_ssh_tracking_preflight_error(
+                "ssh_hardened_control_args_failed",
+                &detail,
+                &params.command,
+                &params.args,
+                Some(job_id),
+                Some(invocation.evidence.to_owned()),
+            )
+        })?;
+    let cleanup_config = ssh_effective_config_readback(&trusted_command, &effective_control_args)
+        .map_err(|detail| {
+        durable_ssh_tracking_preflight_error(
+            "ssh_cleanup_effective_config_read_failed",
+            &detail,
+            &params.command,
+            &params.args,
+            Some(job_id),
+            Some(invocation.evidence.to_owned()),
+        )
+    })?;
+    let ownership_token = new_remote_ownership_token();
+    let remote_guardian = ssh_remote_guardian_command(job_id, &ownership_token, remote_command);
+    let mut spawn_args = effective_control_args.clone();
+    spawn_args.push(remote_guardian);
+    let remote_cleanup_invocation = ShellRemoteCleanupInvocation {
+        schema_version: 4,
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        command: trusted_command.clone(),
+        control_args: parts.control_args.clone(),
+        remote_identity: parts.remote_identity,
+        source_evidence: invocation.evidence.to_owned(),
+        args_sha256: shell_args_sha256(&parts.control_args),
+        request_args_sha256: Some(shell_args_sha256(&params.args)),
+        effective_control_args: Some(effective_control_args.clone()),
+        effective_args_sha256: Some(shell_args_sha256(&effective_control_args)),
+        request_effective_config: Some(isolated_request_config.fingerprint),
+        cleanup_effective_config: Some(cleanup_config.fingerprint),
+        ownership_token: Some(ownership_token),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    Ok(ShellJobSpawnPlan {
+        command: trusted_command,
+        args: spawn_args,
+        remote_cleanup_invocation: Some(remote_cleanup_invocation),
+    })
+}
+
+fn durable_ssh_tracking_preflight_error(
+    reason: &str,
+    detail: &str,
     command: &str,
     args: &[String],
-    background_reason: Option<&str>,
     requested_job_id: Option<&str>,
-) -> Result<(), ErrorData> {
-    let Some(source_evidence) = durable_ssh_promotion_evidence(command, args) else {
-        return Ok(());
-    };
-    Err(shell_tool_error(
+    source_evidence: Option<String>,
+) -> ErrorData {
+    shell_tool_error(
         error_codes::ACTION_TARGET_INVALID,
-        "durable SSH execution is refused because Synapse cannot preserve the inline SSH stdout/stderr, account-shell environment, and stdin contract while acquiring a remote cleanup handle; use bounded inline act_run_shell execution",
+        format!("durable SSH tracking preflight refused the command before spawning: {detail}"),
         json!({
             "code": error_codes::ACTION_TARGET_INVALID,
-            "reason": "ssh_durable_semantic_preservation_unavailable",
-            "remediation": "use_bounded_inline_execution",
-            "recommended_tool": "act_run_shell",
-            "recommended_execution_mode": "inline",
-            "maximum_inline_timeout_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
-            "background_reason": background_reason,
+            "reason": reason,
+            "remediation": "use direct ssh with explicit replay-safe control options, a known host key, noninteractive auth, and a remote command; unsupported interactive/shell-wrapped/forwarding/control modes are refused before spawn",
             "requested_job_id": requested_job_id,
             "source_evidence": source_evidence,
             "command": command,
             "args_sha256": shell_args_sha256(args),
             "no_child_spawned": true,
-            "no_job_artifact_created": true,
+            "no_remote_process_started": true,
+            "maximum_inline_timeout_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
         }),
-    ))
+    )
 }
 
 fn durable_ssh_promotion_evidence(command: &str, args: &[String]) -> Option<String> {
@@ -13121,6 +13258,161 @@ fn hardened_ssh_automatic_replay_args(control_args: &[String]) -> Result<Vec<Str
     Ok(args)
 }
 
+fn new_remote_ownership_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn ssh_remote_guardian_command(
+    job_id: &str,
+    ownership_token: &str,
+    remote_command: &str,
+) -> String {
+    const SCRIPT: &str = r#"import hashlib
+import os
+import pwd
+import signal
+import subprocess
+import sys
+import time
+
+job_id = sys.argv[1]
+process_marker = sys.argv[2]
+exit_marker = sys.argv[3]
+remote_command = sys.argv[4]
+ownership_token = os.environ.get("SYNAPSE_REMOTE_JOB_TOKEN", "")
+child = None
+
+def fail(reason):
+    print(f"synapse_remote_guardian_error error={reason}", file=sys.stderr, flush=True)
+    raise SystemExit(125)
+
+def read_boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            value = handle.read().strip()
+    except OSError:
+        fail("boot_identity_unavailable")
+    if not value:
+        fail("boot_identity_unavailable")
+    return value
+
+def read_start_time(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="strict") as handle:
+            stat_line = handle.read().strip()
+    except OSError:
+        fail("proc_identity_unavailable")
+    _comm, separator, stat_tail = stat_line.rpartition(") ")
+    if not separator:
+        fail("proc_identity_unavailable")
+    fields = stat_tail.split()
+    if len(fields) < 20:
+        fail("proc_identity_unavailable")
+    return fields[19]
+
+def terminate_group(signum, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pgid = os.getpgrp()
+    if child is not None and child.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if child.poll() is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    raise SystemExit(128 + int(signum))
+
+if not ownership_token or len(ownership_token) != 32 or any(ch not in "0123456789abcdef" for ch in ownership_token):
+    fail("remote_identity_prerequisite_unavailable")
+
+scope = "setsid"
+try:
+    os.setsid()
+except OSError:
+    # Some OpenSSH servers already execute the remote command as its own
+    # process-group leader. That is an equivalent cleanup boundary for this
+    # guardian: child shells inherit the group, and cancellation can still kill
+    # exactly this group. Anything broader is refused before the payload starts.
+    if os.getpgrp() != os.getpid():
+        fail("guardian_scope_unavailable")
+    scope = "existing_process_group_leader"
+
+boot_id = read_boot_id()
+pid = os.getpid()
+pgid = os.getpgrp()
+sid = os.getsid(0)
+start_time = read_start_time(pid)
+shell = os.environ.get("SHELL", "")
+if not shell.startswith("/") or not os.path.exists(shell):
+    try:
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+    except KeyError:
+        fail("remote_identity_prerequisite_unavailable")
+if not shell.startswith("/") or not os.path.exists(shell):
+    fail("remote_identity_prerequisite_unavailable")
+
+signal.signal(signal.SIGTERM, terminate_group)
+signal.signal(signal.SIGHUP, terminate_group)
+signal.signal(signal.SIGINT, terminate_group)
+
+payload_env = os.environ.copy()
+payload_env["SYNAPSE_REMOTE_JOB_TOKEN"] = ownership_token
+try:
+    child = subprocess.Popen(
+        remote_command,
+        shell=True,
+        executable=shell,
+        env=payload_env,
+    )
+except OSError:
+    fail("remote_payload_spawn_failed")
+
+ownership_token_sha256 = hashlib.sha256(ownership_token.encode("ascii")).hexdigest()
+print(
+    f"{process_marker} job_id={job_id} pid={pid} pgid={pgid} sid={sid} "
+    f"boot_id={boot_id} start_time={start_time} scope={scope} "
+    f"ownership_token_sha256={ownership_token_sha256}",
+    file=sys.stderr,
+    flush=True,
+)
+returncode = child.wait()
+if returncode is None:
+    exit_code = 1
+elif returncode < 0:
+    exit_code = 128 + abs(returncode)
+else:
+    exit_code = returncode
+print(
+    f"{exit_marker} job_id={job_id} pid={pid} pgid={pgid} "
+    f"exit_code={exit_code} ownership_token_sha256={ownership_token_sha256}",
+    file=sys.stderr,
+    flush=True,
+)
+raise SystemExit(exit_code if 0 <= exit_code <= 255 else 1)
+"#;
+    format!(
+        "env SYNAPSE_REMOTE_JOB_TOKEN={} python3 -c {} {} {} {} {}",
+        posix_single_quote(ownership_token),
+        posix_single_quote(SCRIPT),
+        posix_single_quote(job_id),
+        posix_single_quote(SHELL_REMOTE_PROCESS_MARKER),
+        posix_single_quote(SHELL_REMOTE_EXIT_MARKER),
+        posix_single_quote(remote_command),
+    )
+}
+
 fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatus) {
     if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH {
         return;
@@ -13312,6 +13604,13 @@ fn remote_pre_marker_terminal_evidence(stderr: &str) -> Option<RemotePreMarkerTe
             "remote_guardian_scope_unavailable",
             "error=guardian_scope_unavailable",
         ),
+        (
+            "remote_payload_spawn_failed",
+            "error=remote_payload_spawn_failed",
+        ),
+        ("remote_python_unavailable", "python3: command not found"),
+        ("remote_python_unavailable", "python3: not found"),
+        ("remote_python_unavailable", "env: python3"),
     ];
     patterns
         .iter()
