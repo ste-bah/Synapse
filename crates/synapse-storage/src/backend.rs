@@ -46,7 +46,7 @@ const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8 + 8;
 const CALYX_KV_NAMESPACE: u64 = 0;
 const CALYX_COLLECTION_ID_BASE: u64 = 0x5359_4e43_4600_0000;
 const CALYX_METADATA_COLLECTION_ID: u64 = CALYX_COLLECTION_ID_BASE | 0xffff;
-const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports the byte-preserving Db read/write/scan/delete surface from #1656, but this maintenance API is intentionally unavailable until the Calyx pressure/GC/compaction parity issues #1658/#1659 land";
+const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports the byte-preserving Db read/write/scan/delete/pressure surface, but this public GC/compaction maintenance API is intentionally unavailable until the Calyx GC/maintenance report parity issue #1659 lands";
 const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
 const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
 const MIB_U64: u64 = 1024 * 1024;
@@ -515,10 +515,10 @@ impl StorageBackend for RocksDbBackend {
         storage_path: &Path,
     ) -> StorageResult<pressure::PressureReport> {
         pressure::run_once(
-            &self.inner,
             &self.pressure,
             storage_path,
             &pressure::PressureConfig::default(),
+            &pressure::RocksDbPressureMaintenance::new(Arc::clone(&self.inner)),
         )
     }
 
@@ -527,19 +527,21 @@ impl StorageBackend for RocksDbBackend {
         free_bytes: u64,
     ) -> StorageResult<pressure::PressureReport> {
         pressure::run_once_with_free_bytes(
-            &self.inner,
             &self.pressure,
             &pressure::PressureConfig::default(),
             free_bytes,
+            &pressure::RocksDbPressureMaintenance::new(Arc::clone(&self.inner)),
         )
     }
 
     fn spawn_pressure_task(&self, storage_path: &Path) -> StorageResult<pressure::PressureTask> {
         pressure::spawn(
-            Arc::clone(&self.inner),
             Arc::clone(&self.pressure),
             storage_path.to_path_buf(),
             pressure::PressureConfig::default(),
+            Arc::new(pressure::RocksDbPressureMaintenance::new(Arc::clone(
+                &self.inner,
+            ))),
         )
     }
 
@@ -645,8 +647,8 @@ impl StorageBackend for RocksDbBackend {
 }
 
 pub struct CalyxBackend {
-    vault: Mutex<Option<SynapseCalyxVault>>,
-    pressure: pressure::PressureState,
+    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+    pressure: Arc<pressure::PressureState>,
 }
 
 impl CalyxBackend {
@@ -656,8 +658,8 @@ impl CalyxBackend {
             SynapseCalyxVault::open(config).map_err(|source| calyx_open_failed(path, &source))?;
         verify_calyx_schema_version(&vault, path, schema_version)?;
         Ok(Self {
-            vault: Mutex::new(Some(vault)),
-            pressure: pressure::PressureState::default(),
+            vault: Arc::new(Mutex::new(Some(vault))),
+            pressure: Arc::new(pressure::PressureState::default()),
         })
     }
 
@@ -707,8 +709,8 @@ impl CalyxBackend {
 
 impl Drop for CalyxBackend {
     fn drop(&mut self) {
-        let vault = match self.vault.get_mut() {
-            Ok(slot) => slot.take(),
+        let vault = match self.vault.lock() {
+            Ok(mut slot) => slot.take(),
             Err(poisoned) => {
                 tracing::error!(
                     code = "STORAGE_CALYX_DROP_LOCK_POISONED",
@@ -726,6 +728,51 @@ impl Drop for CalyxBackend {
                 error = %error,
                 "Calyx storage backend close failed during drop"
             );
+        }
+    }
+}
+
+struct CalyxPressureMaintenance {
+    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+}
+
+impl CalyxPressureMaintenance {
+    const fn new(vault: Arc<Mutex<Option<SynapseCalyxVault>>>) -> Self {
+        Self { vault }
+    }
+}
+
+impl pressure::PressureMaintenance for CalyxPressureMaintenance {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the vault mutex intentionally serializes physical Calyx compaction with storage reads/writes"
+    )]
+    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
+        let guard = self.vault.lock().map_err(|poisoned| {
+            calyx_operation_failed(
+                pressure::PRESSURE_CF,
+                true,
+                format!("compact Calyx KV for pressure: vault mutex poisoned: {poisoned}"),
+            )
+        })?;
+        let Some(vault) = guard.as_ref() else {
+            return Err(calyx_operation_failed(
+                pressure::PRESSURE_CF,
+                true,
+                "compact Calyx KV for pressure: vault handle has already been closed".to_owned(),
+            ));
+        };
+        let compacted = vault.compact_kv_once().map_err(|source| {
+            calyx_write_failed(
+                pressure::PRESSURE_CF,
+                "compact Calyx KV for pressure",
+                &source,
+            )
+        })?;
+        if compacted {
+            Ok(cf::ALL_COLUMN_FAMILIES.to_vec())
+        } else {
+            Ok(Vec::new())
         }
     }
 }
@@ -953,22 +1000,35 @@ impl StorageBackend for CalyxBackend {
 
     fn run_pressure_check_once(
         &self,
-        _storage_path: &Path,
+        storage_path: &Path,
     ) -> StorageResult<pressure::PressureReport> {
-        Err(calyx_unsupported_maintenance("run_pressure_check_once"))
+        pressure::run_once(
+            &self.pressure,
+            storage_path,
+            &pressure::PressureConfig::default(),
+            &CalyxPressureMaintenance::new(Arc::clone(&self.vault)),
+        )
     }
 
     fn run_pressure_check_with_free_bytes_sample(
         &self,
-        _free_bytes: u64,
+        free_bytes: u64,
     ) -> StorageResult<pressure::PressureReport> {
-        Err(calyx_unsupported_maintenance(
-            "run_pressure_check_with_free_bytes_sample",
-        ))
+        pressure::run_once_with_free_bytes(
+            &self.pressure,
+            &pressure::PressureConfig::default(),
+            free_bytes,
+            &CalyxPressureMaintenance::new(Arc::clone(&self.vault)),
+        )
     }
 
-    fn spawn_pressure_task(&self, _storage_path: &Path) -> StorageResult<pressure::PressureTask> {
-        Err(calyx_unsupported_maintenance("spawn_pressure_task"))
+    fn spawn_pressure_task(&self, storage_path: &Path) -> StorageResult<pressure::PressureTask> {
+        pressure::spawn(
+            Arc::clone(&self.pressure),
+            storage_path.to_path_buf(),
+            pressure::PressureConfig::default(),
+            Arc::new(CalyxPressureMaintenance::new(Arc::clone(&self.vault))),
+        )
     }
 
     fn scan_cf(&self, cf_name: &str) -> StorageResult<Vec<RawRow>> {

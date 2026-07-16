@@ -13,6 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange};
+use calyx_aster::compaction::CompactionResult;
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, Clock, Seq, SystemClock, Ts, VaultId};
@@ -720,6 +721,24 @@ impl SynapseCalyxVault {
                     })
             }
         }
+    }
+
+    /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.
+    ///
+    /// Synapse maps its storage column families onto namespaces inside Aster's
+    /// `ColumnFamily::Kv`, so a successful physical KV compaction covers the
+    /// complete Synapse storage surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the compaction bridge cannot
+    /// flush, verify manifest coverage, write compacted SST output, or reclaim
+    /// superseded inputs.
+    pub fn compact_kv_once(&self) -> Result<bool, SynapseCalyxError> {
+        self.vault
+            .compact_cf_once(ColumnFamily::Kv)
+            .map(|result| matches!(result, Some(CompactionResult::Compacted(_))))
+            .map_err(|error| SynapseCalyxError::from_calyx("compact Calyx KV CF", &error))
     }
 
     /// Writes raw CF rows through Aster's durable WAL/MVCC commit path.

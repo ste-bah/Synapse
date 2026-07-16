@@ -55,11 +55,8 @@ fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String 
 }
 
 fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -> Option<String> {
-    if !readback.maintenance_supported {
-        return None;
-    }
     let mut reasons = Vec::new();
-    if !readback.gc_task_running {
+    if readback.maintenance_supported && !readback.gc_task_running {
         reasons.push("storage GC task is not running".to_owned());
     }
     if !readback.pressure_task_running {
@@ -68,7 +65,9 @@ fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -
     if !readback.pressure_probe.observed {
         reasons.push("storage pressure probe has not completed successfully".to_owned());
     }
-    if let Some(error) = &readback.gc_task.last_error {
+    if readback.maintenance_supported
+        && let Some(error) = &readback.gc_task.last_error
+    {
         reasons.push(format!("storage GC last_error={error}"));
     }
     if let Some(error) = &readback.pressure_probe.last_error {

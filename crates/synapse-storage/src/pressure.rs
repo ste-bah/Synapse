@@ -19,7 +19,7 @@ const LEVEL_1_FREE_BYTES: u64 = 2 * GB;
 const LEVEL_2_FREE_BYTES: u64 = GB;
 const LEVEL_3_FREE_BYTES: u64 = 500 * MB;
 const LEVEL_4_FREE_BYTES: u64 = 200 * MB;
-const PRESSURE_CF: &str = "storage_disk_pressure";
+pub const PRESSURE_CF: &str = "storage_disk_pressure";
 const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 
 /// Current DB-volume pressure level.
@@ -122,6 +122,28 @@ impl Default for PressureConfig {
     }
 }
 
+pub trait PressureMaintenance: Send + Sync {
+    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>>;
+}
+
+#[derive(Debug)]
+pub struct RocksDbPressureMaintenance {
+    db: Arc<DB>,
+}
+
+impl RocksDbPressureMaintenance {
+    #[must_use]
+    pub const fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+}
+
+impl PressureMaintenance for RocksDbPressureMaintenance {
+    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
+        compact_all(&self.db)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PressureThresholds {
     level1: u64,
@@ -197,46 +219,46 @@ impl PressureState {
 }
 
 pub fn spawn(
-    db: Arc<DB>,
     state: Arc<PressureState>,
     path: PathBuf,
     config: PressureConfig,
+    maintenance: Arc<dyn PressureMaintenance>,
 ) -> StorageResult<PressureTask> {
-    spawn_with_probe(db, state, path, config, Arc::new(Fs2DiskProbe))
+    spawn_with_probe(state, path, config, Arc::new(Fs2DiskProbe), maintenance)
 }
 
 pub fn run_once(
-    db: &DB,
     state: &PressureState,
     path: &Path,
     config: &PressureConfig,
+    maintenance: &dyn PressureMaintenance,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
     let result = Fs2DiskProbe
         .available_space(path)
-        .and_then(|free_bytes| apply_free_bytes(db, state, config, free_bytes));
+        .and_then(|free_bytes| apply_free_bytes(state, config, free_bytes, maintenance));
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
 
 pub fn run_once_with_free_bytes(
-    db: &DB,
     state: &PressureState,
     config: &PressureConfig,
     free_bytes: u64,
+    maintenance: &dyn PressureMaintenance,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
-    let result = apply_free_bytes(db, state, config, free_bytes);
+    let result = apply_free_bytes(state, config, free_bytes, maintenance);
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
 
 fn spawn_with_probe(
-    db: Arc<DB>,
     state: Arc<PressureState>,
     path: PathBuf,
     config: PressureConfig,
     probe: Arc<dyn DiskProbe>,
+    maintenance: Arc<dyn PressureMaintenance>,
 ) -> StorageResult<PressureTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
@@ -251,7 +273,9 @@ fn spawn_with_probe(
                 _ = interval.tick() => {
                     let started = mark_pressure_probe_started(&state);
                     let result = match probe.available_space(&path) {
-                        Ok(free_bytes) => apply_free_bytes(&db, &state, &config, free_bytes),
+                        Ok(free_bytes) => {
+                            apply_free_bytes(&state, &config, free_bytes, maintenance.as_ref())
+                        }
                         Err(error) => Err(error),
                     };
                     mark_pressure_probe_completed(&state, started, result.as_ref());
@@ -270,10 +294,10 @@ fn spawn_with_probe(
 }
 
 fn apply_free_bytes(
-    db: &DB,
     state: &PressureState,
     config: &PressureConfig,
     free_bytes: u64,
+    maintenance: &dyn PressureMaintenance,
 ) -> StorageResult<PressureReport> {
     let current_level = config.thresholds.level_for(free_bytes);
     synapse_telemetry::metrics::gauge!(STORAGE_DISK_PRESSURE_LEVEL)
@@ -282,7 +306,7 @@ fn apply_free_bytes(
     let transitioned = previous_level != current_level;
     let gc_advised = transitioned && current_level >= DiskPressureLevel::Level1;
     let compacted_cfs = if transitioned && current_level >= DiskPressureLevel::Level2 {
-        compact_all(db)?
+        maintenance.compact_for_pressure()?
     } else {
         Vec::new()
     };
