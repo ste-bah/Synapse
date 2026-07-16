@@ -979,6 +979,19 @@ impl ActForegroundAuthorityGuard {
     fn delete_operator_interrupted_lease_row(
         &self,
     ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
+        self.delete_persisted_lease_row_and_snapshot("operator_interrupted")
+    }
+
+    fn delete_expired_or_released_retained_lease_row(
+        &self,
+    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
+        self.delete_persisted_lease_row_and_snapshot("retained_lease_not_owned_in_memory")
+    }
+
+    fn delete_persisted_lease_row_and_snapshot(
+        &self,
+        reason: &'static str,
+    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
         super::session_continuity::delete_persisted_session_lease_row(
             &self.service.m3_state_handle(),
             &self.session_id,
@@ -989,11 +1002,26 @@ impl ActForegroundAuthorityGuard {
         )?;
         if after.row_exists() {
             return Err(format!(
-                "operator-interrupted session lease row still exists for {}",
-                self.session_id
+                "{reason} session lease row still exists for {}",
+                self.session_id,
             ));
         }
+        tracing::info!(
+            code = "ACT_FOREGROUND_PERSISTED_LEASE_ROW_REMOVED",
+            session_id = self.session_id,
+            reason,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "readback=CF_SESSIONS after=act_foreground_persisted_lease_row_removed"
+        );
         Ok(after)
+    }
+
+    fn retained_session_lease_not_owned_in_memory(
+        &self,
+        status: &synapse_action::LeaseStatus,
+    ) -> bool {
+        self.lease_owner_before.as_deref() == Some(self.session_id.as_str())
+            && status.owner_session_id.as_deref() != Some(self.session_id.as_str())
     }
 
     fn reconcile_persisted_lease_after_async_cleanup(
@@ -1008,6 +1036,10 @@ impl ActForegroundAuthorityGuard {
                 &self.session_id,
                 &self.prior_persisted_lease,
             );
+        }
+        let lease_after_async_cleanup = synapse_action::lease::status();
+        if self.retained_session_lease_not_owned_in_memory(&lease_after_async_cleanup) {
+            return self.delete_expired_or_released_retained_lease_row();
         }
         self.read_expected_retained_persisted_lease()
     }
@@ -1081,9 +1113,15 @@ impl ActForegroundAuthorityGuard {
         } else {
             false
         };
+        let retained_session_lease_lost_at_cleanup = !operator_interrupt_at_cleanup
+            && !lease_release_attempted
+            && self.retained_session_lease_not_owned_in_memory(&lease_at_cleanup);
         // Re-assert the operator deletion or exact pre-call row after release.
         // A caller-owned renewed lease is intentionally kept with its renewed
-        // durable expiry instead of mixing old persistence with new memory.
+        // durable expiry while it is still held in memory. If it expired during
+        // the foreground transaction, memory is the authority and the durable
+        // continuity row must be removed so status cannot resurrect an expired
+        // input lease.
         let operator_interrupt_before_final = self.operator_panic_observed();
         let mut final_persisted_restore = if operator_interrupt_before_final {
             self.delete_operator_interrupted_lease_row()
@@ -1093,6 +1131,8 @@ impl ActForegroundAuthorityGuard {
                 &self.session_id,
                 &self.prior_persisted_lease,
             )
+        } else if retained_session_lease_lost_at_cleanup {
+            self.delete_expired_or_released_retained_lease_row()
         } else {
             self.read_expected_retained_persisted_lease()
         };
@@ -1108,6 +1148,8 @@ impl ActForegroundAuthorityGuard {
                     !after.row_exists()
                 } else if lease_release_attempted {
                     after == &self.prior_persisted_lease
+                } else if retained_session_lease_lost_at_cleanup {
+                    !after.row_exists()
                 } else {
                     lease_at_cleanup.owner_session_id.as_deref() != Some(self.session_id.as_str())
                         || (after.row_exists() && after == &self.expected_retained_persisted_lease)
@@ -1129,7 +1171,11 @@ impl ActForegroundAuthorityGuard {
         let lease_owner_restored = if operator_panic_observed {
             lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
         } else if self.lease_owner_before.as_deref() == Some(self.session_id.as_str()) {
-            lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
+            if retained_session_lease_lost_at_cleanup {
+                lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
+            } else {
+                lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
+            }
         } else {
             lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
         };
@@ -3193,6 +3239,14 @@ impl SynapseService {
                 &self.m3_state_handle(),
                 &session_id,
             );
+        let default_expected_persisted_lease_after_cleanup = if acquired {
+            &authority_guard.prior_persisted_lease
+        } else {
+            &authority_guard.expected_retained_persisted_lease
+        };
+        let expected_persisted_lease_after_cleanup = persisted_lease_restore_result
+            .as_ref()
+            .unwrap_or(default_expected_persisted_lease_after_cleanup);
 
         let cleanup_error =
             act_foreground_cleanup_postcondition_error(ActForegroundCleanupEvidence {
@@ -3206,11 +3260,7 @@ impl SynapseService {
                 lease_release_result: lease_release_result.as_ref(),
                 persisted_lease_restore_result: &persisted_lease_restore_result,
                 persisted_lease_final_readback: &persisted_lease_final_readback,
-                expected_persisted_lease_after_cleanup: if acquired {
-                    &authority_guard.prior_persisted_lease
-                } else {
-                    &authority_guard.expected_retained_persisted_lease
-                },
+                expected_persisted_lease_after_cleanup,
                 operator_panic_observed,
                 exact_profile_restore_result: &exact_profile_restore_result,
                 prior_profile_value_sha256: &authority_guard.prior_profile_value_sha256,
@@ -3361,8 +3411,10 @@ fn act_foreground_cleanup_postconditions(
     lease_owner_after: Option<&str>,
 ) -> (bool, bool) {
     let profile_restored = profile_after == Some(prior_profile);
+    let retained_session_lease_no_longer_owned =
+        lease_owner_before == Some(session_id) && lease_owner_after != Some(session_id);
     let lease_cleanup_verified = lease_readback_ok
-        && if session_authority_must_be_released {
+        && if session_authority_must_be_released || retained_session_lease_no_longer_owned {
             lease_owner_after != Some(session_id)
         } else {
             lease_owner_after == lease_owner_before
@@ -3425,10 +3477,14 @@ fn act_foreground_cleanup_postcondition_error(
         .as_ref()
         .ok()
         .and_then(|snapshot| snapshot.owner_session_id.as_deref());
+    let retained_session_lease_no_longer_owned =
+        lease_owner_before == Some(session_id) && lease_owner_after != Some(session_id);
+    let session_must_not_own_lease =
+        acquired_lease || operator_panic_observed || retained_session_lease_no_longer_owned;
     let (profile_kind_restored, lease_cleanup_verified) = act_foreground_cleanup_postconditions(
         session_id,
         prior_profile,
-        acquired_lease || operator_panic_observed,
+        session_must_not_own_lease,
         lease_owner_before,
         profile_after,
         lease_readback_ok,
@@ -3510,6 +3566,7 @@ fn act_foreground_cleanup_postcondition_error(
         persisted_lease_final_readback_ok,
         persisted_lease_row_verified,
         operator_panic_observed,
+        retained_session_lease_no_longer_owned,
         readbacks_ok,
         profile_restored,
         lease_cleanup_verified,
@@ -3532,8 +3589,9 @@ fn act_foreground_cleanup_postcondition_error(
             "expected": {
                 "profile": prior_profile.as_str(),
                 "profile_value_sha256": prior_profile_value_sha256,
-                "session_must_not_own_lease": acquired_lease,
+                "session_must_not_own_lease": session_must_not_own_lease,
                 "lease_owner_before": lease_owner_before,
+                "retained_session_lease_no_longer_owned": retained_session_lease_no_longer_owned,
                 "persisted_lease_row_present": if operator_panic_observed {
                     false
                 } else {

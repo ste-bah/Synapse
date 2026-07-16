@@ -133,12 +133,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $SynapseChromeBridgeMaintenancePauseMs = 720000
 $SynapseChromeBridgeMaintenanceCloseDrainMs = 7000
+$SynapseChromeBridgeMaintenanceResumeProbeAfterMs = 30000
 $SynapseChromeBridgeReconnectAlarmCushionMs = 45000
 $SynapseChromeBridgeDefaultPostStartWaitMs = 30000
 $SynapseChromeBridgeMaintenancePauseGuardMs = 60000
 $SynapseChromeBridgeMaxPostStartWaitMs = $SynapseChromeBridgeMaintenancePauseMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
+$SynapseChromeBridgeMaintenancePostStartWaitMs = $SynapseChromeBridgeMaintenanceResumeProbeAfterMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
 $SynapseBindFinalDeadOwnerSettleSeconds = 15
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+$script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
 $script:SynapseBindPostExitContinuationRequired = $false
 $script:SynapseBindPostExitContinuationDetail = $null
 $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
@@ -453,6 +456,21 @@ function Invoke-SynapseChromeBridgeVerifier {
     $readback = & $InstallerPath @chromeBridgeArgs
     if (-not $readback.ok) {
         Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true"
+    }
+    $extensionDeploy = $readback.extension_deploy
+    if (-not $extensionDeploy) {
+        Die "SYNAPSE_CHROME_BRIDGE_EXTENSION_DEPLOY_READBACK_MISSING path=$InstallerPath remediation=setup requires the Chrome bridge installer to report deployed service worker hash and register-token injection readback"
+    }
+    if ($extensionDeploy.bridge_register_token_injected -ne $true -or
+        $extensionDeploy.bridge_register_token_matches_expected -ne $true -or
+        [int]$extensionDeploy.bridge_register_token_length -ne 64 -or
+        [string]$extensionDeploy.bridge_register_token_sha256 -notmatch '^[0-9a-f]{64}$') {
+        Die ("SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_DEPLOY_READBACK_INVALID path={0} injected={1} matches_expected={2} length={3} sha256={4} remediation=setup must deploy a Chrome service worker with the host-local derived bridge register token before daemon restart; rerun setup after verifying the stable extension directory is writable" -f `
+            $InstallerPath,
+            $extensionDeploy.bridge_register_token_injected,
+            $extensionDeploy.bridge_register_token_matches_expected,
+            $extensionDeploy.bridge_register_token_length,
+            $extensionDeploy.bridge_register_token_sha256)
     }
     $autoInstall = $readback.synapse_chrome_auto_install
     if (-not $autoInstall) {
@@ -946,6 +964,10 @@ function Wait-AdoptedDaemon {
     }
     Write-LogLine "SYNAPSE_DAEMON_ADOPTED_EXIT generation=$Generation pid=$OwnerPid"
     Write-SupervisorEvent 'adopted_exit' @{ generation = $Generation; child_pid = $OwnerPid }
+    Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$Generation reason=adopted_daemon_exit"
+    Write-SupervisorEvent 'supervisor_stop' @{ generation = $Generation; reason = 'adopted_daemon_exit' }
+    Write-SupervisorState -State 'stopped' -Generation $Generation -ChildPid $OwnerPid -ExitCode 0 -Message 'Adopted daemon exited; supervisor stopped instead of launching during a maintenance handoff.'
+    exit 0
 }
 
 function Register-RapidFailure {
@@ -3424,10 +3446,9 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $postStartWaitMs = $SynapseChromeBridgeDefaultPostStartWaitMs
     if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
-        $remainingPauseMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$nowMs)
         $postStartWaitMs = [Math]::Max(
             [int64]$postStartWaitMs,
-            [int64]$remainingPauseMs + [int64]$SynapseChromeBridgeReconnectAlarmCushionMs)
+            [int64]$SynapseChromeBridgeMaintenancePostStartWaitMs)
         $postStartWaitMs = [Math]::Min([int64]$postStartWaitMs, [int64]$SynapseChromeBridgeMaxPostStartWaitMs)
     }
     $deadlineMs = [int64]$nowMs + [int64]$postStartWaitMs
@@ -3442,18 +3463,12 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
             $pauseRemainingMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$currentMs)
         }
-        if ($pauseRemainingMs -gt 0) {
-            Info ("Chrome bridge host absent after daemon start while maintenance reconnect pause remains active; skipping alarmReconnect wait and invoking bounded existing-Chrome UI repair. attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2}" -f `
-                $attempt,
-                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
-                $pauseRemainingMs)
-            break
-        }
         $waitRemainingMs = [Math]::Max(0, [int64]$deadlineMs - [int64]$currentMs)
-        Info ("Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2} wait_remaining_ms={3}" -f `
+        Info ("Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2} resume_probe_after_unix_ms={3} wait_remaining_ms={4}" -f `
             $attempt,
             ($(if ($null -eq $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs })),
             $pauseRemainingMs,
+            ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })),
             $waitRemainingMs)
         Start-Sleep -Seconds 2
         try {
@@ -3471,6 +3486,15 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         }
     }
     if ($detail -match 'no_active_chrome_bridge_host') {
+        if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
+            $timeoutMs = [Math]::Max(0, [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$nowMs)
+            Die ("SYNAPSE_CHROME_BRIDGE_ALARM_RECONNECT_TIMEOUT status={0} detail={1} waited_ms={2} pause_until_unix_ms={3} resume_probe_after_unix_ms={4} remediation=setup requested a maintenance reconnect pause before daemon restart and then waited for the installed MV3 alarmReconnect path to observe the replacement daemon and re-register. It did not. Inspect the Chrome extension service-worker console for maintenance resume probe logs and daemon /health chrome_bridge detail; setup refuses to hide the reconnect failure with foreground UI reload." -f `
+                $status,
+                $detail,
+                $timeoutMs,
+                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
+                ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })))
+        }
         Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
         $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
             -InstallerPath $ChromeBridgeInstallerPath `
@@ -5682,7 +5706,8 @@ function Request-SynapseChromeBridgeMaintenancePause {
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$Token,
         [Parameter(Mandatory=$true)][string]$Reason,
-        [int]$PauseMs = $SynapseChromeBridgeMaintenancePauseMs
+        [int]$PauseMs = $SynapseChromeBridgeMaintenancePauseMs,
+        [int]$ResumeProbeAfterMs = $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
     )
 
     try {
@@ -5740,6 +5765,7 @@ function Request-SynapseChromeBridgeMaintenancePause {
 
     $body = [ordered]@{
         pause_ms = $PauseMs
+        resume_probe_after_ms = $ResumeProbeAfterMs
         reason = $Reason
     } | ConvertTo-Json -Compress -Depth 4
 
@@ -5806,13 +5832,21 @@ function Request-SynapseChromeBridgeMaintenancePause {
             ok = ($response.ok -eq $true)
             status = 200
             pause_ms = if ($null -eq $pause) { $null } else { $pause.pause_ms }
+            resume_probe_after_ms = if ($null -eq $pause) { $null } else { $pause.resume_probe_after_ms }
+            resume_probe_after_unix_ms = if ($null -eq $pause) { $null } else { $pause.resume_probe_after_unix_ms }
+            paused_daemon_pid = if ($null -eq $pause) { $null } else { $pause.paused_daemon_pid }
+            paused_daemon_instance_id = if ($null -eq $pause) { $null } else { $pause.paused_daemon_instance_id }
             reconnect_suppressed = if ($null -eq $pause) { $null } else { $pause.reconnect_suppressed }
             persisted = if ($null -eq $pause) { $null } else { $pause.persisted }
             websocket_close = $websocketClose
         }
         $attempts += $attemptReadback
 
-        if ($response.ok -eq $true -and $null -ne $pause -and $pause.reconnect_suppressed -eq $true -and $pause.persisted -eq $true -and -not $websocketCloseFailed) {
+        $resumeProbeReadbackOk = (
+            $null -eq $pause.resume_probe_after_ms -or
+            [int64]$pause.resume_probe_after_ms -eq [int64]$ResumeProbeAfterMs
+        )
+        if ($response.ok -eq $true -and $null -ne $pause -and $pause.reconnect_suppressed -eq $true -and $pause.persisted -eq $true -and $resumeProbeReadbackOk -and -not $websocketCloseFailed) {
             return [pscustomobject]@{
                 Ok = $true
                 Skipped = $false
@@ -6119,7 +6153,8 @@ function Stop-SynapseMcpProcesses {
             $expectedPids = @($httpProcesses | ForEach-Object { [int]$_.ProcessId })
             if ($ForceRestart) {
                 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
-                $pause = Request-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $tokenRead.Token -Reason $Reason -PauseMs $SynapseChromeBridgeMaintenancePauseMs
+                $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
+                $pause = Request-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $tokenRead.Token -Reason $Reason -PauseMs $SynapseChromeBridgeMaintenancePauseMs -ResumeProbeAfterMs $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
                 if (-not $pause.Ok) {
                     Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Reload the installed bridge through the existing Chrome profile or inspect daemon/extension logs; setup will not chase an unbounded stream of recreated Chrome NetworkService peers." -f `
                         $pause.Code,
@@ -6142,6 +6177,14 @@ function Stop-SynapseMcpProcesses {
                             $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = [int64]$pauseUntil
                         } catch {
                             $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+                        }
+                    }
+                    $resumeProbeAfter = $pause.Response.pause.resume_probe_after_unix_ms
+                    if ($null -ne $resumeProbeAfter) {
+                        try {
+                            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = [int64]$resumeProbeAfter
+                        } catch {
+                            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
                         }
                     }
                     Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK reason={0} bind={1} pause={2}" -f `
@@ -6267,6 +6310,129 @@ function Stop-SynapseMcpProcesses {
     $remaining = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
     Die ("SYNAPSE_PROCESS_STOP_FAILED reason={0} timeout_s={1} remaining_count={2} remaining=`n{3}" -f `
         $Reason, $TimeoutSeconds, $remaining.Count, (Format-SynapseMcpProcessSnapshot -Snapshot $remaining))
+}
+
+function Suspend-SynapseDaemonTaskForInstallHandoff {
+    param([Parameter(Mandatory=$true)][string]$TaskName)
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        Info "Synapse daemon scheduled task absent before install handoff: task=$TaskName"
+        return
+    }
+
+    Info "Suspending Synapse daemon scheduled task before binary handoff: task=$TaskName state=$($task.State)"
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    } catch {
+        Info "WARN: Stop-ScheduledTask failed before binary handoff task=$TaskName error=$($_.Exception.Message)"
+    }
+
+    try {
+        Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+    } catch {
+        Die "SYNAPSE_TASK_DISABLE_FAILED task=$TaskName error=$($_.Exception.Message) remediation=setup must disable the auto-start supervisor before replacing synapse-mcp.exe so Task Scheduler cannot relaunch the old installed binary during Copy-Item"
+    }
+
+    $readback = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $readback) {
+        Info "Synapse daemon scheduled task disappeared while suspending for handoff: task=$TaskName"
+        return
+    }
+    Info "Synapse daemon scheduled task suspended for handoff: task=$TaskName state=$($readback.State)"
+}
+
+function Stop-SynapseMcpProcessesForInstallHandoff {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [switch]$ForceRestart,
+        [int]$TimeoutSeconds = 300
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempt = 0
+    do {
+        $attempt += 1
+        $remainingBudget = [Math]::Max(5, [int](($deadline - (Get-Date)).TotalSeconds))
+        Info "Synapse install handoff drain attempt=$attempt reason=$Reason remaining_budget_s=$remainingBudget"
+        Stop-SynapseMcpProcesses `
+            -Reason $Reason `
+            -Bind $Bind `
+            -DbPath $DbPath `
+            -TokenPath $TokenPath `
+            -ForceRestart:$ForceRestart `
+            -TimeoutSeconds ([Math]::Min(60, $remainingBudget))
+
+        Start-Sleep -Milliseconds 500
+        $targets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+        if ($targets.Count -eq 0) {
+            Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds ([Math]::Min(60, $remainingBudget)) -ForceRestart:$ForceRestart
+            Info "Synapse install handoff drain verified reason=$Reason attempts=$attempt target_after_count=0"
+            return
+        }
+
+        Info ("Synapse install handoff observed daemon relaunch after drain attempt={0} remaining_count={1}`nremaining:`n{2}" -f `
+            $attempt,
+            $targets.Count,
+            (Format-SynapseMcpProcessSnapshot -Snapshot $targets))
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+    $supervisorStatePath = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $supervisorState = if (Test-Path -LiteralPath $supervisorStatePath) {
+        try { (Get-Content -Raw -LiteralPath $supervisorStatePath).Trim() } catch { "read_failed:$($_.Exception.Message)" }
+    } else {
+        '<missing>'
+    }
+    Die ("SYNAPSE_INSTALL_HANDOFF_RELAUNCH_DRAIN_TIMEOUT reason={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}`nsupervisor_state={4}`nremediation=setup disabled the scheduled task and repeatedly drained exact verified synapse-mcp.exe targets, but a supervisor kept relaunching the installed daemon. Inspect daemon-supervisor-events.jsonl and stop only the verified Synapse supervisor path before retrying; do not close terminal/IDE/WSL host processes." -f `
+        $Reason,
+        $TimeoutSeconds,
+        $remaining.Count,
+        (Format-SynapseMcpProcessSnapshot -Snapshot $remaining),
+        $supervisorState)
+}
+
+function Assert-SynapseInstallPathUnlocked {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [int]$TimeoutSeconds = 30
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Info "Installed daemon path does not exist yet; exclusive lock check skipped path=$Path"
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastError = $null
+    do {
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None)
+            $stream.Dispose()
+            Info "Installed daemon path exclusive-open verified path=$Path"
+            return
+        } catch {
+            $lastError = $_.Exception.Message
+            Start-Sleep -Milliseconds 250
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $holders = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+    Die ("SYNAPSE_INSTALL_BINARY_LOCKED path={0} timeout_s={1} error={2}`nverified_synapse_targets:`n{3}`nremediation=installed synapse-mcp.exe is still open after daemon/task drain; inspect the listed exact targets and supervisor logs before retrying binary replacement" -f `
+        $Path,
+        $TimeoutSeconds,
+        $lastError,
+        (Format-SynapseMcpProcessSnapshot -Snapshot $holders))
 }
 
 function Get-SynapseChromeNativeHostProcessSnapshot {
@@ -6710,10 +6876,9 @@ if ($installedBinaryAlreadyVerified) {
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
     Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    }
-    Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
+    Suspend-SynapseDaemonTaskForInstallHandoff -TaskName $TaskName
+    Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
+    Assert-SynapseInstallPathUnlocked -Path $ExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 $backupPath = $null
@@ -6891,10 +7056,15 @@ $ok = $false
 $healthPid = $null
 $lastHealthError = $null
 $lastHealthSubsystemStatuses = '<none>'
-for ($i=0; $i -lt 15; $i++) {
+$installHealthDeadline = (Get-Date).AddSeconds(180)
+$installHealthAttempt = 0
+while ((Get-Date) -lt $installHealthDeadline) {
+    $installHealthAttempt++
     Start-Sleep -Seconds 2
+    $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($installHealthDeadline - (Get-Date)).TotalSeconds))
+    $healthTimeoutSec = [Math]::Min(30, [Math]::Max(5, $remainingSeconds))
     try {
-        $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
+        $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $healthTimeoutSec
         $lastHealthSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $h
         $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
         if ($criticalReady.Ok) {
@@ -6906,10 +7076,11 @@ for ($i=0; $i -lt 15; $i++) {
             $ok = $true; break
         } else {
             $lastHealthError = $criticalReady.Detail
-            Info "WARN: daemon /health responded but critical subsystems are not ready yet attempt=$($i + 1) detail=$($criticalReady.Detail) subsystem_statuses=$lastHealthSubsystemStatuses"
+            Info "WARN: daemon /health responded but critical subsystems are not ready yet attempt=$installHealthAttempt detail=$($criticalReady.Detail) subsystem_statuses=$lastHealthSubsystemStatuses"
         }
     } catch {
         $lastHealthError = $_.Exception.Message
+        Info "WARN: daemon /health not ready yet attempt=$installHealthAttempt timeout_s=$healthTimeoutSec remaining_s=$remainingSeconds error=$lastHealthError"
     }
 }
 if (-not $ok) {
@@ -6942,16 +7113,23 @@ if (-not $ok) {
         Start-ScheduledTask -TaskName $TaskName
         $rollbackOk = $false
         $rollbackHealth = $null
-        for ($j=0; $j -lt 15; $j++) {
+        $rollbackHealthDeadline = (Get-Date).AddSeconds(180)
+        $rollbackHealthAttempt = 0
+        while ((Get-Date) -lt $rollbackHealthDeadline) {
+            $rollbackHealthAttempt++
             Start-Sleep -Seconds 2
+            $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($rollbackHealthDeadline - (Get-Date)).TotalSeconds))
+            $rollbackHealthTimeoutSec = [Math]::Min(30, [Math]::Max(5, $remainingSeconds))
             try {
-                $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
+                $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $rollbackHealthTimeoutSec
                 if ($rh.ok) {
                     $rollbackHealth = $rh
                     $rollbackOk = $true
                     break
                 }
-            } catch { }
+            } catch {
+                Info "WARN: rollback daemon /health not ready yet attempt=$rollbackHealthAttempt timeout_s=$rollbackHealthTimeoutSec remaining_s=$remainingSeconds error=$($_.Exception.Message)"
+            }
         }
         if ($rollbackOk) {
             Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} original_failure=[{3}] remediation=old daemon is serving again; inspect candidate startup logs before retrying" -f `

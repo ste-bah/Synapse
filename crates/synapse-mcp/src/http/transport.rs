@@ -2656,6 +2656,10 @@ fn router(
             post(crate::chrome_debugger_bridge::http_register),
         )
         .route(
+            "/chrome-debugger/native/reconnect-probe",
+            get(crate::chrome_debugger_bridge::http_reconnect_probe),
+        )
+        .route(
             "/chrome-debugger/native/message",
             post(crate::chrome_debugger_bridge::http_message),
         )

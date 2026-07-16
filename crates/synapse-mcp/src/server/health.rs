@@ -978,11 +978,17 @@ fn parse_chrome_bridge_detail(detail: &str) -> ChromeBridgeDetail {
             .and_then(|value| (*value).parse::<u64>().ok())
     };
     let string_field = |key: &str| fields.get(key).map(|value| (*value).to_owned());
+    let tab_control_available = bool_field("tab_control_available");
+    let reason = if tab_control_available == Some(false) && !fields.contains_key("active_host_id") {
+        string_field("reason")
+    } else {
+        None
+    };
     ChromeBridgeDetail {
-        tab_control_available: bool_field("tab_control_available"),
+        tab_control_available,
         extension_stale: bool_field("extension_stale"),
         extension_stale_reasons: string_field("extension_stale_reasons"),
-        reason: string_field("reason"),
+        reason,
         host_count: u64_field("host_count"),
         queued_count: u64_field("queued_count"),
         pending_count: u64_field("pending_count"),

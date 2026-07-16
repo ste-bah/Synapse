@@ -119,6 +119,35 @@ function Set-SynapseChromeBridgeRegisterToken {
     [System.IO.File]::WriteAllText($ServiceWorkerPath, $updated, $encoding)
 }
 
+function Assert-SynapseChromeBridgeRegisterTokenReadback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceWorkerPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedRegisterToken
+    )
+    $text = Get-Content -Raw -LiteralPath $ServiceWorkerPath
+    $match = [System.Text.RegularExpressions.Regex]::Match($text, 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"([^"]*)";')
+    if (-not $match.Success) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_READBACK_MISSING path=$ServiceWorkerPath remediation=deployed service_worker.js must contain exactly one BRIDGE_REGISTER_TOKEN declaration after setup injects the host-local credential"
+    }
+    $actual = [string]$match.Groups[1].Value
+    $actualSha256 = if ($actual.Length -gt 0) {
+        Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($actual))
+    } else {
+        ''
+    }
+    $expectedSha256 = Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($ExpectedRegisterToken))
+    if ($actual -ne $ExpectedRegisterToken) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_READBACK_MISMATCH path=$ServiceWorkerPath actual_length=$($actual.Length) actual_sha256=$actualSha256 expected_length=$($ExpectedRegisterToken.Length) expected_sha256=$expectedSha256 remediation=setup copied or rewrote the unpacked extension without the derived daemon registration credential; rerun setup after verifying the deployed worker is writable"
+    }
+    [pscustomobject]@{
+        length = $actual.Length
+        sha256 = $actualSha256
+        matches_expected = $true
+    }
+}
+
 function Get-RegistryAclDiagnostic {
     param(
         [Parameter(Mandatory = $true)]
@@ -648,7 +677,7 @@ if (-not (Test-Path -LiteralPath $deployedServiceWorkerPath -PathType Leaf)) {
 $bridgeBearerToken = Get-SynapseChromeBridgeBearerToken -Path $TokenPath
 $bridgeRegisterToken = Get-SynapseChromeBridgeRegisterToken -BearerToken $bridgeBearerToken
 Set-SynapseChromeBridgeRegisterToken -ServiceWorkerPath $deployedServiceWorkerPath -RegisterToken $bridgeRegisterToken
-$bridgeRegisterTokenSha256 = Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($bridgeRegisterToken))
+$bridgeRegisterTokenReadback = Assert-SynapseChromeBridgeRegisterTokenReadback -ServiceWorkerPath $deployedServiceWorkerPath -ExpectedRegisterToken $bridgeRegisterToken
 $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 $extensionDeploy = [pscustomobject]@{
     source_dir = $extensionSourceDir
@@ -660,7 +689,9 @@ $extensionDeploy = [pscustomobject]@{
     manifest_sha256 = Get-SynapseFileSha256 -Path $manifestPath
     service_worker_sha256 = Get-SynapseFileSha256 -Path $deployedServiceWorkerPath
     bridge_register_token_injected = $true
-    bridge_register_token_sha256 = $bridgeRegisterTokenSha256
+    bridge_register_token_length = $bridgeRegisterTokenReadback.length
+    bridge_register_token_sha256 = $bridgeRegisterTokenReadback.sha256
+    bridge_register_token_matches_expected = $bridgeRegisterTokenReadback.matches_expected
 }
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
@@ -741,10 +772,12 @@ namespace SynapseChromeBridgeAutoInstall {
 
         public static ForegroundAttachAttemptResult AttachThreadInputBringToTopSetForeground(IntPtr targetHwnd, IntPtr foregroundHwnd) {
             ForegroundAttachAttemptResult result = new ForegroundAttachAttemptResult();
-            result.TargetThread = GetWindowThreadProcessId(targetHwnd, out uint targetPid);
+            uint targetPid = 0;
+            result.TargetThread = GetWindowThreadProcessId(targetHwnd, out targetPid);
             result.TargetPid = targetPid;
             if (foregroundHwnd != IntPtr.Zero) {
-                result.ForegroundThread = GetWindowThreadProcessId(foregroundHwnd, out uint foregroundPid);
+                uint foregroundPid = 0;
+                result.ForegroundThread = GetWindowThreadProcessId(foregroundHwnd, out foregroundPid);
                 result.ForegroundPid = foregroundPid;
             }
             result.CurrentThread = GetCurrentThreadId();

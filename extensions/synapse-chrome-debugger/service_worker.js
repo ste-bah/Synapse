@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
-const BRIDGE_DECLARED_BUILD_SHA256 = "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-16-maintenance-alarm-resume-v1";
+const BRIDGE_DECLARED_BUILD_SHA256 = "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -109,6 +109,7 @@ const WEBSOCKET_CLOSE_CODE_RECONNECT_CLEANUP = 3001;
 const WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS = 0;
 const MAINTENANCE_RECONNECT_PAUSE_MIN_MS = 1000;
 const MAINTENANCE_RECONNECT_PAUSE_MAX_MS = 900000;
+const MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS = 30000;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
@@ -179,8 +180,13 @@ let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
 let maintenanceReconnectPauseUntilMs = 0;
 let maintenanceReconnectPauseReason = "";
+let maintenanceReconnectPauseStoredAtMs = 0;
+let maintenanceReconnectResumeProbeAfterMs = 0;
+let maintenanceReconnectPausedDaemonPid = null;
+let maintenanceReconnectPausedDaemonInstanceId = "";
 let maintenanceReconnectPauseLoaded = false;
 let maintenanceReconnectPauseLoadInFlight = null;
+let maintenanceReconnectResumeProbeInFlight = null;
 const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
@@ -226,10 +232,54 @@ function normalizeStoredMaintenanceReconnectPause(record) {
   if (!Number.isFinite(pauseUntilMs) || pauseUntilMs <= 0 || !reason) {
     return null;
   }
+  const storedAtNumber = Number(record.stored_at_unix_ms);
+  const storedAtMs = Number.isFinite(storedAtNumber) && storedAtNumber > 0
+    ? storedAtNumber
+    : 0;
+  const fallbackProbeBaseMs = storedAtMs > 0 ? storedAtMs : Date.now();
+  const resumeProbeAfterNumber = Number(record.resume_probe_after_unix_ms);
+  const resumeProbeAfterMs =
+    Number.isFinite(resumeProbeAfterNumber) && resumeProbeAfterNumber > 0
+      ? Math.min(resumeProbeAfterNumber, pauseUntilMs)
+      : Math.min(
+        pauseUntilMs,
+        fallbackProbeBaseMs + MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS
+      );
+  const pausedDaemonPidNumber = Number(record.paused_daemon_pid);
+  const pausedDaemonPid =
+    Number.isSafeInteger(pausedDaemonPidNumber) && pausedDaemonPidNumber > 0
+      ? pausedDaemonPidNumber
+      : null;
+  const pausedDaemonInstanceId = String(record.paused_daemon_instance_id || "").trim();
   return {
     pauseUntilMs,
-    reason
+    reason,
+    storedAtMs,
+    resumeProbeAfterMs,
+    pausedDaemonPid,
+    pausedDaemonInstanceId
   };
+}
+
+function resetMaintenanceReconnectPauseState() {
+  maintenanceReconnectPauseUntilMs = 0;
+  maintenanceReconnectPauseReason = "";
+  maintenanceReconnectPauseStoredAtMs = 0;
+  maintenanceReconnectResumeProbeAfterMs = 0;
+  maintenanceReconnectPausedDaemonPid = null;
+  maintenanceReconnectPausedDaemonInstanceId = "";
+}
+
+async function clearMaintenanceReconnectPause(reason) {
+  const hadPause =
+    maintenanceReconnectPauseUntilMs > 0 ||
+    Boolean(maintenanceReconnectPauseReason) ||
+    maintenanceReconnectPauseStoredAtMs > 0 ||
+    maintenanceReconnectResumeProbeAfterMs > 0;
+  if (hadPause) {
+    await requireRemoveStoredMaintenanceReconnectPause(reason);
+  }
+  resetMaintenanceReconnectPauseState();
 }
 
 async function removeStoredMaintenanceReconnectPause(reason) {
@@ -242,12 +292,31 @@ async function removeStoredMaintenanceReconnectPause(reason) {
   } catch (error) {
     console.warn(
       `Synapse maintenance reconnect pause storage cleanup failed: ` +
+      `reason=${reason} error=${errorMessage(error)}`
+    );
+  }
+}
+
+async function requireRemoveStoredMaintenanceReconnectPause(reason) {
+  const storage = maintenanceReconnectPauseStorage();
+  if (!storage?.remove) {
+    throw bridgeError(
+      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
+      "chrome.storage.session is unavailable; maintenance pause release cannot be persisted"
+    );
+  }
+  try {
+    await storage.remove(MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY);
+  } catch (error) {
+    throw bridgeError(
+      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
+      `chrome.storage.session.remove failed for maintenance pause release: ` +
         `reason=${reason} error=${errorMessage(error)}`
     );
   }
 }
 
-async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
+async function persistMaintenanceReconnectPause(pauseUntilMs, reason, options = {}) {
   const storage = maintenanceReconnectPauseStorage();
   if (!storage?.set) {
     throw bridgeError(
@@ -255,10 +324,25 @@ async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
       "chrome.storage.session is unavailable; maintenance pause cannot survive MV3 worker restart"
     );
   }
+  const storedAtMs = Date.now();
+  const resumeProbeAfterDurationMs = normalizeMaintenanceReconnectResumeProbeAfterMs(
+    options.resumeProbeAfterMs,
+    pauseUntilMs - storedAtMs
+  );
+  const resumeProbeAfterMs = Math.min(
+    pauseUntilMs,
+    storedAtMs + resumeProbeAfterDurationMs
+  );
+  const pausedDaemonPid = normalizeOptionalPositiveInteger(options.pausedDaemonPid);
+  const pausedDaemonInstanceId = String(options.pausedDaemonInstanceId || "").trim();
   const record = {
     pause_until_unix_ms: pauseUntilMs,
+    resume_probe_after_ms: resumeProbeAfterDurationMs,
+    resume_probe_after_unix_ms: resumeProbeAfterMs,
     reason,
-    stored_at_unix_ms: Date.now(),
+    stored_at_unix_ms: storedAtMs,
+    paused_daemon_pid: pausedDaemonPid,
+    paused_daemon_instance_id: pausedDaemonInstanceId,
     bridge_build_id: BRIDGE_BUILD_ID,
     extension_id: chrome.runtime.id
   };
@@ -270,6 +354,13 @@ async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
       `chrome.storage.session.set failed for maintenance pause: ${errorMessage(error)}`
     );
   }
+  return {
+    storedAtMs,
+    resumeProbeAfterDurationMs,
+    resumeProbeAfterMs,
+    pausedDaemonPid,
+    pausedDaemonInstanceId
+  };
 }
 
 async function loadMaintenanceReconnectPause(reason) {
@@ -303,14 +394,21 @@ async function loadMaintenanceReconnectPause(reason) {
     if (stored && stored.pauseUntilMs > now) {
       maintenanceReconnectPauseUntilMs = stored.pauseUntilMs;
       maintenanceReconnectPauseReason = stored.reason;
+      maintenanceReconnectPauseStoredAtMs = stored.storedAtMs;
+      maintenanceReconnectResumeProbeAfterMs = stored.resumeProbeAfterMs;
+      maintenanceReconnectPausedDaemonPid = stored.pausedDaemonPid;
+      maintenanceReconnectPausedDaemonInstanceId = stored.pausedDaemonInstanceId;
       ensureReconnectWakeAlarm();
       console.warn(
         `Synapse daemon bridge restored persisted maintenance pause: ` +
-          `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} trigger=${reason}`
+          `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} ` +
+          `resume_probe_after_unix_ms=${stored.resumeProbeAfterMs} ` +
+          `paused_daemon_pid=${stored.pausedDaemonPid || "<unknown>"} ` +
+          `paused_daemon_instance_id=${stored.pausedDaemonInstanceId || "<unknown>"} ` +
+          `trigger=${reason}`
       );
     } else if (stored) {
-      maintenanceReconnectPauseUntilMs = 0;
-      maintenanceReconnectPauseReason = "";
+      resetMaintenanceReconnectPauseState();
       removeStoredMaintenanceReconnectPause(`expired:${reason}`);
     }
     maintenanceReconnectPauseLoaded = true;
@@ -506,15 +604,110 @@ function resetReconnectState() {
 
 function maintenanceReconnectPauseRemainingMs(now = Date.now()) {
   if (maintenanceReconnectPauseUntilMs <= now) {
-    const hadPause = maintenanceReconnectPauseUntilMs > 0 || maintenanceReconnectPauseReason;
-    maintenanceReconnectPauseUntilMs = 0;
-    maintenanceReconnectPauseReason = "";
+    const hadPause =
+      maintenanceReconnectPauseUntilMs > 0 ||
+      Boolean(maintenanceReconnectPauseReason) ||
+      maintenanceReconnectPauseStoredAtMs > 0 ||
+      maintenanceReconnectResumeProbeAfterMs > 0;
+    resetMaintenanceReconnectPauseState();
     if (hadPause) {
       removeStoredMaintenanceReconnectPause("expired");
     }
     return 0;
   }
   return maintenanceReconnectPauseUntilMs - now;
+}
+
+async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
+  if (permanentlyDisabled) {
+    return false;
+  }
+  const now = Date.now();
+  const probeAfterMs = maintenanceReconnectResumeProbeAfterMs || (
+    (maintenanceReconnectPauseStoredAtMs || now) + MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS
+  );
+  if (now < probeAfterMs) {
+    ensureReconnectWakeAlarm();
+    console.warn(
+      `Synapse daemon bridge maintenance pause alarm fired before resume probe window: ` +
+        `remaining_ms=${pauseRemainingMs} probe_after_unix_ms=${probeAfterMs} ` +
+        `probe_wait_ms=${probeAfterMs - now} reason=${maintenanceReconnectPauseReason}`
+    );
+    return false;
+  }
+  if (maintenanceReconnectResumeProbeInFlight) {
+    return maintenanceReconnectResumeProbeInFlight;
+  }
+  maintenanceReconnectResumeProbeInFlight = (async () => {
+    let probe;
+    try {
+      probe = await daemonFetchJson("/chrome-debugger/native/reconnect-probe", {
+        method: "GET",
+        forceRegisterToken: true
+      });
+    } catch (error) {
+      ensureReconnectWakeAlarm();
+      console.warn(
+        `Synapse daemon bridge maintenance resume probe failed: ` +
+          `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
+          `paused_daemon_pid=${maintenanceReconnectPausedDaemonPid || "<unknown>"} ` +
+          `paused_daemon_instance_id=${maintenanceReconnectPausedDaemonInstanceId || "<unknown>"} ` +
+          `error=${errorMessage(error)}`
+      );
+      return false;
+    }
+
+    const daemonPid = Number(probe?.daemon_pid);
+    const daemonInstanceId = String(probe?.daemon_instance_id || "").trim();
+    if (
+      probe?.ok !== true ||
+      !Number.isSafeInteger(daemonPid) ||
+      daemonPid <= 0 ||
+      !daemonInstanceId
+    ) {
+      ensureReconnectWakeAlarm();
+      console.warn(
+        `Synapse daemon bridge maintenance resume probe returned invalid response: ` +
+          `response=${JSON.stringify(probe)} reason=${maintenanceReconnectPauseReason}`
+      );
+      return false;
+    }
+
+    const pausedInstanceId = maintenanceReconnectPausedDaemonInstanceId;
+    const pausedPid = maintenanceReconnectPausedDaemonPid;
+    const sameInstance = pausedInstanceId && daemonInstanceId === pausedInstanceId;
+    const samePidWithoutInstance = !pausedInstanceId && pausedPid && daemonPid === pausedPid;
+    if (sameInstance || samePidWithoutInstance) {
+      ensureReconnectWakeAlarm();
+      console.warn(
+        `Synapse daemon bridge maintenance resume probe still sees pausing daemon: ` +
+          `daemon_pid=${daemonPid} daemon_instance_id=${daemonInstanceId} ` +
+          `paused_daemon_pid=${pausedPid || "<unknown>"} ` +
+          `paused_daemon_instance_id=${pausedInstanceId || "<unknown>"} ` +
+          `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason}`
+      );
+      return false;
+    }
+
+    const pausedPidForLog = pausedPid || "<unknown>";
+    const pausedInstanceForLog = pausedInstanceId || "<unknown>";
+    await clearMaintenanceReconnectPause("replacement_daemon_reconnect_probe");
+    closeWebSocket({ reason: "maintenance pause released after replacement daemon probe" });
+    hostId = null;
+    bridgeToken = null;
+    resetReconnectState();
+    console.warn(
+      `Synapse daemon bridge maintenance pause released by alarm reconnect probe: ` +
+        `replacement_daemon_pid=${daemonPid} replacement_daemon_instance_id=${daemonInstanceId} ` +
+        `paused_daemon_pid=${pausedPidForLog} ` +
+        `paused_daemon_instance_id=${pausedInstanceForLog}`
+    );
+    connectDaemon();
+    return true;
+  })().finally(() => {
+    maintenanceReconnectResumeProbeInFlight = null;
+  });
+  return maintenanceReconnectResumeProbeInFlight;
 }
 
 async function ensureExternalPopupRiskSuppression(reason) {
@@ -1661,8 +1854,16 @@ function handleReconnectWakeAlarm(alarm) {
       if (permanentlyDisabled) {
         return;
       }
-      if (maintenanceReconnectPauseRemainingMs() > 0) {
+      const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
+      if (pauseRemainingMs > 0) {
         ensureReconnectWakeAlarm();
+        attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs).catch((error) => {
+          console.warn(
+            `Synapse daemon bridge maintenance resume probe threw: ` +
+              `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
+              `error=${errorMessage(error)}`
+          );
+        });
         return;
       }
       startBridgeFromEvent();
@@ -1895,8 +2096,6 @@ if (chrome.downloads?.onChanged?.addListener) {
 if (chrome.downloads?.onErased?.addListener) {
   chrome.downloads.onErased.addListener((id) => recordDownloadEvent("erased", { id }, null));
 }
-
-startBridgeFromEvent();
 
 async function handleCommand(command) {
   if (!command || typeof command !== "object") {
@@ -13064,10 +13263,18 @@ async function handleMaintenancePauseReconnect(params = {}) {
   const reason = normalizeMaintenanceReconnectPauseReason(params.reason);
   const now = Date.now();
   const pauseUntilMs = now + pauseMs;
-  await persistMaintenanceReconnectPause(pauseUntilMs, reason);
+  const persisted = await persistMaintenanceReconnectPause(pauseUntilMs, reason, {
+    resumeProbeAfterMs: params.resumeProbeAfterMs,
+    pausedDaemonPid: params.pausedDaemonPid,
+    pausedDaemonInstanceId: params.pausedDaemonInstanceId
+  });
   maintenanceReconnectPauseLoaded = true;
   maintenanceReconnectPauseUntilMs = pauseUntilMs;
   maintenanceReconnectPauseReason = reason;
+  maintenanceReconnectPauseStoredAtMs = persisted.storedAtMs;
+  maintenanceReconnectResumeProbeAfterMs = persisted.resumeProbeAfterMs;
+  maintenanceReconnectPausedDaemonPid = persisted.pausedDaemonPid;
+  maintenanceReconnectPausedDaemonInstanceId = persisted.pausedDaemonInstanceId;
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
   const websocketClose = requestWebSocketCloseAfterResponse(
@@ -13077,6 +13284,10 @@ async function handleMaintenancePauseReconnect(params = {}) {
   console.warn(
     `Synapse daemon bridge reconnect paused for maintenance: ` +
       `pause_ms=${pauseMs} pause_until_unix_ms=${maintenanceReconnectPauseUntilMs} ` +
+      `resume_probe_after_ms=${persisted.resumeProbeAfterDurationMs} ` +
+      `resume_probe_after_unix_ms=${maintenanceReconnectResumeProbeAfterMs} ` +
+      `paused_daemon_pid=${maintenanceReconnectPausedDaemonPid || "<unknown>"} ` +
+      `paused_daemon_instance_id=${maintenanceReconnectPausedDaemonInstanceId || "<unknown>"} ` +
       `reason=${reason} persisted=true websocket_close=${JSON.stringify(websocketClose)}`
   );
   return {
@@ -13084,6 +13295,10 @@ async function handleMaintenancePauseReconnect(params = {}) {
     host_id: hostId,
     pause_ms: pauseMs,
     pause_until_unix_ms: maintenanceReconnectPauseUntilMs,
+    resume_probe_after_ms: persisted.resumeProbeAfterDurationMs,
+    resume_probe_after_unix_ms: maintenanceReconnectResumeProbeAfterMs,
+    paused_daemon_pid: maintenanceReconnectPausedDaemonPid,
+    paused_daemon_instance_id: maintenanceReconnectPausedDaemonInstanceId,
     reason,
     reconnect_suppressed: true,
     persisted: true,
@@ -23489,6 +23704,43 @@ function normalizeMaintenanceReconnectPauseMs(value) {
   return number;
 }
 
+function normalizeMaintenanceReconnectResumeProbeAfterMs(value, maxRemainingMs) {
+  if (value === undefined || value === null) {
+    return Math.min(
+      MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS,
+      Math.max(MAINTENANCE_RECONNECT_PAUSE_MIN_MS, Number(maxRemainingMs) || 0)
+    );
+  }
+  const number = Number(value);
+  const upperBound = Math.max(
+    MAINTENANCE_RECONNECT_PAUSE_MIN_MS,
+    Number(maxRemainingMs) || MAINTENANCE_RECONNECT_PAUSE_MIN_MS
+  );
+  if (
+    !Number.isInteger(number) ||
+    number < MAINTENANCE_RECONNECT_PAUSE_MIN_MS ||
+    number > upperBound
+  ) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `resumeProbeAfterMs must be an integer from ${MAINTENANCE_RECONNECT_PAUSE_MIN_MS} ` +
+        `through ${upperBound}`
+    );
+  }
+  return number;
+}
+
+function normalizeOptionalPositiveInteger(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "paused daemon pid must be a positive integer when supplied");
+  }
+  return number;
+}
+
 function normalizeMaintenanceReconnectPauseReason(value) {
   const reason = String(value || "").trim();
   if (!reason || reason.length > 256) {
@@ -23799,9 +24051,11 @@ async function daemonFetchJson(path, options = {}) {
     cache: "no-store",
     headers: {}
   };
-  if (bridgeToken) {
-    init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
-  } else if (path === "/chrome-debugger/native/register") {
+  const forceRegisterToken =
+    options.forceRegisterToken === true ||
+    path === "/chrome-debugger/native/register" ||
+    path === "/chrome-debugger/native/reconnect-probe";
+  if (forceRegisterToken) {
     if (!BRIDGE_REGISTER_TOKEN) {
       throw bridgeError(
         ERROR_DAEMON_UNAVAILABLE,
@@ -23809,6 +24063,8 @@ async function daemonFetchJson(path, options = {}) {
       );
     }
     init.headers[BRIDGE_REGISTER_TOKEN_HEADER] = BRIDGE_REGISTER_TOKEN;
+  } else if (bridgeToken) {
+    init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
   }
   if (Object.prototype.hasOwnProperty.call(options, "body")) {
     init.headers["Content-Type"] = "application/json";

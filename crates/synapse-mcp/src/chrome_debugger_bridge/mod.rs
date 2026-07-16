@@ -17,7 +17,7 @@ use axum::{
         Query,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -37,11 +37,14 @@ const EXTENSION_ID: &str = "leoocgnkjnplbfdbklajepahofecgfbk";
 const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
+const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
+    "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
+    "synapse-chrome-bridge-2026-07-16-maintenance-alarm-resume-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
+    "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -115,6 +118,7 @@ const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
 const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
 const MIN_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 1_000;
 const MAX_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 900_000;
+const DEFAULT_MAINTENANCE_RECONNECT_RESUME_PROBE_AFTER_MS: u64 = 30_000;
 const RELOAD_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
@@ -4341,6 +4345,12 @@ pub struct ChromeBridgeMaintenancePauseAck {
     pub host_id: Option<String>,
     pub pause_ms: u64,
     pub pause_until_unix_ms: u64,
+    pub resume_probe_after_ms: u64,
+    pub resume_probe_after_unix_ms: u64,
+    #[serde(default)]
+    pub paused_daemon_pid: Option<u32>,
+    #[serde(default)]
+    pub paused_daemon_instance_id: Option<String>,
     pub reason: String,
     pub reconnect_suppressed: bool,
     pub persisted: bool,
@@ -4392,6 +4402,18 @@ pub struct NativeMessageRequest {
 pub struct NativeMaintenancePauseRequest {
     pause_ms: Option<u64>,
     reason: String,
+    resume_probe_after_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NativeReconnectProbeResponse {
+    ok: bool,
+    daemon_pid: u32,
+    daemon_instance_id: String,
+    daemon_now_unix_ms: u64,
+    bridge_protocol_version: u32,
+    expected_extension_id: String,
+    expected_extension_build_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5618,14 +5640,20 @@ impl ChromeDebuggerBridge {
         &self,
         reason: String,
         pause_ms: u64,
+        resume_probe_after_ms: u64,
     ) -> Result<ChromeBridgeMaintenancePauseAck, ChromeDebuggerBridgeError> {
+        let daemon_pid = std::process::id();
+        let daemon_instance_id = daemon_instance_id().to_owned();
         let result = self
             .send_command_with_timeout(
                 MAINTENANCE_RECONNECT_PAUSE_COMMAND,
                 json!({
                     "pauseMs": pause_ms,
+                    "resumeProbeAfterMs": resume_probe_after_ms,
                     "reason": reason,
                     "requestedAtUnixMs": now_unix_ms(),
+                    "pausedDaemonPid": daemon_pid,
+                    "pausedDaemonInstanceId": daemon_instance_id,
                 }),
                 Duration::from_secs(5),
             )
@@ -5646,10 +5674,13 @@ impl ChromeDebuggerBridge {
             || !ack.persisted
             || websocket_close_failed
             || ack.pause_ms != pause_ms
+            || ack.resume_probe_after_ms != resume_probe_after_ms
+            || ack.paused_daemon_pid != Some(daemon_pid)
+            || ack.paused_daemon_instance_id.as_deref() != Some(daemon_instance_id.as_str())
             || ack.reason.trim() != reason.trim()
         {
             return Err(ChromeDebuggerBridgeError::protocol(format!(
-                "Chrome bridge maintenancePauseReconnect acknowledgement failed postcondition: ok={} reconnect_suppressed={} persisted={} websocket_had_socket={} websocket_ready_state_before={:?} websocket_close_requested={} websocket_close_deferred={} websocket_close_error={:?} pause_ms={} expected_pause_ms={} reason={:?} expected_reason={:?}",
+                "Chrome bridge maintenancePauseReconnect acknowledgement failed postcondition: ok={} reconnect_suppressed={} persisted={} websocket_had_socket={} websocket_ready_state_before={:?} websocket_close_requested={} websocket_close_deferred={} websocket_close_error={:?} pause_ms={} expected_pause_ms={} resume_probe_after_ms={} expected_resume_probe_after_ms={} paused_daemon_pid={:?} expected_paused_daemon_pid={} paused_daemon_instance_id={:?} expected_paused_daemon_instance_id={} reason={:?} expected_reason={:?}",
                 ack.ok,
                 ack.reconnect_suppressed,
                 ack.persisted,
@@ -5660,6 +5691,12 @@ impl ChromeDebuggerBridge {
                 ack.websocket_close.close_error,
                 ack.pause_ms,
                 pause_ms,
+                ack.resume_probe_after_ms,
+                resume_probe_after_ms,
+                ack.paused_daemon_pid,
+                daemon_pid,
+                ack.paused_daemon_instance_id,
+                daemon_instance_id,
                 ack.reason,
                 reason
             )));
@@ -8332,6 +8369,19 @@ fn validate_maintenance_reconnect_pause_ms(
     Ok(value)
 }
 
+fn validate_maintenance_reconnect_resume_probe_after_ms(
+    value: Option<u64>,
+    pause_ms: u64,
+) -> Result<u64, ChromeDebuggerBridgeError> {
+    let value = value.unwrap_or(DEFAULT_MAINTENANCE_RECONNECT_RESUME_PROBE_AFTER_MS);
+    if !(MIN_MAINTENANCE_RECONNECT_PAUSE_MS..=pause_ms).contains(&value) {
+        return Err(ChromeDebuggerBridgeError::params_invalid(format!(
+            "chrome bridge maintenance reconnect resume_probe_after_ms must be {MIN_MAINTENANCE_RECONNECT_PAUSE_MS}..={pause_ms}, got {value}; remediation=set the resume probe after the shutdown/socket-drain critical section but before the bounded pause expires"
+        )));
+    }
+    Ok(value)
+}
+
 fn validate_maintenance_reconnect_pause_reason(
     value: &str,
 ) -> Result<String, ChromeDebuggerBridgeError> {
@@ -8362,10 +8412,15 @@ pub async fn wait_for_active_bridge_host(
 pub async fn maintenance_pause_reconnect(
     reason: &str,
     pause_ms: Option<u64>,
+    resume_probe_after_ms: Option<u64>,
 ) -> Result<ChromeBridgeMaintenancePauseAck, ChromeDebuggerBridgeError> {
     let pause_ms = validate_maintenance_reconnect_pause_ms(pause_ms)?;
+    let resume_probe_after_ms =
+        validate_maintenance_reconnect_resume_probe_after_ms(resume_probe_after_ms, pause_ms)?;
     let reason = validate_maintenance_reconnect_pause_reason(reason)?;
-    bridge().maintenance_pause_reconnect(reason, pause_ms).await
+    bridge()
+        .maintenance_pause_reconnect(reason, pause_ms, resume_probe_after_ms)
+        .await
 }
 
 pub fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -> bool {
@@ -8393,13 +8448,83 @@ pub fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -
         .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
 }
 
-pub fn is_direct_http_extension_bridge_register_request(headers: &HeaderMap, uri: &Uri) -> bool {
-    uri.path() == "/chrome-debugger/native/register"
-        && headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .is_some_and(|origin| origin == EXTENSION_ORIGIN)
+pub fn is_direct_http_extension_bridge_register_or_probe_request(
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> bool {
+    if !matches!(
+        uri.path(),
+        "/chrome-debugger/native/register" | "/chrome-debugger/native/reconnect-probe"
+    ) {
+        return false;
+    }
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_none_or(|origin| origin == EXTENSION_ORIGIN)
+}
+
+pub fn is_direct_http_extension_bridge_cors_preflight_request(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> bool {
+    if *method != Method::OPTIONS {
+        return false;
+    }
+    if !matches!(
+        uri.path(),
+        "/chrome-debugger/native/register"
+            | "/chrome-debugger/native/reconnect-probe"
+            | "/chrome-debugger/native/message"
+            | "/chrome-debugger/native/next"
+    ) {
+        return false;
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if origin.is_some_and(|origin| origin != EXTENSION_ORIGIN) {
+        return false;
+    }
+    headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|method| matches!(method, "GET" | "POST" | "OPTIONS"))
+}
+
+pub fn direct_http_bridge_cors_preflight_response() -> Response {
+    with_direct_http_bridge_cors_headers(StatusCode::NO_CONTENT.into_response())
+}
+
+fn with_direct_http_bridge_cors_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static(EXTENSION_ORIGIN),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
+    headers.insert(
+        header::VARY,
+        HeaderValue::from_static(
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        ),
+    );
+    response
 }
 
 fn direct_http_bridge_token_header_matches_host(headers: &HeaderMap, host_id: &str) -> bool {
@@ -8419,7 +8544,7 @@ pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Respon
     if request.transport.as_deref() == Some("direct_http") {
         note_normal_bridge_registration_external_popup_risk();
     }
-    match bridge().register(request) {
+    with_direct_http_bridge_cors_headers(match bridge().register(request) {
         Ok(response) => Json(response).into_response(),
         Err(detail) => (
             StatusCode::BAD_REQUEST,
@@ -8430,7 +8555,7 @@ pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Respon
             })),
         )
             .into_response(),
-    }
+    })
 }
 
 pub async fn http_message(
@@ -8440,9 +8565,11 @@ pub async fn http_message(
     if bridge_token_from_headers(&headers).is_some()
         && !direct_http_bridge_token_header_matches_host(&headers, &request.host_id)
     {
-        return direct_http_bridge_token_rejected(&request.host_id);
+        return with_direct_http_bridge_cors_headers(direct_http_bridge_token_rejected(
+            &request.host_id,
+        ));
     }
-    match bridge().post_message(request) {
+    with_direct_http_bridge_cors_headers(match bridge().post_message(request) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(detail) => (
             StatusCode::BAD_REQUEST,
@@ -8453,62 +8580,89 @@ pub async fn http_message(
             })),
         )
             .into_response(),
-    }
+    })
 }
 
 pub async fn http_maintenance_pause(
     Json(request): Json<NativeMaintenancePauseRequest>,
 ) -> Response {
-    match maintenance_pause_reconnect(&request.reason, request.pause_ms).await {
-        Ok(pause) => Json(json!({
-            "ok": true,
-            "pause": pause,
-        }))
+    with_direct_http_bridge_cors_headers(
+        match maintenance_pause_reconnect(
+            &request.reason,
+            request.pause_ms,
+            request.resume_probe_after_ms,
+        )
+        .await
+        {
+            Ok(pause) => Json(json!({
+                "ok": true,
+                "pause": pause,
+            }))
+            .into_response(),
+            Err(error) => {
+                let status = if error.code() == error_codes::TOOL_PARAMS_INVALID {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                (
+                    status,
+                    Json(json!({
+                        "ok": false,
+                        "code": error.code(),
+                        "detail": error.detail(),
+                    })),
+                )
+                    .into_response()
+            }
+        },
+    )
+}
+
+pub async fn http_reconnect_probe() -> Response {
+    with_direct_http_bridge_cors_headers(
+        Json(NativeReconnectProbeResponse {
+            ok: true,
+            daemon_pid: std::process::id(),
+            daemon_instance_id: daemon_instance_id().to_owned(),
+            daemon_now_unix_ms: now_unix_ms(),
+            bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+            expected_extension_id: EXTENSION_ID.to_owned(),
+            expected_extension_build_id: EXPECTED_EXTENSION_BUILD_ID.to_owned(),
+        })
         .into_response(),
-        Err(error) => {
-            let status = if error.code() == error_codes::TOOL_PARAMS_INVALID {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            (
-                status,
-                Json(json!({
-                    "ok": false,
-                    "code": error.code(),
-                    "detail": error.detail(),
-                })),
-            )
-                .into_response()
-        }
-    }
+    )
 }
 
 pub async fn http_next(headers: HeaderMap, Query(query): Query<NativeNextQuery>) -> Response {
     if bridge_token_from_headers(&headers).is_some()
         && !direct_http_bridge_token_header_matches_host(&headers, &query.host_id)
     {
-        return direct_http_bridge_token_rejected(&query.host_id);
+        return with_direct_http_bridge_cors_headers(direct_http_bridge_token_rejected(
+            &query.host_id,
+        ));
     }
     let timeout_ms = query
         .timeout_ms
         .unwrap_or_else(|| u64::try_from(NATIVE_POLL_TIMEOUT.as_millis()).unwrap_or(15_000))
         .min(30_000);
-    match bridge()
-        .next_command(&query.host_id, Duration::from_millis(timeout_ms))
-        .await
-    {
-        Ok(command) => Json(NativeNextResponse { ok: true, command }).into_response(),
-        Err(detail) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "code": error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
-                "detail": detail,
-            })),
-        )
-            .into_response(),
-    }
+    with_direct_http_bridge_cors_headers(
+        match bridge()
+            .next_command(&query.host_id, Duration::from_millis(timeout_ms))
+            .await
+        {
+            Ok(command) => Json(NativeNextResponse { ok: true, command }).into_response(),
+            Err(detail) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "code": error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+                    "detail": detail,
+                })),
+            )
+                .into_response(),
+        },
+    )
 }
 
 fn direct_http_bridge_token_rejected(host_id: &str) -> Response {
@@ -9045,6 +9199,11 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+fn daemon_instance_id() -> &'static str {
+    static INSTANCE_ID: OnceLock<String> = OnceLock::new();
+    INSTANCE_ID.get_or_init(|| Uuid::new_v4().to_string())
 }
 
 fn digest_bridge_token(token: &str) -> [u8; 32] {

@@ -112,19 +112,42 @@ pub(super) async fn require_http_security(
     next: Next,
 ) -> Response {
     if auth.bind_addr.ip().is_loopback() && validate_host(request.headers()).is_ok() {
+        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_cors_preflight_request(
+            request.method(),
+            request.headers(),
+            request.uri(),
+        ) {
+            tracing::info!(
+                code = "CHROME_BRIDGE_CORS_PREFLIGHT_ACCEPTED",
+                method = %request.method(),
+                path = request.uri().path(),
+                origin = origin_header(request.headers()).unwrap_or("<missing>"),
+                access_control_request_method = request
+                    .headers()
+                    .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .unwrap_or("<missing>"),
+                has_access_control_request_headers = request
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_REQUEST_HEADERS),
+                "accepted direct Chrome bridge CORS preflight"
+            );
+            return crate::chrome_debugger_bridge::direct_http_bridge_cors_preflight_response();
+        }
         if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
             request.headers(),
             request.uri(),
         ) {
             return next.run(request).await;
         }
-        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_request(
+        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_or_probe_request(
             request.headers(),
             request.uri(),
         ) {
             return match auth.authorize_bridge_register(request.headers()) {
                 Ok(()) => next.run(request).await,
-                Err(failure) => unauthorized(failure),
+                Err(failure) => unauthorized_request(failure, &request),
             };
         }
     }
@@ -133,7 +156,7 @@ pub(super) async fn require_http_security(
     }
     match auth.authorize(request.headers()) {
         Ok(()) => next.run(request).await,
-        Err(failure) => unauthorized(failure),
+        Err(failure) => unauthorized_request(failure, &request),
     }
 }
 
@@ -281,10 +304,26 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn unauthorized(failure: AuthFailure) -> Response {
+fn origin_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+}
+
+fn unauthorized_request(failure: AuthFailure, request: &Request<Body>) -> Response {
     tracing::warn!(
         code = synapse_core::error_codes::HTTP_TOKEN_INVALID,
         reason = ?failure,
+        method = %request.method(),
+        path = request.uri().path(),
+        origin = origin_header(request.headers()).unwrap_or("<missing>"),
+        has_authorization = request.headers().contains_key(header::AUTHORIZATION),
+        has_bridge_register_token = request.headers().contains_key(BRIDGE_REGISTER_TOKEN_HEADER),
+        has_bridge_token = request.headers().contains_key("x-synapse-bridge-token"),
+        has_access_control_request_method = request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD),
         "HTTP bearer token rejected"
     );
     (
