@@ -1,7 +1,9 @@
-use calyx_core::{Constellation, Result, SlotId};
+use std::collections::BTreeSet;
+
+use calyx_core::{CalyxError, Constellation, Result, SlotId};
 
 use super::encode::{self, WriteRow};
-use crate::cf::{ColumnFamily, anchor_key, base_key, slot_key};
+use crate::cf::{ColumnFamily, anchor_key, base_key, scalar_id_for_key, scalar_key, slot_key};
 
 pub(super) struct PreparedConstellationEncoding {
     slot_hashes: Vec<(SlotId, [u8; 32])>,
@@ -51,6 +53,20 @@ pub(super) fn stage_validated_constellation_rows(
             cf: ColumnFamily::Anchors,
             key: anchor_key(id, &anchor.kind),
             value: encode::encode_anchor(anchor)?,
+        });
+    }
+    let mut scalar_ids = BTreeSet::new();
+    for (name, value) in &constellation.scalars {
+        let scalar_id = scalar_id_for_key(name);
+        if !scalar_ids.insert(scalar_id) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "scalar id collision while staging scalar {name:?}; choose a distinct scalar key"
+            )));
+        }
+        rows.push(WriteRow {
+            cf: ColumnFamily::Scalars,
+            key: scalar_key(scalar_id, id),
+            value: value.to_bits().to_be_bytes().to_vec(),
         });
     }
     Ok(())

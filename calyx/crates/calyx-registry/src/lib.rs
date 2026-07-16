@@ -23,6 +23,7 @@ pub mod profile;
 pub mod runtime;
 mod runtime_limit;
 pub mod spec;
+pub mod structured_record;
 pub mod swap;
 pub mod temporal;
 
@@ -132,6 +133,14 @@ pub use runtime_limit::{
     measure_registry_batch_with_runtime_limit, measure_registry_group_with_runtime_limit,
 };
 pub use spec::{Bgem3Engine, FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
+pub use structured_record::{
+    CALYX_STRUCTURED_FIELD_MISSING, CALYX_STRUCTURED_FIELD_TYPE_MISMATCH,
+    CALYX_STRUCTURED_RECORD_INVALID, CALYX_STRUCTURED_SCHEMA_INVALID, StructuredBatchMeasurement,
+    StructuredFieldSchema, StructuredFieldType, StructuredMetadataRoute,
+    StructuredRecordMeasurement, StructuredRecordSchema, StructuredScalarRoute,
+    StructuredSlotMeasure, canonical_json_bytes, measure_structured_record,
+    measure_structured_record_batch,
+};
 pub use swap::{BackfillCandidate, BackfillQueue, SlotSpec, SwapController};
 pub use temporal::{
     DecayFunction, E2RecencyConfig, E2RecencyLens, E3PeriodicConfig, E3PeriodicLens,

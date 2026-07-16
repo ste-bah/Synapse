@@ -1,6 +1,6 @@
 //! Big-endian key codecs for Aster column families.
 
-use calyx_core::{AnchorKind, CalyxError, CxId, Result, SlotId};
+use calyx_core::{AnchorKind, CalyxError, CxId, Result, SlotId, content_address};
 
 const CX_ID_BYTES: usize = 16;
 const FULL_HASH_BYTES: usize = 32;
@@ -37,6 +37,20 @@ impl ScalarId {
     pub const fn get(self) -> u32 {
         self.0
     }
+}
+
+/// Stable scalar-column id for a constellation scalar key.
+///
+/// The physical Scalars CF is keyed by a compact `u32` column id. Deriving it
+/// from the declared scalar name keeps the mapping deterministic across vault
+/// restarts without introducing a side registry that could drift from Base.
+pub fn scalar_id_for_key(key: &str) -> ScalarId {
+    let digest = content_address([b"calyx-scalar-key-v1".as_slice(), key.as_bytes()]);
+    ScalarId::new(u32::from_be_bytes(
+        digest[..4]
+            .try_into()
+            .expect("content address has at least four bytes"),
+    ))
 }
 
 /// Typed keyspace inside the `online` CF.
