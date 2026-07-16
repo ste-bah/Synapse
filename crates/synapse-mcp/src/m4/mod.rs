@@ -87,7 +87,10 @@ const SHELL_RESERVED_ENV_KEYS: [&str; 3] = [
     SHELL_WORKING_DIR_ENV,
 ];
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const PROCESS_BASE_ENV_KEYS: [&str; 20] = [
+const SHELL_ENV_DAEMON_STALE: &str = "SYNAPSE_SHELL_ENV_DAEMON_STALE";
+const SHELL_ENV_DURABLE_MISSING: &str = "SYNAPSE_SHELL_ENV_DURABLE_MISSING";
+const SHELL_ENV_DURABLE_INVALID: &str = "SYNAPSE_SHELL_ENV_DURABLE_INVALID";
+const PROCESS_BASE_ENV_KEYS: [&str; 26] = [
     "PATH",
     "PATHEXT",
     "COMSPEC",
@@ -108,7 +111,26 @@ const PROCESS_BASE_ENV_KEYS: [&str; 20] = [
     "CommonProgramFiles",
     "CommonProgramFiles(x86)",
     "CommonProgramW6432",
+    "CUDA_PATH",
+    "CUDA_PATH_V13_3",
+    "FORGE_CUDA_CCBIN",
+    "NVCC_CCBIN",
+    "NVCC_APPEND_FLAGS",
+    "NVCC_PREPEND_FLAGS",
 ];
+const WINDOWS_DURABLE_ENV_OVERRIDE_KEYS: [&str; 6] = [
+    "CUDA_PATH",
+    "CUDA_PATH_V13_3",
+    "FORGE_CUDA_CCBIN",
+    "NVCC_CCBIN",
+    "NVCC_APPEND_FLAGS",
+    "NVCC_PREPEND_FLAGS",
+];
+#[cfg(windows)]
+const WINDOWS_MACHINE_ENVIRONMENT_SUBKEY: &str =
+    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+#[cfg(windows)]
+const WINDOWS_USER_ENVIRONMENT_SUBKEY: &str = "Environment";
 #[cfg(windows)]
 const WINDOWS_DEFAULT_PATHEXT: &str =
     ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
@@ -654,6 +676,26 @@ pub struct ActRunShellTransferDiagnostics {
     pub suggested_next_steps: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellEnvironmentDiagnostic {
+    pub variable: String,
+    pub diagnostic_code: String,
+    pub severity: String,
+    pub daemon_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_path: Option<String>,
+    pub explicit_override: bool,
+    pub source_of_truth: String,
+    pub remediation: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellCancelResponse {
@@ -769,6 +811,8 @@ pub struct ActRunShellJobStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_working_dir: Option<String>,
     pub env_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_diagnostics: Vec<ActRunShellEnvironmentDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_env_keys: Vec<String>,
     pub timeout_ms: Option<u64>,
@@ -9490,6 +9534,167 @@ fn child_base_environment() -> BTreeMap<String, (String, String)> {
     env
 }
 
+fn shell_child_environment(
+    command_name: &str,
+    args: &[String],
+    requested_env: &BTreeMap<String, String>,
+    effective_working_dir: Option<&str>,
+    context: Option<&ShellExecutionContext>,
+) -> Result<BTreeMap<String, String>, ErrorData> {
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_run_shell")?;
+    validate_configured_host_build_environment(&env, requested_env, command_name, args)?;
+    apply_requested_shell_environment(&mut env, requested_env);
+    apply_shell_session_environment(&mut env, effective_working_dir, context);
+    Ok(env.into_values().collect())
+}
+
+fn apply_requested_shell_environment(
+    env: &mut BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+) {
+    for (key, value) in requested_env {
+        env.insert(key.to_ascii_uppercase(), (key.clone(), value.clone()));
+    }
+}
+
+fn shell_job_environment_diagnostics(
+    params: &ActRunShellStartParams,
+    context: Option<&ShellExecutionContext>,
+) -> Vec<ActRunShellEnvironmentDiagnostic> {
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    apply_requested_shell_environment(&mut env, &params.env);
+    apply_shell_session_environment(&mut env, params.working_dir.as_deref(), context);
+    let diagnostics = configured_host_environment_diagnostics(&env, &params.env);
+    log_shell_environment_diagnostics(&diagnostics);
+    diagnostics
+}
+
+#[cfg(windows)]
+fn validate_configured_host_build_environment(
+    env: &BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+    command_name: &str,
+    args: &[String],
+) -> Result<(), ErrorData> {
+    if !shell_command_requires_durable_cuda(command_name, args)
+        || env_map_contains_key(requested_env, "CUDA_PATH")
+    {
+        return Ok(());
+    }
+    let Some(durable_cuda_path) = persisted_environment_value("CUDA_PATH") else {
+        return Err(configured_host_cuda_path_error(
+            env,
+            requested_env,
+            SHELL_ENV_DURABLE_MISSING,
+            "durable_cuda_path_missing",
+            "act_run_shell refused a CUDA-relevant command because CUDA_PATH is missing from durable Windows HKCU/HKLM environment Source of Truth",
+        ));
+    };
+    if durable_cuda_path.value.trim().is_empty() {
+        return Err(configured_host_cuda_path_error(
+            env,
+            requested_env,
+            SHELL_ENV_DURABLE_MISSING,
+            "durable_cuda_path_empty",
+            "act_run_shell refused a CUDA-relevant command because durable Windows CUDA_PATH is empty",
+        ));
+    }
+    let nvcc_path = cuda_path_nvcc_path(&durable_cuda_path.value);
+    if nvcc_path.is_file() {
+        return Ok(());
+    }
+    Err(configured_host_cuda_path_error(
+        env,
+        requested_env,
+        SHELL_ENV_DURABLE_INVALID,
+        "durable_cuda_path_nvcc_missing",
+        "act_run_shell refused a CUDA-relevant command because durable Windows CUDA_PATH does not contain bin\\nvcc.exe",
+    ))
+}
+
+#[cfg(windows)]
+fn configured_host_cuda_path_error(
+    env: &BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+    diagnostic_code: &'static str,
+    reason: &'static str,
+    message: &'static str,
+) -> ErrorData {
+    let diagnostic = configured_host_environment_diagnostic(
+        "CUDA_PATH",
+        env,
+        requested_env,
+        diagnostic_code,
+        "error",
+    );
+    tracing::error!(
+        code = diagnostic_code,
+        variable = %diagnostic.variable,
+        daemon_pid = diagnostic.daemon_pid,
+        process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
+        durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
+        effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
+        validation_path = diagnostic.validation_path.as_deref().unwrap_or("<none>"),
+        source_of_truth = %diagnostic.source_of_truth,
+        remediation = %diagnostic.remediation,
+        "act_run_shell refused a CUDA-relevant shell command because durable Windows CUDA_PATH failed validation"
+    );
+    shell_tool_error(
+        error_codes::ACTION_TARGET_INVALID,
+        message,
+        json!({
+            "code": error_codes::ACTION_TARGET_INVALID,
+            "reason": reason,
+            "diagnostic": diagnostic,
+        }),
+    )
+}
+
+#[cfg(not(windows))]
+fn validate_configured_host_build_environment(
+    _env: &BTreeMap<String, (String, String)>,
+    _requested_env: &BTreeMap<String, String>,
+    _command_name: &str,
+    _args: &[String],
+) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+fn shell_command_requires_durable_cuda(command_name: &str, args: &[String]) -> bool {
+    let executable = Path::new(command_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_name)
+        .to_ascii_lowercase();
+    if matches!(
+        executable.as_str(),
+        "cargo" | "cargo.exe" | "nvcc" | "nvcc.exe"
+    ) {
+        return true;
+    }
+    if !matches!(
+        executable.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
+    ) {
+        return false;
+    }
+    let command_line = args.join(" ").to_ascii_lowercase();
+    command_line.contains("cargo ")
+        || command_line.contains("cargo.exe")
+        || command_line.contains("nvcc ")
+        || command_line.contains("nvcc.exe")
+}
+
+#[cfg(windows)]
+fn cuda_path_nvcc_path(cuda_path: &str) -> PathBuf {
+    Path::new(cuda_path.trim().trim_matches('"'))
+        .join("bin")
+        .join("nvcc.exe")
+}
+
 /// Resolves a bare executable name (`rg`, `findstr`, …) against a semicolon
 /// PATH plus PATHEXT, returning the first matching file. Mirrors how Windows
 /// resolves a bare command name so the readback matches what a shell job's own
@@ -9570,6 +9775,177 @@ fn env_value<'a>(env: &'a BTreeMap<String, (String, String)>, key: &str) -> Opti
         .filter(|value| !value.trim().is_empty())
 }
 
+fn env_map_contains_key(env: &BTreeMap<String, String>, key: &str) -> bool {
+    env.keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+fn durable_env_override_key(key: &str) -> bool {
+    WINDOWS_DURABLE_ENV_OVERRIDE_KEYS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+#[cfg(windows)]
+fn configured_host_environment_diagnostics(
+    env: &BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+) -> Vec<ActRunShellEnvironmentDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for key in WINDOWS_DURABLE_ENV_OVERRIDE_KEYS {
+        let explicit_override = env_map_contains_key(requested_env, key);
+        if explicit_override {
+            continue;
+        }
+        let process_value = std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let durable_value = persisted_environment_value(key);
+        let durable_missing = durable_value
+            .as_ref()
+            .is_none_or(|durable| durable.value.trim().is_empty());
+        if durable_missing && (key.eq_ignore_ascii_case("CUDA_PATH") || process_value.is_some()) {
+            diagnostics.push(configured_host_environment_diagnostic(
+                key,
+                env,
+                requested_env,
+                SHELL_ENV_DURABLE_MISSING,
+                if key.eq_ignore_ascii_case("CUDA_PATH") {
+                    "error"
+                } else {
+                    "warning"
+                },
+            ));
+            continue;
+        }
+        if key.eq_ignore_ascii_case("CUDA_PATH")
+            && durable_value
+                .as_ref()
+                .is_some_and(|durable| !cuda_path_nvcc_path(&durable.value).is_file())
+        {
+            diagnostics.push(configured_host_environment_diagnostic(
+                key,
+                env,
+                requested_env,
+                SHELL_ENV_DURABLE_INVALID,
+                "error",
+            ));
+        }
+        match (process_value.as_deref(), durable_value.as_ref()) {
+            (Some(process), Some(durable))
+                if !environment_values_equivalent(key, process, &durable.value) =>
+            {
+                diagnostics.push(configured_host_environment_diagnostic(
+                    key,
+                    env,
+                    requested_env,
+                    SHELL_ENV_DAEMON_STALE,
+                    "warning",
+                ));
+            }
+            _ => {}
+        }
+    }
+    diagnostics
+}
+
+#[cfg(not(windows))]
+fn configured_host_environment_diagnostics(
+    _env: &BTreeMap<String, (String, String)>,
+    _requested_env: &BTreeMap<String, String>,
+) -> Vec<ActRunShellEnvironmentDiagnostic> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn environment_values_equivalent(key: &str, left: &str, right: &str) -> bool {
+    let left = left.trim().trim_matches('"');
+    let right = right.trim().trim_matches('"');
+    if matches!(
+        key.to_ascii_uppercase().as_str(),
+        "CUDA_PATH" | "CUDA_PATH_V13_3" | "FORGE_CUDA_CCBIN" | "NVCC_CCBIN"
+    ) {
+        return normalize_semicolon_path_part(left) == normalize_semicolon_path_part(right);
+    }
+    left == right
+}
+
+#[cfg(windows)]
+fn configured_host_environment_diagnostic(
+    key: &str,
+    env: &BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+    diagnostic_code: &'static str,
+    severity: &'static str,
+) -> ActRunShellEnvironmentDiagnostic {
+    let durable = persisted_environment_value(key);
+    ActRunShellEnvironmentDiagnostic {
+        variable: key.to_owned(),
+        diagnostic_code: diagnostic_code.to_owned(),
+        severity: severity.to_owned(),
+        daemon_pid: std::process::id(),
+        process_value: std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        durable_value: durable.as_ref().map(|value| value.value.clone()),
+        effective_value: env_value(env, key).map(ToOwned::to_owned),
+        validation_path: durable
+            .as_ref()
+            .filter(|_| key.eq_ignore_ascii_case("CUDA_PATH"))
+            .map(|value| path_string(&cuda_path_nvcc_path(&value.value))),
+        explicit_override: env_map_contains_key(requested_env, key),
+        source_of_truth: durable
+            .map(|value| value.source_of_truth)
+            .unwrap_or_else(persisted_environment_source_of_truth),
+        remediation: shell_environment_diagnostic_remediation(diagnostic_code, key),
+    }
+}
+
+fn shell_environment_diagnostic_remediation(diagnostic_code: &str, key: &str) -> String {
+    match diagnostic_code {
+        SHELL_ENV_DAEMON_STALE => format!(
+            "{key} differs between the long-lived daemon process and durable Windows environment; Synapse used the durable HKCU/HKLM value for the child. Restart the daemon through scripts\\synapse-setup.ps1 so process env and durable env converge."
+        ),
+        SHELL_ENV_DURABLE_MISSING => format!(
+            "{key} is absent from durable Windows environment. Run scripts\\synapse-setup.ps1 or set the real HKCU/HKLM environment value, then verify the registry Source of Truth before retrying CUDA-relevant shell work."
+        ),
+        SHELL_ENV_DURABLE_INVALID => format!(
+            "{key} does not resolve to a CUDA root containing bin\\nvcc.exe. Set the durable HKCU/HKLM value to the installed CUDA root, then verify that bin\\nvcc.exe exists before retrying CUDA-relevant shell work."
+        ),
+        _ => "inspect durable Windows environment, daemon process environment, and shell job status.json".to_owned(),
+    }
+}
+
+fn log_shell_environment_diagnostics(diagnostics: &[ActRunShellEnvironmentDiagnostic]) {
+    for diagnostic in diagnostics {
+        if diagnostic.severity == "error" {
+            tracing::error!(
+                code = %diagnostic.diagnostic_code,
+                variable = %diagnostic.variable,
+                daemon_pid = diagnostic.daemon_pid,
+                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
+                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
+                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
+                source_of_truth = %diagnostic.source_of_truth,
+                remediation = %diagnostic.remediation,
+                "act_run_shell configured-host environment diagnostic"
+            );
+        } else {
+            tracing::warn!(
+                code = %diagnostic.diagnostic_code,
+                variable = %diagnostic.variable,
+                daemon_pid = diagnostic.daemon_pid,
+                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
+                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
+                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
+                source_of_truth = %diagnostic.source_of_truth,
+                remediation = %diagnostic.remediation,
+                "act_run_shell configured-host environment diagnostic"
+            );
+        }
+    }
+}
+
 fn set_env_value(env: &mut BTreeMap<String, (String, String)>, key: &str, value: String) {
     if value.trim().is_empty() || value.contains('\0') {
         tracing::warn!(
@@ -9632,25 +10008,67 @@ fn ensure_child_temp_environment(env: &mut BTreeMap<String, (String, String)>) {
     insert_env_if_absent(env, "TMP", temp);
 }
 
+#[derive(Clone, Debug)]
+struct PersistedEnvironmentValue {
+    value: String,
+    source_of_truth: String,
+}
+
+#[cfg(windows)]
+fn persisted_environment_value(key: &str) -> Option<PersistedEnvironmentValue> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+
+    let machine = read_windows_registry_environment_value(
+        HKEY_LOCAL_MACHINE,
+        WINDOWS_MACHINE_ENVIRONMENT_SUBKEY,
+        key,
+    )
+    .map(|value| PersistedEnvironmentValue {
+        value,
+        source_of_truth: format!(r"HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY} value {key}"),
+    });
+    read_windows_registry_environment_value(HKEY_CURRENT_USER, WINDOWS_USER_ENVIRONMENT_SUBKEY, key)
+        .map(|value| PersistedEnvironmentValue {
+            value,
+            source_of_truth: format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY} value {key}"),
+        })
+        .or(machine)
+}
+
+#[cfg(not(windows))]
+fn persisted_environment_value(_key: &str) -> Option<PersistedEnvironmentValue> {
+    None
+}
+
+#[cfg(windows)]
+fn persisted_environment_source_of_truth() -> String {
+    format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY} or HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY}")
+}
+
+#[cfg(not(windows))]
+fn persisted_environment_source_of_truth() -> String {
+    "process environment".to_owned()
+}
+
 #[cfg(windows)]
 fn add_windows_registry_environment(env: &mut BTreeMap<String, (String, String)>) {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
-    const MACHINE_ENVIRONMENT: &str =
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
-    const USER_ENVIRONMENT: &str = "Environment";
-
     for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) =
-            read_windows_registry_environment_value(HKEY_LOCAL_MACHINE, MACHINE_ENVIRONMENT, key)
-        {
+        if let Some(value) = read_windows_registry_environment_value(
+            HKEY_LOCAL_MACHINE,
+            WINDOWS_MACHINE_ENVIRONMENT_SUBKEY,
+            key,
+        ) {
             apply_windows_registry_environment_value(env, key, value, "machine");
         }
     }
     for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) =
-            read_windows_registry_environment_value(HKEY_CURRENT_USER, USER_ENVIRONMENT, key)
-        {
+        if let Some(value) = read_windows_registry_environment_value(
+            HKEY_CURRENT_USER,
+            WINDOWS_USER_ENVIRONMENT_SUBKEY,
+            key,
+        ) {
             apply_windows_registry_environment_value(env, key, value, "user");
         }
     }
@@ -9762,6 +10180,22 @@ fn apply_windows_registry_environment_value(
                 key,
                 source,
                 "merged persisted Windows environment value into child process environment"
+            );
+        }
+        return;
+    }
+
+    if durable_env_override_key(key) {
+        let before = env_value(env, key).map(ToOwned::to_owned);
+        set_env_value(env, key, value);
+        if before.as_deref() != env_value(env, key) {
+            tracing::info!(
+                code = "M4_CHILD_ENV_REGISTRY_OVERRIDDEN",
+                key,
+                source,
+                before = before.as_deref().unwrap_or("<missing>"),
+                after = env_value(env, key).unwrap_or("<missing>"),
+                "durable Windows environment value overrides process snapshot for child process"
             );
         }
         return;
@@ -15723,6 +16157,7 @@ fn shell_job_status_record(
         session_dir: context.map(|context| path_string(context.session_dir())),
         effective_working_dir: params.working_dir.clone(),
         env_keys: params.env.keys().cloned().collect(),
+        environment_diagnostics: shell_job_environment_diagnostics(params, context),
         session_env_keys: context.map_or_else(Vec::new, shell_session_env_keys),
         timeout_ms: params.timeout_ms,
         started_at,
@@ -15849,15 +16284,17 @@ fn spawn_shell_job_child(
         command.current_dir(working_dir);
     }
     command.env_clear();
-    let mut env = child_base_environment();
-    ensure_child_temp_environment(&mut env);
-    validate_child_base_environment(&env, "act_run_shell")
-        .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
-    for (_sort_key, (key, value)) in env {
+    let env = shell_child_environment(
+        &params.command,
+        &params.args,
+        &params.env,
+        params.working_dir.as_deref(),
+        context,
+    )
+    .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
+    for (key, value) in env {
         command.env(key, value);
     }
-    command.envs(&params.env);
-    apply_shell_session_environment(&mut command, params.working_dir.as_deref(), context);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
@@ -16115,17 +16552,21 @@ fn spawn_shell_job_child(
 }
 
 fn apply_shell_session_environment(
-    command: &mut TokioCommand,
+    env: &mut BTreeMap<String, (String, String)>,
     effective_working_dir: Option<&str>,
     context: Option<&ShellExecutionContext>,
 ) {
     let Some(context) = context else {
         return;
     };
-    command.env(SHELL_SESSION_ID_ENV, context.session_id());
-    command.env(SHELL_SESSION_DIR_ENV, context.session_dir());
+    set_env_value(env, SHELL_SESSION_ID_ENV, context.session_id().to_owned());
+    set_env_value(
+        env,
+        SHELL_SESSION_DIR_ENV,
+        path_string(context.session_dir()),
+    );
     if let Some(working_dir) = effective_working_dir {
-        command.env(SHELL_WORKING_DIR_ENV, working_dir);
+        set_env_value(env, SHELL_WORKING_DIR_ENV, working_dir.to_owned());
     }
 }
 
@@ -19308,14 +19749,16 @@ fn spawn_shell_child(
         command.current_dir(working_dir);
     }
     command.env_clear();
-    let mut env = child_base_environment();
-    ensure_child_temp_environment(&mut env);
-    validate_child_base_environment(&env, "act_run_shell")?;
-    for (_sort_key, (key, value)) in env {
+    let env = shell_child_environment(
+        &params.command,
+        &params.args,
+        &params.env,
+        params.working_dir.as_deref(),
+        context,
+    )?;
+    for (key, value) in env {
         command.env(key, value);
     }
-    command.envs(&params.env);
-    apply_shell_session_environment(&mut command, params.working_dir.as_deref(), context);
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
