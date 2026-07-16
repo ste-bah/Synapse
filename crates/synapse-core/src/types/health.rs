@@ -131,6 +131,40 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_backend_requested: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_cuda_compiled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_device_vram_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_device_avx512: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_cpu_avx512_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_cpu_simd_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_fallback_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_fallback_source_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_fallback_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_tolerance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_dot: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_cosine: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_l2_squared: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_topk: Option<Vec<CalyxMathProbeTopKEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_clock_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_fixed_clock_unix_ms: Option<u64>,
@@ -193,6 +227,13 @@ pub struct SubsystemHealth {
     /// fields are retained; full responses populate every parsed field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_bridge: Option<ChromeBridgeDetail>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxMathProbeTopKEntry {
+    pub index: usize,
+    pub score: f32,
 }
 
 /// Structured replacement for the `chrome_bridge` subsystem's concatenated

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use synapse_action::BackendResolutionPolicy;
-use synapse_core::{Backend, ChromeBridgeDetail};
+use synapse_core::{Backend, CalyxMathProbeTopKEntry, ChromeBridgeDetail};
 
 /// Verbosity control for the `health` tool response.
 ///
@@ -207,10 +207,11 @@ impl SynapseService {
             "starting"
         };
         let tuning = status.tuning;
+        let math_backend = status.math_backend;
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} remediation={}",
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -227,6 +228,9 @@ impl SynapseService {
                 tuning.map_or("none", |config| config.clock_mode.as_str()),
                 tuning.map(|config| config.bit_floor_bits),
                 tuning.map(|config| config.correlation_ceiling),
+                math_backend
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |math| math.detail()),
                 status.remediation.as_deref().unwrap_or("none")
             )),
             calyx_vault_open: Some(status.open),
@@ -258,7 +262,48 @@ impl SynapseService {
             calyx_temporal_boost_min: tuning.map(|config| config.temporal_boost_min),
             calyx_temporal_boost_max: tuning.map(|config| config.temporal_boost_max),
             calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
-            calyx_math_backend: tuning.map(|config| config.math_backend.as_str().to_owned()),
+            calyx_math_backend: math_backend
+                .as_ref()
+                .map(|math| math.selected_backend.clone()),
+            calyx_math_backend_requested: math_backend
+                .as_ref()
+                .map(|math| math.requested_backend.as_str().to_owned())
+                .or_else(|| tuning.map(|config| config.math_backend.as_str().to_owned())),
+            calyx_math_cuda_compiled: math_backend.as_ref().map(|math| math.cuda_compiled),
+            calyx_math_device_name: math_backend.as_ref().map(|math| math.device_name.clone()),
+            calyx_math_device_vram_mib: math_backend.as_ref().and_then(|math| math.device_vram_mib),
+            calyx_math_device_avx512: math_backend.as_ref().map(|math| math.device_avx512),
+            calyx_math_cpu_avx512_available: math_backend
+                .as_ref()
+                .map(|math| math.cpu_avx512_available),
+            calyx_math_cpu_simd_path: math_backend.as_ref().map(|math| math.cpu_simd_path.clone()),
+            calyx_math_fallback_code: math_backend
+                .as_ref()
+                .and_then(|math| math.fallback_code.clone()),
+            calyx_math_fallback_source_code: math_backend
+                .as_ref()
+                .and_then(|math| math.fallback_source_code.clone()),
+            calyx_math_fallback_error: math_backend
+                .as_ref()
+                .and_then(|math| math.fallback_error.clone()),
+            calyx_math_probe_status: math_backend.as_ref().map(|math| math.probe.status.clone()),
+            calyx_math_probe_detail: math_backend.as_ref().map(|math| math.probe.detail.clone()),
+            calyx_math_probe_tolerance: math_backend.as_ref().map(|math| math.probe.tolerance),
+            calyx_math_probe_dot: math_backend.as_ref().map(|math| math.probe.dot.clone()),
+            calyx_math_probe_cosine: math_backend.as_ref().map(|math| math.probe.cosine.clone()),
+            calyx_math_probe_l2_squared: math_backend
+                .as_ref()
+                .map(|math| math.probe.l2_squared.clone()),
+            calyx_math_probe_topk: math_backend.as_ref().map(|math| {
+                math.probe
+                    .topk
+                    .iter()
+                    .map(|entry| CalyxMathProbeTopKEntry {
+                        index: entry.index,
+                        score: entry.score,
+                    })
+                    .collect()
+            }),
             calyx_clock_mode: tuning.map(|config| config.clock_mode.as_str().to_owned()),
             calyx_fixed_clock_unix_ms: tuning.and_then(|config| config.fixed_clock_unix_ms),
             calyx_rng_seed: tuning.map(|config| config.rng_seed),

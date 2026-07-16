@@ -2,6 +2,7 @@
 
 mod async_vault;
 mod error_bridge;
+mod math;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -22,6 +23,10 @@ use ulid::Ulid;
 pub use async_vault::{
     SynapseCalyxAsyncConfig, SynapseCalyxAsyncVault, SynapseCalyxAsyncVaultHandle,
     SynapseCalyxCfWrite, SynapseCalyxReaderLease,
+};
+pub use math::{
+    SynapseCalyxMathBackendStatus, SynapseCalyxMathProbeReport, SynapseCalyxMathProbeTopKEntry,
+    SynapseCalyxMathRuntime, math_backend,
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -192,6 +197,11 @@ impl SynapseCalyxTuningConfig {
         )?;
         if self.vram_budget_bytes == 0 {
             return Err(invalid_config("vram_budget_bytes must be positive"));
+        }
+        if matches!(self.math_backend, SynapseCalyxMathBackend::Cuda) {
+            return Err(invalid_config(
+                "math_backend = \"cuda\" is not a supported Synapse override; use \"auto\" to prefer CUDA with CPU fallback or \"cpu\" to force CPU",
+            ));
         }
         match (self.clock_mode, self.fixed_clock_unix_ms) {
             (SynapseCalyxClockMode::System, Some(_)) => {
@@ -477,6 +487,7 @@ pub struct SynapseCalyxVaultStatus {
     pub last_error: Option<String>,
     pub remediation: Option<String>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
+    pub math_backend: Option<SynapseCalyxMathBackendStatus>,
 }
 
 impl SynapseCalyxVaultStatus {
@@ -586,6 +597,7 @@ pub struct SynapseCalyxVault {
     config: SynapseCalyxConfig,
     vault: AsterVault<SynapseCalyxClock>,
     lock: VaultLockGuard,
+    math_runtime: SynapseCalyxMathRuntime,
 }
 
 impl SynapseCalyxVault {
@@ -625,7 +637,11 @@ impl SynapseCalyxVault {
                 ));
             }
         };
-        let status = status_from_vault(&config, &vault);
+        let math_runtime = match math_backend(&config.tuning) {
+            Ok(runtime) => runtime,
+            Err(error) => return Err(cleanup_open_lock(lock, error)),
+        };
+        let status = status_from_vault(&config, &vault, math_runtime.status());
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_OPENED",
             vault_dir = %config.vault_dir.display(),
@@ -638,18 +654,48 @@ impl SynapseCalyxVault {
             clock_mode = ?config.tuning.clock_mode,
             fixed_clock_unix_ms = config.tuning.fixed_clock_unix_ms,
             rng_seed = config.tuning.rng_seed,
+            math_backend_requested = status
+                .math_backend
+                .as_ref()
+                .map_or("none", |math| math.requested_backend.as_str()),
+            math_backend_selected = status
+                .math_backend
+                .as_ref()
+                .map_or("none", |math| math.selected_backend.as_str()),
+            math_backend_device_name = status
+                .math_backend
+                .as_ref()
+                .map_or("none", |math| math.device_name.as_str()),
+            math_backend_device_vram_mib = status
+                .math_backend
+                .as_ref()
+                .and_then(|math| math.device_vram_mib),
+            math_backend_cpu_avx512_available = status
+                .math_backend
+                .as_ref()
+                .map(|math| math.cpu_avx512_available),
+            math_backend_fallback_code = status
+                .math_backend
+                .as_ref()
+                .and_then(|math| math.fallback_code.as_deref())
+                .unwrap_or("none"),
+            math_backend_probe_status = status
+                .math_backend
+                .as_ref()
+                .map_or("none", |math| math.probe.status.as_str()),
             "opened durable Calyx Aster vault"
         );
         Ok(Self {
             config,
             vault,
             lock,
+            math_runtime,
         })
     }
 
     #[must_use]
     pub fn status(&self) -> SynapseCalyxVaultStatus {
-        status_from_vault(&self.config, &self.vault)
+        status_from_vault(&self.config, &self.vault, self.math_runtime.status())
     }
 
     /// Writes raw CF rows through Aster's durable WAL/MVCC commit path.
@@ -827,6 +873,7 @@ impl SynapseCalyxVault {
             config,
             vault,
             lock,
+            math_runtime: _,
         } = self;
         let latest_seq = vault.latest_seq();
         vault.flush().map_err(|error| {
@@ -1010,6 +1057,7 @@ impl VaultLockGuard {
 fn status_from_vault(
     config: &SynapseCalyxConfig,
     vault: &AsterVault<SynapseCalyxClock>,
+    math_backend: &SynapseCalyxMathBackendStatus,
 ) -> SynapseCalyxVaultStatus {
     let recovery_report = vault.recovery_report();
     let mut status = SynapseCalyxVaultStatus {
@@ -1026,6 +1074,7 @@ fn status_from_vault(
         ..SynapseCalyxVaultStatus::default()
     };
     status.apply_paths(config);
+    status.math_backend = Some(math_backend.clone());
     status
 }
 
