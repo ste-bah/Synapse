@@ -307,6 +307,7 @@ pub struct M3State {
     pub storage_gc_task: Option<GcTask>,
     pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
+    pub storage_maintenance_unsupported: Option<String>,
     pub reflex_last_error: Option<String>,
     pub profile_last_error: Option<String>,
     pub audio_last_error: Option<String>,
@@ -329,6 +330,8 @@ pub struct M3State {
 
 #[derive(Clone, Debug, Default)]
 pub struct StorageMaintenanceReadback {
+    pub maintenance_supported: bool,
+    pub unsupported_reason: Option<String>,
     pub gc_task_running: bool,
     pub pressure_task_running: bool,
     pub gc_task: GcTaskReadback,
@@ -518,6 +521,7 @@ impl M3State {
             storage_gc_task: None,
             storage_pressure_task: None,
             storage_last_error: None,
+            storage_maintenance_unsupported: None,
             reflex_last_error: None,
             profile_last_error: None,
             audio_last_error: None,
@@ -654,6 +658,19 @@ impl M3State {
         &mut self,
     ) -> std::result::Result<(), synapse_storage::StorageError> {
         let db = self.ensure_storage()?;
+        if db.backend_kind() == StorageBackendKind::Calyx {
+            let reason = "storage backend calyx has the #1656 byte-preserving Db surface; RocksDB-style pressure/GC maintenance is unavailable until #1658/#1659".to_owned();
+            tracing::warn!(
+                code = "STORAGE_CALYX_MAINTENANCE_UNSUPPORTED",
+                backend = db.backend_name(),
+                %reason,
+                "skipping storage maintenance tasks for backend without pressure/GC parity"
+            );
+            self.storage_maintenance_unsupported = Some(reason);
+            self.storage_last_error = None;
+            return Ok(());
+        }
+        self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
             {
@@ -814,6 +831,8 @@ impl M3State {
                     })
             });
         StorageMaintenanceReadback {
+            maintenance_supported: self.storage_maintenance_unsupported.is_none(),
+            unsupported_reason: self.storage_maintenance_unsupported.clone(),
             gc_task_running: gc_task.running,
             pressure_task_running,
             gc_task,

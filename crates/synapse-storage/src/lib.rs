@@ -15,8 +15,6 @@ pub mod timeline;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use synapse_core::error_codes;
-
 pub use backend::StorageBackendKind;
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
@@ -69,8 +67,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns a structured open error when the selected backend cannot serve
-    /// the `Db` API. `calyx` intentionally fails closed until #1656 supplies a
-    /// byte-identical implementation.
+    /// the `Db` API.
     #[tracing::instrument(skip_all, fields(storage_path = %path.display(), schema_version, backend = backend_kind.as_str()))]
     pub fn open_with_backend(
         path: &Path,
@@ -82,22 +79,7 @@ impl Db {
                 Box::new(backend::RocksDbBackend::open(path, schema_version)?)
             }
             StorageBackendKind::Calyx => {
-                let detail = concat!(
-                    "storage_backend=\"calyx\" selected, but the Calyx Db backend is not implemented; ",
-                    "finish issue #1656 before selecting this backend"
-                )
-                .to_owned();
-                tracing::error!(
-                    code = error_codes::STORAGE_BACKEND_UNIMPLEMENTED,
-                    storage_path = %path.display(),
-                    backend = backend_kind.as_str(),
-                    %detail,
-                    "storage backend unavailable"
-                );
-                return Err(StorageError::BackendUnavailable {
-                    backend: backend_kind.as_str().to_owned(),
-                    detail,
-                });
+                Box::new(backend::CalyxBackend::open(path, schema_version)?)
             }
         };
         tracing::info!(

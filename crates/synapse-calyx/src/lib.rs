@@ -661,10 +661,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if admission, WAL append,
     /// MVCC apply, checkpoint staging, or any durability guard fails.
-    pub(crate) fn write_cf_batch(
-        &self,
-        rows: Vec<SynapseCalyxCfWrite>,
-    ) -> Result<Seq, SynapseCalyxError> {
+    pub fn write_cf_batch(&self, rows: Vec<SynapseCalyxCfWrite>) -> Result<Seq, SynapseCalyxError> {
         self.vault
             .write_cf_batch(rows.into_iter().map(|row| (row.cf, row.key, row.value)))
             .map_err(|error| SynapseCalyxError::from_calyx("write Calyx CF batch", &error))
@@ -676,7 +673,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the snapshot is stale,
     /// blocked by a read barrier, or unavailable from the opened recovery mode.
-    pub(crate) fn read_cf_at(
+    pub fn read_cf_at(
         &self,
         snapshot: Seq,
         cf: ColumnFamily,
@@ -693,7 +690,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the lease expired, the row is
     /// blocked by a read barrier, or the opened recovery mode cannot serve it.
-    pub(crate) fn read_cf_snapshot(
+    pub fn read_cf_snapshot(
         &self,
         snapshot: Snapshot,
         cf: ColumnFamily,
@@ -712,7 +709,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the snapshot is stale,
     /// blocked by a read barrier, or unavailable from the opened recovery mode.
-    pub(crate) fn scan_cf_at(
+    pub fn scan_cf_at(
         &self,
         snapshot: Seq,
         cf: ColumnFamily,
@@ -728,7 +725,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the lease expired, any row is
     /// blocked by a read barrier, or the opened recovery mode cannot serve it.
-    pub(crate) fn scan_cf_snapshot(
+    pub fn scan_cf_snapshot(
         &self,
         snapshot: Snapshot,
         cf: ColumnFamily,
@@ -744,7 +741,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the snapshot is stale,
     /// blocked by a read barrier, or unavailable from the opened recovery mode.
-    pub(crate) fn scan_cf_range_at(
+    pub fn scan_cf_range_at(
         &self,
         snapshot: Seq,
         cf: ColumnFamily,
@@ -762,7 +759,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the lease expired, any row is
     /// blocked by a read barrier, or the opened recovery mode cannot serve it.
-    pub(crate) fn scan_cf_range_snapshot(
+    pub fn scan_cf_range_snapshot(
         &self,
         snapshot: Snapshot,
         cf: ColumnFamily,
@@ -782,7 +779,7 @@ impl SynapseCalyxVault {
     /// Returns a structured error when `max_age_ms == 0`; zero-length leases
     /// are rejected so callers cannot accidentally create immediately expired
     /// snapshots and then misclassify the follow-on read failure.
-    pub(crate) fn pin_reader(
+    pub fn pin_reader(
         &self,
         freshness: Freshness,
         max_age_ms: u64,
@@ -798,7 +795,7 @@ impl SynapseCalyxVault {
     }
 
     #[must_use]
-    pub(crate) fn release_reader(&self, lease_id: u64) -> bool {
+    pub fn release_reader(&self, lease_id: u64) -> bool {
         self.vault.release_reader(lease_id)
     }
 
@@ -808,7 +805,7 @@ impl SynapseCalyxVault {
     ///
     /// Returns a structured Calyx-backed error if the WAL fsync or checkpoint
     /// flush fails.
-    pub(crate) fn flush(&self) -> Result<(), SynapseCalyxError> {
+    pub fn flush(&self) -> Result<(), SynapseCalyxError> {
         self.vault
             .flush()
             .map_err(|error| SynapseCalyxError::from_calyx("flush Calyx Aster vault", &error))

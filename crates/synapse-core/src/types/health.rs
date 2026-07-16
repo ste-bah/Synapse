@@ -41,6 +41,10 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_maintenance_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_maintenance_unsupported_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_sizes: Option<BTreeMap<String, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_task_running: Option<bool>,

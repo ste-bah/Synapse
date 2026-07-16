@@ -265,15 +265,20 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: format!(
-            "{}_live_data_size_estimates_estimated_row_counts",
-            runtime.storage_backend_name()
-        ),
+        metrics_mode: storage_metrics_mode(runtime.storage_backend_name()),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
         missing_cf_row_count_estimates,
     })
+}
+
+fn storage_metrics_mode(storage_backend: &str) -> String {
+    if storage_backend == "calyx" {
+        "calyx_exact_scan_sizes_counts".to_owned()
+    } else {
+        format!("{storage_backend}_live_data_size_estimates_estimated_row_counts")
+    }
 }
 
 pub fn put_probe_rows(
