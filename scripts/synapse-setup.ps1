@@ -805,26 +805,260 @@ function New-HiddenDaemonLauncher {
 
     $daemonLogDir = $LogDir
     $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
-    $daemonCommand = @(
-        (Quote-WindowsCommandArgument $ExePath),
+    $supervisorPath = Join-Path (Split-Path -Parent $OutputPath) 'synapse-daemon-supervisor.ps1'
+    $supervisorState = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $supervisorEvents = Join-Path $LogDir 'daemon-supervisor-events.jsonl'
+    $daemonArgumentText = @(
         '--mode', 'http',
         '--bind', (Quote-WindowsCommandArgument $Bind),
         '--db', (Quote-WindowsCommandArgument $DbPath),
         '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
         '--log-level', 'info'
     ) -join ' '
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        Die "SYNAPSE_HIDDEN_SUPERVISOR_POWERSHELL_MISSING path=$powerShellExe remediation=repair Windows PowerShell before registering the daemon supervisor"
+    }
 
-    @"
+    $supervisorScript = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$ExePath = __EXE_PATH__
+$Bind = __BIND__
+$DbPath = __DB_PATH__
+$ProfilesDir = __PROFILES_DIR__
+$DaemonLogDir = __DAEMON_LOG_DIR__
+$TokenPath = __TOKEN_PATH__
+$LauncherLog = __LAUNCHER_LOG__
+$SupervisorState = __SUPERVISOR_STATE__
+$SupervisorEvents = __SUPERVISOR_EVENTS__
+$DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
+
+$restartFloorSeconds = 2
+$restartCeilingSeconds = 60
+$rapidFailureWindowSeconds = 60
+$rapidFailureLimit = 5
+$generation = 0
+$rapidFailures = New-Object 'System.Collections.Generic.Queue[datetime]'
+
+function Write-LogLine {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    $line = '{0} {1}' -f (Get-Date -Format o), $Message
+    Add-Content -LiteralPath $LauncherLog -Value $line -Encoding ascii
+}
+
+function Write-SupervisorEvent {
+    param(
+        [Parameter(Mandatory=$true)][string]$Event,
+        [hashtable]$Fields = @{}
+    )
+    $row = [ordered]@{
+        ts_utc = (Get-Date).ToUniversalTime().ToString('o')
+        event = $Event
+        supervisor_pid = $PID
+        bind = $Bind
+        db_path = $DbPath
+    }
+    foreach ($key in $Fields.Keys) {
+        $row[$key] = $Fields[$key]
+    }
+    ($row | ConvertTo-Json -Compress -Depth 8) | Add-Content -LiteralPath $SupervisorEvents -Encoding ascii
+}
+
+function Write-SupervisorState {
+    param(
+        [Parameter(Mandatory=$true)][string]$State,
+        [int]$Generation,
+        [AllowNull()][object]$ChildPid,
+        [AllowNull()][object]$ExitCode,
+        [Parameter(Mandatory=$true)][string]$Message
+    )
+    $stateObject = [ordered]@{
+        updated_utc = (Get-Date).ToUniversalTime().ToString('o')
+        state = $State
+        generation = $Generation
+        supervisor_pid = $PID
+        child_pid = $ChildPid
+        exit_code = $ExitCode
+        bind = $Bind
+        db_path = $DbPath
+        exe_path = $ExePath
+        message = $Message
+    }
+    $stateObject | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SupervisorState -Encoding ascii
+}
+
+function Read-SynapseToken {
+    if (-not (Test-Path -LiteralPath $TokenPath -PathType Leaf)) {
+        throw "SYNAPSE_DAEMON_TOKEN_MISSING path=$TokenPath"
+    }
+    $token = (Get-Content -Raw -LiteralPath $TokenPath).Trim()
+    if ($token.Length -lt 16) {
+        throw "SYNAPSE_DAEMON_TOKEN_INVALID path=$TokenPath length=$($token.Length)"
+    }
+    return $token
+}
+
+function Get-BindParts {
+    $lastColon = $Bind.LastIndexOf(':')
+    if ($lastColon -lt 1 -or $lastColon -ge ($Bind.Length - 1)) {
+        throw "SYNAPSE_DAEMON_BIND_INVALID bind=$Bind"
+    }
+    return [pscustomobject]@{
+        Address = $Bind.Substring(0, $lastColon)
+        Port = [int]$Bind.Substring($lastColon + 1)
+    }
+}
+
+function Get-ProcessInfoForPid {
+    param([Parameter(Mandatory=$true)][int]$ProcessId)
+    Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
+}
+
+function Test-ExpectedDaemonProcess {
+    param([AllowNull()][object]$ProcessInfo)
+    if ($null -eq $ProcessInfo) {
+        return $false
+    }
+    if (-not [string]::Equals([string]$ProcessInfo.ExecutablePath, $ExePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $commandLine = [string]$ProcessInfo.CommandLine
+    return ($commandLine.IndexOf('--mode http', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+        ($commandLine.IndexOf($Bind, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+        ($commandLine.IndexOf($DbPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function Wait-AdoptedDaemon {
+    param(
+        [Parameter(Mandatory=$true)][int]$OwnerPid,
+        [int]$Generation
+    )
+    Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_ADOPT_EXISTING generation=$Generation pid=$OwnerPid bind=$Bind"
+    Write-SupervisorEvent 'adopt_existing' @{ generation = $Generation; child_pid = $OwnerPid }
+    Write-SupervisorState -State 'adopted_existing' -Generation $Generation -ChildPid $OwnerPid -ExitCode $null -Message 'Existing expected daemon owns the listener; supervisor is waiting for it to exit before relaunching.'
+    try {
+        Wait-Process -Id $OwnerPid
+    } catch {
+        Write-LogLine "SYNAPSE_DAEMON_ADOPTED_WAIT_ERROR generation=$Generation pid=$OwnerPid error=$($_.Exception.Message)"
+        Write-SupervisorEvent 'adopted_wait_error' @{ generation = $Generation; child_pid = $OwnerPid; error = $_.Exception.Message }
+    }
+    Write-LogLine "SYNAPSE_DAEMON_ADOPTED_EXIT generation=$Generation pid=$OwnerPid"
+    Write-SupervisorEvent 'adopted_exit' @{ generation = $Generation; child_pid = $OwnerPid }
+}
+
+function Register-RapidFailure {
+    param([Parameter(Mandatory=$true)][datetime]$FailureTime)
+    $rapidFailures.Enqueue($FailureTime)
+    while ($rapidFailures.Count -gt 0 -and (($FailureTime - $rapidFailures.Peek()).TotalSeconds -gt $rapidFailureWindowSeconds)) {
+        [void]$rapidFailures.Dequeue()
+    }
+    if ($rapidFailures.Count -ge $rapidFailureLimit) {
+        throw "SYNAPSE_DAEMON_CRASH_LOOP rapid_failures=$($rapidFailures.Count) window_seconds=$rapidFailureWindowSeconds bind=$Bind"
+    }
+    $exponent = [Math]::Min($rapidFailures.Count - 1, 5)
+    return [int][Math]::Min($restartCeilingSeconds, $restartFloorSeconds * [Math]::Pow(2, $exponent))
+}
+
+trap {
+    $message = ($_.Exception.Message -replace '\s+', ' ').Trim()
+    try {
+        Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_FATAL error=$message"
+        Write-SupervisorEvent 'fatal' @{ generation = $generation; error = $message }
+        Write-SupervisorState -State 'fatal' -Generation $generation -ChildPid $null -ExitCode 1 -Message $message
+    } catch {
+    }
+    exit 1
+}
+
+New-Item -ItemType Directory -Force -Path $DaemonLogDir | Out-Null
+$bindParts = Get-BindParts
+Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_START supervisor_pid=$PID bind=$Bind db=$DbPath exe=$ExePath"
+Write-SupervisorEvent 'supervisor_start' @{ generation = $generation; exe_path = $ExePath }
+Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Supervisor process started.'
+
+while ($true) {
+    $listener = Get-NetTCPConnection -LocalAddress $bindParts.Address -LocalPort $bindParts.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $listener) {
+        $ownerPid = [int]$listener.OwningProcess
+        $ownerInfo = Get-ProcessInfoForPid -ProcessId $ownerPid
+        if (Test-ExpectedDaemonProcess -ProcessInfo $ownerInfo) {
+            Wait-AdoptedDaemon -OwnerPid $ownerPid -Generation $generation
+            continue
+        }
+        $ownerExe = if ($null -eq $ownerInfo) { '<missing>' } else { [string]$ownerInfo.ExecutablePath }
+        $ownerCommand = if ($null -eq $ownerInfo) { '<missing>' } else { ([string]$ownerInfo.CommandLine -replace '\s+', ' ').Trim() }
+        throw "SYNAPSE_DAEMON_BIND_OCCUPIED bind=$Bind owner_pid=$ownerPid owner_exe=$ownerExe owner_command=$ownerCommand"
+    }
+
+    $generation += 1
+    $token = Read-SynapseToken
+    $env:SYNAPSE_BEARER_TOKEN = $token
+    $env:SYNAPSE_LOG_DIR = $DaemonLogDir
+
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $DaemonArgumentText"
+    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $DaemonArgumentText }
+    Write-SupervisorState -State 'launching' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Starting synapse-mcp daemon.'
+
+    $startTime = Get-Date
+    $process = Start-Process -FilePath $ExePath -ArgumentList $DaemonArgumentText -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -PassThru
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id)"
+    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id }
+    Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon child process is running.'
+
+    $process.WaitForExit()
+    $endTime = Get-Date
+    $exitCode = $process.ExitCode
+    $runtimeMs = [int64](($endTime - $startTime).TotalMilliseconds)
+    Write-LogLine "SYNAPSE_DAEMON_EXIT generation=$generation pid=$($process.Id) exit_code=$exitCode runtime_ms=$runtimeMs"
+    Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs }
+    Write-SupervisorState -State 'child_exited' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Daemon child exited after ${runtimeMs}ms."
+
+    if ($exitCode -eq 0) {
+        Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$generation reason=daemon_exit_zero"
+        Write-SupervisorEvent 'supervisor_stop' @{ generation = $generation; reason = 'daemon_exit_zero' }
+        Write-SupervisorState -State 'stopped' -Generation $generation -ChildPid $process.Id -ExitCode 0 -Message 'Daemon exited cleanly; supervisor stopped.'
+        exit 0
+    }
+
+    $delaySeconds = Register-RapidFailure -FailureTime $endTime
+    Write-LogLine "SYNAPSE_DAEMON_RESTART_SCHEDULED generation=$generation exit_code=$exitCode delay_seconds=$delaySeconds rapid_failures=$($rapidFailures.Count)"
+    Write-SupervisorEvent 'restart_scheduled' @{ generation = $generation; exit_code = $exitCode; delay_seconds = $delaySeconds; rapid_failures = $rapidFailures.Count }
+    Write-SupervisorState -State 'restart_wait' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Restart scheduled in ${delaySeconds}s after non-zero child exit."
+    Start-Sleep -Seconds $delaySeconds
+}
+'@
+
+    $supervisorScript = $supervisorScript.
+        Replace('__EXE_PATH__', (Quote-PowerShellSingleQuotedString $ExePath)).
+        Replace('__BIND__', (Quote-PowerShellSingleQuotedString $Bind)).
+        Replace('__DB_PATH__', (Quote-PowerShellSingleQuotedString $DbPath)).
+        Replace('__PROFILES_DIR__', (Quote-PowerShellSingleQuotedString $ProfilesDir)).
+        Replace('__DAEMON_LOG_DIR__', (Quote-PowerShellSingleQuotedString $daemonLogDir)).
+        Replace('__TOKEN_PATH__', (Quote-PowerShellSingleQuotedString $TokenPath)).
+        Replace('__LAUNCHER_LOG__', (Quote-PowerShellSingleQuotedString $launcherLog)).
+        Replace('__SUPERVISOR_STATE__', (Quote-PowerShellSingleQuotedString $supervisorState)).
+        Replace('__SUPERVISOR_EVENTS__', (Quote-PowerShellSingleQuotedString $supervisorEvents)).
+        Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText))
+
+    $supervisorScript | Set-Content -Path $supervisorPath -Encoding ascii
+
+    $supervisorCommand = @(
+        (Quote-WindowsCommandArgument $powerShellExe),
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', (Quote-WindowsCommandArgument $supervisorPath)
+    ) -join ' '
+
+    $wrapperScript = @'
 Option Explicit
-Dim shell, fso, env, tokenPath, launcherLog, daemonLogDir, daemonCommand
-Dim tokenFile, token, exitCode
+Dim shell, fso, launcherLog, supervisorCommand, exitCode
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
-tokenPath = $(Vbs-Literal $TokenPath)
-launcherLog = $(Vbs-Literal $launcherLog)
-daemonLogDir = $(Vbs-Literal $daemonLogDir)
-daemonCommand = $(Vbs-Literal $daemonCommand)
+launcherLog = __LAUNCHER_LOG__
+supervisorCommand = __SUPERVISOR_COMMAND__
 
 Sub LogLine(message)
   Dim logFile
@@ -833,53 +1067,17 @@ Sub LogLine(message)
   logFile.Close
 End Sub
 
-On Error Resume Next
-If Not fso.FolderExists(daemonLogDir) Then
-  fso.CreateFolder daemonLogDir
-End If
-If Err.Number <> 0 Then
-  WScript.Quit 1
-End If
-On Error GoTo 0
-
-If Not fso.FileExists(tokenPath) Then
-  LogLine "SYNAPSE_DAEMON_TOKEN_MISSING path=" & tokenPath
-  WScript.Quit 1
-End If
-
-On Error Resume Next
-Set tokenFile = fso.OpenTextFile(tokenPath, 1, False)
-If Err.Number <> 0 Then
-  LogLine "SYNAPSE_DAEMON_TOKEN_READ_FAILED path=" & tokenPath & " err_number=" & Err.Number & " err_description=" & Err.Description
-  WScript.Quit 1
-End If
-If tokenFile.AtEndOfStream Then
-  token = ""
-Else
-  token = Trim(tokenFile.ReadAll)
-End If
-If Err.Number <> 0 Then
-  LogLine "SYNAPSE_DAEMON_TOKEN_READ_FAILED path=" & tokenPath & " err_number=" & Err.Number & " err_description=" & Err.Description
-  tokenFile.Close
-  WScript.Quit 1
-End If
-tokenFile.Close
-On Error GoTo 0
-
-If Len(token) < 16 Then
-  LogLine "SYNAPSE_DAEMON_TOKEN_INVALID path=" & tokenPath & " length=" & Len(token)
-  WScript.Quit 1
-End If
-
-Set env = shell.Environment("PROCESS")
-env("SYNAPSE_BEARER_TOKEN") = token
-env("SYNAPSE_LOG_DIR") = daemonLogDir
-
-LogLine "SYNAPSE_DAEMON_LAUNCH_START command=" & daemonCommand
-exitCode = shell.Run(daemonCommand, 0, True)
-LogLine "SYNAPSE_DAEMON_EXIT exit_code=" & exitCode
+LogLine "SYNAPSE_DAEMON_WRAPPER_START command=" & supervisorCommand
+exitCode = shell.Run(supervisorCommand, 0, True)
+LogLine "SYNAPSE_DAEMON_WRAPPER_EXIT exit_code=" & exitCode
 WScript.Quit exitCode
-"@ | Set-Content -Path $OutputPath -Encoding ascii
+'@
+
+    $wrapperScript = $wrapperScript.
+        Replace('__LAUNCHER_LOG__', (Vbs-Literal $launcherLog)).
+        Replace('__SUPERVISOR_COMMAND__', (Vbs-Literal $supervisorCommand))
+
+    $wrapperScript | Set-Content -Path $OutputPath -Encoding ascii
 }
 
 function Ensure-SynapseSetupProcessJobType {
@@ -6455,6 +6653,19 @@ if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }
 Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
+$installedBinaryAlreadyVerified = $false
+if ($SkipBuild) {
+    $resolvedInstallSourcePath = [System.IO.Path]::GetFullPath($installSourcePath)
+    $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
+    $installedBinaryAlreadyVerified = (
+        $resolvedInstallSourcePath -ieq $resolvedExePath -and
+        (Test-Path -LiteralPath $ExePath -PathType Leaf) -and
+        ((Get-SynapseFileSha256 -Path $ExePath) -eq $installSourceHash)
+    )
+    if ($installedBinaryAlreadyVerified) {
+        Info "SkipBuild candidate is already installed; setup will keep the live daemon and let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash"
+    }
+}
 
 $codexAncestorBeforeHandoff = Get-SynapseCurrentCodexAncestor
 if ($codexAncestorBeforeHandoff -and $processTokenAtStart -ne $token) {
@@ -6492,18 +6703,25 @@ if ($script:SynapsePostExitStartOnly) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Drain the running daemon, then install the proven binary
+# 5. Drain the running daemon only when binary bytes must be replaced
 # ---------------------------------------------------------------------------
-Step "Draining live daemon and installing verified binary -> $ExePath"
-Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($installedBinaryAlreadyVerified) {
+    Step "Verified installed daemon binary without live drain -> $ExePath"
+} else {
+    Step "Draining live daemon and installing verified binary -> $ExePath"
+    Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+    Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
 }
-Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 $backupPath = $null
 $oldInstalledHash = $null
-if (Test-Path -LiteralPath $ExePath) {
+if ($installedBinaryAlreadyVerified) {
+    $oldInstalledHash = $installSourceHash
+    Info "Installed binary already matches verified SkipBuild candidate; no backup/copy needed. path=$ExePath sha256=$oldInstalledHash"
+} elseif (Test-Path -LiteralPath $ExePath) {
     $oldInstalledHash = Get-SynapseFileSha256 -Path $ExePath
     $backupPath = "$ExePath.bak"
     Copy-Item -LiteralPath $ExePath -Destination $backupPath -Force
@@ -6513,7 +6731,9 @@ if (Test-Path -LiteralPath $ExePath) {
     }
     Info "Backed up old binary -> $backupPath sha256=$backupHash"
 }
-if (-not $SkipBuild) {
+if ($installedBinaryAlreadyVerified) {
+    Info "SkipBuild candidate already resides at install path=$ExePath"
+} elseif (-not $SkipBuild) {
     Copy-Item -LiteralPath $installSourcePath -Destination $ExePath -Force
 } else {
     Info "SkipBuild candidate already resides at install path=$ExePath"
@@ -6627,7 +6847,15 @@ if ($script:SynapseBindPostExitContinuationRequired) {
 # 7. Register + start the auto-start HTTP daemon (interactive desktop session)
 # ---------------------------------------------------------------------------
 Step "Registering auto-start daemon task '$TaskName'"
-Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
+if ($installedBinaryAlreadyVerified) {
+    $existingTaskForAdoption = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existingTaskForAdoption -and [string]$existingTaskForAdoption.State -eq 'Running') {
+        Die "SYNAPSE_TASK_RUNNING_LIVE_ADOPTION_REREGISTER_UNSAFE task=$TaskName remediation=the installed binary is unchanged, but the existing scheduled task is already running; rerun setup during an explicit daemon maintenance window so the old task can be stopped before registration is replaced"
+    }
+    Info "Live daemon adoption enabled for unchanged SkipBuild binary; setup will not wait for bind release before starting the supervisor task."
+} else {
+    Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
+}
 $legacyLauncher = Join-Path $LogDir 'synapse-daemon-launch.cmd'
 $hiddenLauncher = Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'
 $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
