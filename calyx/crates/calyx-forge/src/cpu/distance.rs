@@ -38,6 +38,27 @@ pub fn l2_batch(query: &[f32], candidates: &[f32], dim: usize, out: &mut [f32]) 
     Ok(())
 }
 
+pub fn paired_cosine_batch(
+    left: &[f32],
+    right: &[f32],
+    pair_count: usize,
+    dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_paired("paired_cosine_batch", left, right, pair_count, dim, out)?;
+    for (pair_idx, score) in out.iter_mut().enumerate().take(pair_count) {
+        let left_row = candidate_row(left, dim, pair_idx);
+        let right_row = candidate_row(right, dim, pair_idx);
+        let (dot, left_norm_sq, right_norm_sq) = dot_and_pair_norms(left_row, right_row);
+        let left_norm = left_norm_sq.sqrt();
+        let right_norm = right_norm_sq.sqrt();
+        check_norm_positive(left_norm, "paired_cosine_batch", pair_idx)?;
+        check_norm_positive(right_norm, "paired_cosine_batch", pair_idx)?;
+        *score = dot / (left_norm * right_norm);
+    }
+    Ok(())
+}
+
 fn validate_batch(
     op: &'static str,
     query: &[f32],
@@ -49,6 +70,22 @@ fn validate_batch(
     check_shape_2d(candidates, out.len(), dim, "distance candidates")?;
     check_finite(query, op)?;
     check_finite(candidates, op)?;
+    Ok(())
+}
+
+fn validate_paired(
+    op: &'static str,
+    left: &[f32],
+    right: &[f32],
+    pair_count: usize,
+    dim: usize,
+    out: &[f32],
+) -> Result<()> {
+    check_shape_2d(left, pair_count, dim, "paired cosine left")?;
+    check_shape_2d(right, pair_count, dim, "paired cosine right")?;
+    check_shape_2d(out, pair_count, 1, "paired cosine output")?;
+    check_finite(left, op)?;
+    check_finite(right, op)?;
     Ok(())
 }
 
@@ -105,6 +142,18 @@ fn dot_and_norm(query: &[f32], candidate: &[f32]) -> (f32, f32) {
         offset += 1;
     }
     (dot_sum, norm_sum)
+}
+
+fn dot_and_pair_norms(left: &[f32], right: &[f32]) -> (f32, f32, f32) {
+    let mut dot_sum = 0.0;
+    let mut left_norm_sum = 0.0;
+    let mut right_norm_sum = 0.0;
+    for (left_value, right_value) in left.iter().zip(right) {
+        dot_sum += left_value * right_value;
+        left_norm_sum += left_value * left_value;
+        right_norm_sum += right_value * right_value;
+    }
+    (dot_sum, left_norm_sum, right_norm_sum)
 }
 
 fn l2_squared(query: &[f32], candidate: &[f32]) -> f32 {

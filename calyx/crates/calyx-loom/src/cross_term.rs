@@ -140,19 +140,41 @@ fn agreement_batch_cuda(pairs: &[(&[f32], &[f32])]) -> Result<Vec<f32>> {
             format!("Forge CUDA backend unavailable for Loom agreement: {err}"),
         )
     })?;
-    let mut out = Vec::with_capacity(pairs.len());
-    for (left, right) in pairs {
+    let dim = pairs[0].0.len();
+    let row_values = pairs.len().checked_mul(dim).ok_or_else(|| {
+        loom_error(
+            CALYX_LOOM_DIM_MISMATCH,
+            format!(
+                "agreement_batch_gpu shape overflows usize: pairs={} dim={dim}",
+                pairs.len()
+            ),
+        )
+    })?;
+    let mut left_rows = Vec::with_capacity(row_values);
+    let mut right_rows = Vec::with_capacity(row_values);
+    for (pair_idx, (left, right)) in pairs.iter().enumerate() {
         ensure_same_dim_finite(left, right)?;
-        let mut score = [0.0_f32];
-        backend
-            .cosine(left, right, left.len(), &mut score)
-            .map_err(|err| {
-                loom_error(
-                    CALYX_LOOM_FORGE_UNAVAILABLE,
-                    format!("Forge CUDA cosine failed for Loom agreement: {err}"),
-                )
-            })?;
-        out.push(score[0]);
+        if left.len() != dim {
+            return Err(loom_error(
+                CALYX_LOOM_DIM_MISMATCH,
+                format!(
+                    "agreement_batch_gpu requires one dim per batch; pair {pair_idx} has dim {}, first pair dim {dim}",
+                    left.len()
+                ),
+            ));
+        }
+        left_rows.extend_from_slice(left);
+        right_rows.extend_from_slice(right);
     }
+
+    let mut out = vec![0.0_f32; pairs.len()];
+    backend
+        .paired_cosine(&left_rows, &right_rows, pairs.len(), dim, &mut out)
+        .map_err(|err| {
+            loom_error(
+                CALYX_LOOM_FORGE_UNAVAILABLE,
+                format!("Forge CUDA paired cosine failed for Loom agreement: {err}"),
+            )
+        })?;
     Ok(out)
 }

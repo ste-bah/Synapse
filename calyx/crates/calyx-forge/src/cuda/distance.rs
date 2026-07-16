@@ -98,6 +98,18 @@ pub fn l2_batch_gpu(
     check_device_output(ctx, "l2_batch_gpu", out, false)
 }
 
+pub fn paired_cosine_gpu(
+    ctx: &CudaContext,
+    left: &CudaSlice<f32>,
+    right: &CudaSlice<f32>,
+    dim: usize,
+    pair_count: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    launch_paired_cosine(ctx, left, right, dim, pair_count, out)?;
+    check_device_output(ctx, "paired_cosine_gpu", out, true)
+}
+
 pub fn cosine_host(
     ctx: &CudaContext,
     query: &[f32],
@@ -147,6 +159,40 @@ pub fn l2_host(
         dim,
         out,
     )
+}
+
+pub fn paired_cosine_host(
+    ctx: &CudaContext,
+    left: &[f32],
+    right: &[f32],
+    pair_count: usize,
+    dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_paired_host_inputs(left, right, pair_count, dim, out)?;
+    out.fill(0.0);
+    if pair_count == 0 {
+        return Ok(());
+    }
+
+    let stream = ctx.inner().default_stream();
+    let left_dev = stream
+        .clone_htod(left)
+        .map_err(|err| device_unavailable(ctx, format!("paired cosine left copy failed: {err}")))?;
+    let right_dev = stream.clone_htod(right).map_err(|err| {
+        device_unavailable(ctx, format!("paired cosine right copy failed: {err}"))
+    })?;
+    let mut out_dev = stream.alloc_zeros(pair_count).map_err(|err| {
+        device_unavailable(
+            ctx,
+            format!("paired cosine output allocation failed: {err}"),
+        )
+    })?;
+
+    launch_paired_cosine(ctx, &left_dev, &right_dev, dim, pair_count, &mut out_dev)?;
+    let result = read_checked_device_output(ctx, "paired_cosine_gpu", &out_dev, true)?;
+    out.copy_from_slice(&result);
+    Ok(())
 }
 
 pub fn normalize_rows_gpu(
@@ -270,6 +316,54 @@ fn launch_distance(
     Ok(())
 }
 
+fn launch_paired_cosine(
+    ctx: &CudaContext,
+    left: &CudaSlice<f32>,
+    right: &CudaSlice<f32>,
+    dim: usize,
+    pair_count: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    check_device_shape(left.len(), pair_count, dim, "cuda paired cosine left")?;
+    check_device_shape(right.len(), pair_count, dim, "cuda paired cosine right")?;
+    check_device_shape(out.len(), pair_count, 1, "cuda paired cosine output")?;
+    if pair_count == 0 {
+        return Ok(());
+    }
+
+    let dim_i32 = to_i32(dim, "dim")?;
+    let pair_count_i32 = to_i32(pair_count, "pair_count")?;
+    let pair_count_u32 = u32::try_from(pair_count).map_err(|_| ForgeError::ShapeMismatch {
+        expected: vec![u32::MAX as usize],
+        got: vec![pair_count],
+        remediation: "cuda paired cosine pair_count exceeds grid dimension limit".to_string(),
+    })?;
+    let module = distance_module(ctx)?;
+    let func = ctx
+        .cached_function(&module, "distance.paired_cosine_f32", "paired_cosine_f32")
+        .map_err(|err| {
+            device_unavailable(ctx, format!("paired cosine load function failed: {err}"))
+        })?;
+    let stream = ctx.inner().default_stream();
+    let cfg = LaunchConfig {
+        grid_dim: (pair_count_u32, 1, 1),
+        block_dim: (BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launch = stream.launch_builder(func.as_ref());
+    unsafe {
+        launch
+            .arg(left)
+            .arg(right)
+            .arg(&dim_i32)
+            .arg(&pair_count_i32)
+            .arg(out)
+            .launch(cfg)
+    }
+    .map_err(|err| device_unavailable(ctx, format!("paired cosine kernel launch failed: {err}")))?;
+    Ok(())
+}
+
 fn launch_normalize(
     ctx: &CudaContext,
     vecs: &mut CudaSlice<f32>,
@@ -325,6 +419,7 @@ fn distance_cache_key(kernel_name: &'static str) -> &'static str {
         "cosine_batch_f32" => "distance.cosine_batch_f32",
         "dot_batch_f32" => "distance.dot_batch_f32",
         "l2_batch_f32" => "distance.l2_batch_f32",
+        "paired_cosine_f32" => "distance.paired_cosine_f32",
         _ => kernel_name,
     }
 }
@@ -376,6 +471,21 @@ fn validate_host_inputs(
     check_shape_2d(candidates, out.len(), dim, "cuda distance candidates")?;
     check_finite(query, op)?;
     check_finite(candidates, op)?;
+    Ok(())
+}
+
+fn validate_paired_host_inputs(
+    left: &[f32],
+    right: &[f32],
+    pair_count: usize,
+    dim: usize,
+    out: &[f32],
+) -> Result<()> {
+    check_shape_2d(left, pair_count, dim, "cuda paired cosine left")?;
+    check_shape_2d(right, pair_count, dim, "cuda paired cosine right")?;
+    check_shape_2d(out, pair_count, 1, "cuda paired cosine output")?;
+    check_finite(left, "paired_cosine_gpu")?;
+    check_finite(right, "paired_cosine_gpu")?;
     Ok(())
 }
 

@@ -29,7 +29,8 @@ pub use autotune::{
 };
 pub use backend::{
     Backend, BackendKind, BestConfig, CUDA_EXACT_TOPK_MAX_K, DeviceInfo,
-    FORGE_DEFERRED_BACKEND_OPS, FORGE_SHIPPED_BACKEND_OPS, Result,
+    FORGE_CPU_ROUTED_BACKEND_OPS, FORGE_DEFERRED_BACKEND_OPS, FORGE_SHIPPED_BACKEND_OPS, KnnBatch,
+    KnnMetric, Result,
 };
 pub use compression_report::{
     COMPRESSION_REPORT_SCHEMA_VERSION, CompressionReport, CompressionReportInput,

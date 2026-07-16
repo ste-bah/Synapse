@@ -79,7 +79,7 @@ The absorbed crates compile and their engines are real, but a working Synapse in
 | Windows has never carried a production workload | aster has `cfg(windows)` paths but no daemon soak; AV handles, long paths, lock semantics, sleep cycles untested | durability audit + crash-consistency soak (#1693) |
 | No structured-record ingestion | registry ingest paths are text/GDELT-shaped; no JSON-record → typed-fields → panel pipeline, no declarative field schemas | structured measurement pipeline (#1694) |
 | Encoder catalog mostly missing | `AlgorithmicEncoder` ships only ByteFeatures/Scalar/OneHot/AstStyle/SparseKeywords/TokenHash + GDELT; cyclic, scalar variants, multi-hot, record-vector, ordinal, binning, frequency, target/mean, lag/delta, interactions, aggregations, graph-structural do not exist | `Syn*` encoders as new calyx-registry code (#1663 + #1685) |
-| GPU coverage partial | `FORGE_DEFERRED_BACKEND_OPS = [knn, histogram_nmi, spmm_sparse_ops, bilinear_cross_term, graph_ops, colbert_maxsim]` — the ops assay/loom/search lean on | profile-driven implementation or measured CPU routing (#1695) |
+| GPU coverage partial | #1695 ships first-class `Backend::knn` and `Backend::paired_cosine` for Loom agreement batching; `FORGE_DEFERRED_BACKEND_OPS` now names only measured CPU-routed ops (`histogram_nmi`, `spmm_sparse_ops`, `graph_ops`, `colbert_maxsim`) | use the #1695 profile/routing contract; add more GPU ops only after a real Synapse profile proves CPU is the bottleneck |
 | No Synapse bridges | CALYX_* errors, config knobs, and clock injection are not wired to Synapse's error-code regime, config, or deterministic test clock | error/config/clock bridges (#1696) |
 
 ## 3. Domain → panel → anchor mapping (the atoms)

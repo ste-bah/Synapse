@@ -162,6 +162,62 @@ extern "C" __global__ __launch_bounds__(256) void l2_batch_f32(
     }
 }
 
+extern "C" __global__ __launch_bounds__(256) void paired_cosine_f32(
+    const float *left,
+    const float *right,
+    int dim,
+    int pair_count,
+    float *out) {
+    __shared__ float dot_shared[256];
+    __shared__ float norm_left_shared[256];
+    __shared__ float norm_right_shared[256];
+    __shared__ int bad_shared[256];
+
+    const int pair = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (pair >= pair_count) {
+        return;
+    }
+
+    float dot = 0.0f;
+    float norm_left = 0.0f;
+    float norm_right = 0.0f;
+    int bad = dim <= 0;
+    const int base = pair * dim;
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+        const float left_value = left[base + i];
+        const float right_value = right[base + i];
+        bad |= !finite2(left_value, right_value);
+        dot += left_value * right_value;
+        norm_left += left_value * left_value;
+        norm_right += right_value * right_value;
+    }
+
+    dot_shared[tid] = dot;
+    norm_left_shared[tid] = norm_left;
+    norm_right_shared[tid] = norm_right;
+    bad_shared[tid] = bad;
+    __syncthreads();
+
+    reduce_sums(dot_shared, norm_left_shared, bad_shared, tid);
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            norm_right_shared[tid] += norm_right_shared[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float denom = sqrtf(norm_left_shared[0]) * sqrtf(norm_right_shared[0]);
+        if (bad_shared[0]) {
+            out[pair] = NAN;
+        } else {
+            out[pair] = denom > 0.0f ? dot_shared[0] / denom : -2.0f;
+        }
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void normalize_rows_f32(
     float *vecs,
     int dim,
