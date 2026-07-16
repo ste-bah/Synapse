@@ -1341,36 +1341,253 @@ function Set-SynapseAutomationEditValue {
     }
 }
 
-function Set-SynapseChromeAddressBarUrl {
+function Read-SynapseForegroundWindow {
+    Initialize-SynapseChromeBridgeAutoInstallInterop
+    $foregroundHwnd = [SynapseChromeBridgeAutoInstall.Win32]::GetForegroundWindow().ToInt64()
+    if ($foregroundHwnd -eq 0) {
+        return [pscustomobject]@{
+            hwnd = 0
+            pid = 0
+            title = '<none>'
+            class_name = '<none>'
+        }
+    }
+
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $children = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Children,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+        foreach ($child in $children) {
+            $current = $child.Current
+            if ([int64]$current.NativeWindowHandle -ne $foregroundHwnd) {
+                continue
+            }
+            return [pscustomobject]@{
+                hwnd = $foregroundHwnd
+                pid = [int]$current.ProcessId
+                title = [string]$current.Name
+                class_name = [string]$current.ClassName
+            }
+        }
+    } catch {
+        return [pscustomobject]@{
+            hwnd = $foregroundHwnd
+            pid = 0
+            title = '<uia-read-failed>'
+            class_name = $_.Exception.Message
+        }
+    }
+
+    [pscustomobject]@{
+        hwnd = $foregroundHwnd
+        pid = 0
+        title = '<not-found>'
+        class_name = '<not-found>'
+    }
+}
+
+function Read-SynapseChromeAddressBarValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window
+    )
+
+    try {
+        $addressBar = Find-SynapseAutomationElementByName `
+            -Root $Window.element `
+            -Name 'Address and search bar' `
+            -ControlType ([System.Windows.Automation.ControlType]::Edit)
+        if (-not $addressBar) {
+            return [pscustomobject]@{
+                present = $false
+                value = $null
+                error = 'address_bar_not_found'
+            }
+        }
+        $valuePattern = $addressBar.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        [pscustomobject]@{
+            present = $true
+            value = [string]$valuePattern.Current.Value
+            error = $null
+        }
+    } catch {
+        [pscustomobject]@{
+            present = $false
+            value = $null
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Read-SynapseChromeNavigationState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int64]$Hwnd,
+        [AllowNull()]
+        [string]$ChromeUserDataRoot
+    )
+
+    $windows = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
+        $_.hwnd -eq $Hwnd
+    } | Select-Object -First 1)
+    if ($windows.Count -eq 0) {
+        return [pscustomobject]@{
+            hwnd = $Hwnd
+            pid = 0
+            title = '<missing>'
+            address_bar_present = $false
+            address_bar_value = $null
+            address_bar_error = 'window_not_found'
+        }
+    }
+
+    $address = Read-SynapseChromeAddressBarValue -Window $windows[0]
+    [pscustomobject]@{
+        hwnd = [int64]$windows[0].hwnd
+        pid = [int]$windows[0].pid
+        title = [string]$windows[0].title
+        address_bar_present = [bool]$address.present
+        address_bar_value = $address.value
+        address_bar_error = $address.error
+    }
+}
+
+function Invoke-SynapseChromeAddressBarNavigation {
     param(
         [Parameter(Mandatory = $true)]
         $Window,
+        [AllowNull()]
+        [string]$ChromeUserDataRoot,
         [Parameter(Mandatory = $true)]
-        [string]$Url
+        [string]$Url,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedTitlePattern,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Deadline,
+        [Parameter(Mandatory = $true)]
+        [string]$Purpose
     )
 
-    $addressBar = Find-SynapseAutomationElementByName `
-        -Root $Window.element `
-        -Name 'Address and search bar' `
-        -ControlType ([System.Windows.Automation.ControlType]::Edit)
-    if (-not $addressBar) {
-        throw "SYNAPSE_CHROME_ADDRESS_BAR_NOT_FOUND chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) title=$($Window.title) remediation=Chrome did not expose the address bar through UI Automation; setup refuses clipboard/key-only navigation or launching another Chrome profile"
+    $before = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
+    $foregroundBefore = Read-SynapseForegroundWindow
+    $showResult = [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$Window.hwnd, 9)
+    $setForegroundResult = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$Window.hwnd)
+    $foregroundDeadline = (Get-Date).AddSeconds(5)
+    if ($foregroundDeadline -gt $Deadline) {
+        $foregroundDeadline = $Deadline
+    }
+    $foregroundAcquired = Wait-SynapseUntil -Deadline $foregroundDeadline -SleepMilliseconds 100 -Probe {
+        $foregroundNow = Read-SynapseForegroundWindow
+        if ($foregroundNow.hwnd -eq [int64]$Window.hwnd) {
+            return $foregroundNow
+        }
+        return $null
+    }
+    if (-not $foregroundAcquired) {
+        $foregroundAfter = Read-SynapseForegroundWindow
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            purpose = $Purpose
+            target_url = $Url
+            chrome_window_hwnd = $Window.hwnd
+            chrome_window_pid = $Window.pid
+            show_window_async_result = [bool]$showResult
+            set_foreground_window_result = [bool]$setForegroundResult
+            foreground_before = $foregroundBefore
+            foreground_after = $foregroundAfter
+            navigation_before = $before
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target; setup refuses to send browser navigation keys to an unverified foreground window"
     }
 
+    $previousClipboardText = $null
+    $restoreClipboard = $false
     try {
-        $addressBar.SetFocus()
+        try {
+            $previousClipboardText = Get-Clipboard -Raw -ErrorAction Stop
+            $restoreClipboard = $true
+        } catch {
+            $restoreClipboard = $false
+        }
+        Set-Clipboard -Value $Url
+        Send-SynapseNativeKeyTap -VirtualKey 0x1B
+        Start-Sleep -Milliseconds 200
+        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x4C))
+        Start-Sleep -Milliseconds 250
+        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x56))
+        Start-Sleep -Milliseconds 250
+        Send-SynapseNativeKeyTap -VirtualKey 0x0D
     } catch {
-        throw "SYNAPSE_CHROME_ADDRESS_BAR_FOCUS_FAILED chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) error=$($_.Exception.Message) remediation=repair the existing Chrome window focus/UIA state before bridge UI repair"
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            purpose = $Purpose
+            target_url = $Url
+            chrome_window_hwnd = $Window.hwnd
+            chrome_window_pid = $Window.pid
+            foreground_acquired = $foregroundAcquired
+            navigation_before = $before
+            error = $_.Exception.Message
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_NAVIGATION_KEY_INPUT_FAILED detail=$detail remediation=Chrome navigation input failed after foreground readback; inspect clipboard and keyboard-input availability before retrying setup"
+    } finally {
+        if ($restoreClipboard) {
+            try {
+                Set-Clipboard -Value $previousClipboardText
+            } catch {
+                $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                    purpose = $Purpose
+                    target_url = $Url
+                    chrome_window_hwnd = $Window.hwnd
+                    chrome_window_pid = $Window.pid
+                    error = $_.Exception.Message
+                }) -Depth 8
+                throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_RESTORE_FAILED detail=$detail remediation=setup changed the clipboard for Chrome address-bar navigation but could not restore the prior clipboard text"
+            }
+        }
     }
-    Start-Sleep -Milliseconds 100
-    try {
-        $valuePattern = $addressBar.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-        $valuePattern.SetValue($Url)
-    } catch {
-        throw "SYNAPSE_CHROME_ADDRESS_BAR_SET_VALUE_FAILED chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) url=$Url error=$($_.Exception.Message) remediation=Chrome address bar did not accept UIA ValuePattern input; setup refuses to navigate by arbitrary coordinate clicks"
+
+    $after = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 250 -Probe {
+        $state = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
+        $titleMatches = $state.title -match $ExpectedTitlePattern
+        $addressMatches = $false
+        if (-not [string]::IsNullOrWhiteSpace([string]$state.address_bar_value)) {
+            $addressMatches = [string]$state.address_bar_value -like "$Url*"
+        }
+        if ($titleMatches -or $addressMatches) {
+            return $state
+        }
+        return $null
     }
-    Start-Sleep -Milliseconds 100
-    Send-SynapseNativeKeyTap -VirtualKey 0x0D
+    if (-not $after) {
+        $latest = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
+        $foregroundAfter = Read-SynapseForegroundWindow
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            purpose = $Purpose
+            target_url = $Url
+            expected_title_pattern = $ExpectedTitlePattern
+            chrome_window_hwnd = $Window.hwnd
+            chrome_window_pid = $Window.pid
+            foreground_before = $foregroundBefore
+            foreground_acquired = $foregroundAcquired
+            foreground_after = $foregroundAfter
+            navigation_before = $before
+            navigation_after = $latest
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_NAVIGATION_NOT_CONFIRMED detail=$detail remediation=Chrome did not visibly reach the requested internal page after verified foreground keyboard navigation; setup refuses to search extension controls on a stale page"
+    }
+
+    [pscustomobject]@{
+        method = 'foreground_ctrl_l_clipboard_enter'
+        purpose = $Purpose
+        target_url = $Url
+        expected_title_pattern = $ExpectedTitlePattern
+        show_window_async_result = [bool]$showResult
+        set_foreground_window_result = [bool]$setForegroundResult
+        foreground_before = $foregroundBefore
+        foreground_acquired = $foregroundAcquired
+        before = $before
+        after = $after
+    }
 }
 
 function Send-SynapseNativeKeyDown {
@@ -1540,13 +1757,14 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
     }
 
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
-    [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 9) | Out-Null
-    [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
-    Start-Sleep -Milliseconds 300
 
-    Set-SynapseChromeAddressBarUrl `
+    $navigation = Invoke-SynapseChromeAddressBarNavigation `
         -Window $chromeWindow `
-        -Url "chrome://extensions/?id=$ExtensionId"
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -Url "chrome://extensions/?id=$ExtensionId" `
+        -ExpectedTitlePattern '^Extensions( - Synapse Chrome Bridge)?( - Google Chrome)?$' `
+        -Deadline $deadline `
+        -Purpose 'existing_bridge_extension_details'
 
     $details = Wait-SynapseUntil -Deadline $deadline -Probe {
         $currentWindow = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
@@ -1571,7 +1789,8 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
     if (-not $details) {
         $latestWindow = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
         $latestTitle = if ($latestWindow) { [string]$latestWindow.title } else { '<missing>' }
-        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_BUTTON_NOT_FOUND active_profile=$ActiveProfile timeout_s=$TimeoutSeconds chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) latest_title=$latestTitle user_data_dir=$($chromeWindow.chrome_user_data_dir) match_reason=$($chromeWindow.chrome_profile_match_reason) remediation=Chrome did not expose the Synapse extension details Reload button through UI Automation; setup refuses to click arbitrary browser coordinates or launch another Chrome profile"
+        $navigationReadback = ConvertTo-CompressedJson -Value $navigation -Depth 10
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_BUTTON_NOT_FOUND active_profile=$ActiveProfile timeout_s=$TimeoutSeconds chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) latest_title=$latestTitle user_data_dir=$($chromeWindow.chrome_user_data_dir) match_reason=$($chromeWindow.chrome_profile_match_reason) navigation=$navigationReadback remediation=Chrome reached the extension details page but did not expose the Synapse extension details Reload button through UI Automation; setup refuses to click arbitrary browser coordinates or launch another Chrome profile"
     }
 
     if (-not $details.ui_before.enable_toggle_present -or -not $details.ui_before.enable_toggle_on) {
@@ -1610,6 +1829,7 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
         chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
         chrome_window_profile_match_reason = $chromeWindow.chrome_profile_match_reason
         extension_details_url = "chrome://extensions/?id=$ExtensionId"
+        navigation = $navigation
         ui_before = $details.ui_before
         ui_after = $uiAfter
         before = $Before
@@ -1702,132 +1922,114 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_NO_ELIGIBLE_CHROME_WINDOW active_profile=$activeProfile user_data_root=$ChromeUserDataRoot rejected_windows=$rejected remediation=open the already-authenticated Chrome profile for this user-data root; setup refuses to drive ms-playwright-mcp, remote-debugging, unreadable, or other dedicated Chrome user-data-dir windows"
     }
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
-    [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 5) | Out-Null
-    [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
-    Start-Sleep -Milliseconds 300
 
-    $previousClipboardText = $null
-    $restoreClipboard = $false
-    try {
-        try {
-            $previousClipboardText = Get-Clipboard -Raw -ErrorAction Stop
-            $restoreClipboard = $true
-        } catch {
-            $restoreClipboard = $false
-        }
-        Set-Clipboard -Value 'chrome://extensions'
-        Send-SynapseNativeKeyTap -VirtualKey 0x1B
-        Start-Sleep -Milliseconds 200
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x4C))
-        Start-Sleep -Milliseconds 250
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x56))
-        Start-Sleep -Milliseconds 250
-        Send-SynapseNativeKeyTap -VirtualKey 0x0D
+    $navigation = Invoke-SynapseChromeAddressBarNavigation `
+        -Window $chromeWindow `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -Url 'chrome://extensions' `
+        -ExpectedTitlePattern '^Extensions( - Google Chrome)?$' `
+        -Deadline $deadline `
+        -Purpose 'load_unpacked_extensions_page'
 
-        $loadUnpacked = Wait-SynapseUntil -Deadline $deadline -Probe {
-            $currentWindow = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
-                $_.hwnd -eq $chromeWindow.hwnd
-            } | Select-Object -First 1)
-            if ($currentWindow.Count -eq 0) {
-                return $null
-            }
-            if ($currentWindow[0].title -notmatch '^Extensions( - Google Chrome)?$') {
-                return $null
-            }
-            $button = Find-SynapseAutomationElementByName `
-                -Root $currentWindow[0].element `
-                -Name 'Load unpacked' `
-                -ControlType ([System.Windows.Automation.ControlType]::Button)
-            if ($button) {
-                return [pscustomobject]@{ window = $currentWindow[0]; button = $button }
-            }
-            $developerMode = Find-SynapseAutomationElementByName `
-                -Root $currentWindow[0].element `
-                -Name 'Developer mode' `
-                -ControlType $null
-            if ($developerMode) {
-                try {
-                    Invoke-SynapseAutomationElement -Element $developerMode -Description 'Developer mode'
-                } catch { }
-            }
+    $loadUnpacked = Wait-SynapseUntil -Deadline $deadline -Probe {
+        $currentWindow = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
+            $_.hwnd -eq $chromeWindow.hwnd
+        } | Select-Object -First 1)
+        if ($currentWindow.Count -eq 0) {
             return $null
         }
-        if (-not $loadUnpacked) {
-            $latestWindow = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
-            $latestTitle = if ($latestWindow) { [string]$latestWindow.title } else { '<missing>' }
-            throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_LOAD_UNPACKED_NOT_FOUND active_profile=$activeProfile timeout_s=$TimeoutSeconds chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) latest_title=$latestTitle user_data_dir=$($chromeWindow.chrome_user_data_dir) match_reason=$($chromeWindow.chrome_profile_match_reason) remediation=Chrome did not confirm chrome://extensions and expose the Load unpacked button in the selected active-profile window; setup refuses to hunt controls in any other Chrome window"
+        if ($currentWindow[0].title -notmatch '^Extensions( - Google Chrome)?$') {
+            return $null
         }
-        Invoke-SynapseAutomationElement -Element $loadUnpacked.button -Description 'Load unpacked'
-
-        $dialog = Wait-SynapseUntil -Deadline $deadline -Probe {
-            Find-SynapseChromeFolderDialog -ChromeWindowHwnd $chromeWindow.hwnd -ChromeWindowPid $chromeWindow.pid
-        }
-        if (-not $dialog) {
-            throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_FOLDER_DIALOG_NOT_FOUND active_profile=$activeProfile timeout_s=$TimeoutSeconds remediation=Chrome did not open the folder picker after Load unpacked"
-        }
-        [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$dialog.hwnd) | Out-Null
-        Start-Sleep -Milliseconds 200
-        $folderEdit = Find-SynapseAutomationElementByName `
-            -Root $dialog.element `
-            -Name 'Folder:' `
-            -ControlType ([System.Windows.Automation.ControlType]::Edit)
-        if (-not $folderEdit) {
-            throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_FOLDER_FIELD_NOT_FOUND active_profile=$activeProfile dialog_hwnd=$($dialog.hwnd) remediation=folder picker did not expose the Folder field through UI Automation"
-        }
-        Set-SynapseAutomationEditValue -Element $folderEdit -Value $ExtensionDir -Description 'Folder:'
-        Start-Sleep -Milliseconds 200
-        $selectFolder = Find-SynapseAutomationElementByName `
-            -Root $dialog.element `
-            -Name 'Select Folder' `
+        $button = Find-SynapseAutomationElementByName `
+            -Root $currentWindow[0].element `
+            -Name 'Load unpacked' `
             -ControlType ([System.Windows.Automation.ControlType]::Button)
-        if (-not $selectFolder) {
-            throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_SELECT_FOLDER_NOT_FOUND active_profile=$activeProfile dialog_hwnd=$($dialog.hwnd) remediation=folder picker did not expose Select Folder through UI Automation"
+        if ($button) {
+            return [pscustomobject]@{ window = $currentWindow[0]; button = $button }
         }
-        Invoke-SynapseAutomationElement -Element $selectFolder -Description 'Select Folder'
-
-        $after = Wait-SynapseUntil -Deadline $deadline -Probe {
-            $row = Test-SynapseChromeBridgeProfileRow `
-                -ChromeUserDataRoot $ChromeUserDataRoot `
-                -ProfileName $activeProfile `
-                -ExtensionId $ExtensionId `
-                -ExtensionDir $ExtensionDir
-            if ($row.installed -and $row.manifest_path_matches) {
-                return $row
-            }
-            return $null
-        }
-        if (-not $after) {
-            $latest = Test-SynapseChromeBridgeProfileRow `
-                -ChromeUserDataRoot $ChromeUserDataRoot `
-                -ProfileName $activeProfile `
-                -ExtensionId $ExtensionId `
-                -ExtensionDir $ExtensionDir
-            throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_PROFILE_ROW_MISSING active_profile=$activeProfile timeout_s=$TimeoutSeconds installed=$($latest.installed) manifest_path=$($latest.manifest_path) expected_path=$ExtensionDir remediation=Chrome did not persist the Synapse unpacked extension row after Select Folder"
-        }
-        $installReason = if ($before.installed -and -not $before.manifest_path_matches) {
-            'migrated_existing_extension_to_credentialed_stable_path'
-        } else {
-            'installed_unpacked_extension_in_active_profile'
-        }
-        return [pscustomobject]@{
-            attempted = $true
-            changed = $true
-            reason = $installReason
-            active_profile = $activeProfile
-            chrome_window_hwnd = $chromeWindow.hwnd
-            chrome_window_pid = $chromeWindow.pid
-            chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
-            chrome_window_profile_match_reason = $chromeWindow.chrome_profile_match_reason
-            folder_dialog_hwnd = $dialog.hwnd
-            before = $before
-            after = $after
-        }
-    } finally {
-        if ($restoreClipboard) {
+        $developerMode = Find-SynapseAutomationElementByName `
+            -Root $currentWindow[0].element `
+            -Name 'Developer mode' `
+            -ControlType $null
+        if ($developerMode) {
             try {
-                Set-Clipboard -Value $previousClipboardText
+                Invoke-SynapseAutomationElement -Element $developerMode -Description 'Developer mode'
             } catch { }
         }
+        return $null
+    }
+    if (-not $loadUnpacked) {
+        $latestWindow = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+        $latestTitle = if ($latestWindow) { [string]$latestWindow.title } else { '<missing>' }
+        $navigationReadback = ConvertTo-CompressedJson -Value $navigation -Depth 10
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_LOAD_UNPACKED_NOT_FOUND active_profile=$activeProfile timeout_s=$TimeoutSeconds chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) latest_title=$latestTitle user_data_dir=$($chromeWindow.chrome_user_data_dir) match_reason=$($chromeWindow.chrome_profile_match_reason) navigation=$navigationReadback remediation=Chrome reached chrome://extensions but did not expose the Load unpacked button in the selected active-profile window; setup refuses to hunt controls in any other Chrome window"
+    }
+    Invoke-SynapseAutomationElement -Element $loadUnpacked.button -Description 'Load unpacked'
+
+    $dialog = Wait-SynapseUntil -Deadline $deadline -Probe {
+        Find-SynapseChromeFolderDialog -ChromeWindowHwnd $chromeWindow.hwnd -ChromeWindowPid $chromeWindow.pid
+    }
+    if (-not $dialog) {
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_FOLDER_DIALOG_NOT_FOUND active_profile=$activeProfile timeout_s=$TimeoutSeconds remediation=Chrome did not open the folder picker after Load unpacked"
+    }
+    [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$dialog.hwnd) | Out-Null
+    Start-Sleep -Milliseconds 200
+    $folderEdit = Find-SynapseAutomationElementByName `
+        -Root $dialog.element `
+        -Name 'Folder:' `
+        -ControlType ([System.Windows.Automation.ControlType]::Edit)
+    if (-not $folderEdit) {
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_FOLDER_FIELD_NOT_FOUND active_profile=$activeProfile dialog_hwnd=$($dialog.hwnd) remediation=folder picker did not expose the Folder field through UI Automation"
+    }
+    Set-SynapseAutomationEditValue -Element $folderEdit -Value $ExtensionDir -Description 'Folder:'
+    Start-Sleep -Milliseconds 200
+    $selectFolder = Find-SynapseAutomationElementByName `
+        -Root $dialog.element `
+        -Name 'Select Folder' `
+        -ControlType ([System.Windows.Automation.ControlType]::Button)
+    if (-not $selectFolder) {
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_SELECT_FOLDER_NOT_FOUND active_profile=$activeProfile dialog_hwnd=$($dialog.hwnd) remediation=folder picker did not expose Select Folder through UI Automation"
+    }
+    Invoke-SynapseAutomationElement -Element $selectFolder -Description 'Select Folder'
+
+    $after = Wait-SynapseUntil -Deadline $deadline -Probe {
+        $row = Test-SynapseChromeBridgeProfileRow `
+            -ChromeUserDataRoot $ChromeUserDataRoot `
+            -ProfileName $activeProfile `
+            -ExtensionId $ExtensionId `
+            -ExtensionDir $ExtensionDir
+        if ($row.installed -and $row.manifest_path_matches) {
+            return $row
+        }
+        return $null
+    }
+    if (-not $after) {
+        $latest = Test-SynapseChromeBridgeProfileRow `
+            -ChromeUserDataRoot $ChromeUserDataRoot `
+            -ProfileName $activeProfile `
+            -ExtensionId $ExtensionId `
+            -ExtensionDir $ExtensionDir
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_PROFILE_ROW_MISSING active_profile=$activeProfile timeout_s=$TimeoutSeconds installed=$($latest.installed) manifest_path=$($latest.manifest_path) expected_path=$ExtensionDir remediation=Chrome did not persist the Synapse unpacked extension row after Select Folder"
+    }
+    $installReason = if ($before.installed -and -not $before.manifest_path_matches) {
+        'migrated_existing_extension_to_credentialed_stable_path'
+    } else {
+        'installed_unpacked_extension_in_active_profile'
+    }
+    return [pscustomobject]@{
+        attempted = $true
+        changed = $true
+        reason = $installReason
+        active_profile = $activeProfile
+        chrome_window_hwnd = $chromeWindow.hwnd
+        chrome_window_pid = $chromeWindow.pid
+        chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
+        chrome_window_profile_match_reason = $chromeWindow.chrome_profile_match_reason
+        folder_dialog_hwnd = $dialog.hwnd
+        navigation = $navigation
+        before = $before
+        after = $after
     }
 }
 
