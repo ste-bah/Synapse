@@ -713,13 +713,61 @@ using System;
 using System.Runtime.InteropServices;
 
 namespace SynapseChromeBridgeAutoInstall {
+    public sealed class ForegroundAttachAttemptResult {
+        public uint CurrentThread { get; set; }
+        public uint TargetThread { get; set; }
+        public uint TargetPid { get; set; }
+        public uint ForegroundThread { get; set; }
+        public uint ForegroundPid { get; set; }
+        public bool AttachedTarget { get; set; }
+        public bool AttachedForeground { get; set; }
+        public bool BringWindowToTopResult { get; set; }
+        public bool SetForegroundWindowResult { get; set; }
+        public long SetFocusResultHwnd { get; set; }
+    }
+
     public static class Win32 {
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
         [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+        public static ForegroundAttachAttemptResult AttachThreadInputBringToTopSetForeground(IntPtr targetHwnd, IntPtr foregroundHwnd) {
+            ForegroundAttachAttemptResult result = new ForegroundAttachAttemptResult();
+            result.TargetThread = GetWindowThreadProcessId(targetHwnd, out uint targetPid);
+            result.TargetPid = targetPid;
+            if (foregroundHwnd != IntPtr.Zero) {
+                result.ForegroundThread = GetWindowThreadProcessId(foregroundHwnd, out uint foregroundPid);
+                result.ForegroundPid = foregroundPid;
+            }
+            result.CurrentThread = GetCurrentThreadId();
+            try {
+                if (result.TargetThread != 0 && result.TargetThread != result.CurrentThread) {
+                    result.AttachedTarget = AttachThreadInput(result.CurrentThread, result.TargetThread, true);
+                }
+                if (result.ForegroundThread != 0 && result.ForegroundThread != result.CurrentThread && result.ForegroundThread != result.TargetThread) {
+                    result.AttachedForeground = AttachThreadInput(result.CurrentThread, result.ForegroundThread, true);
+                }
+                result.BringWindowToTopResult = BringWindowToTop(targetHwnd);
+                result.SetForegroundWindowResult = SetForegroundWindow(targetHwnd);
+                result.SetFocusResultHwnd = SetFocus(targetHwnd).ToInt64();
+            } finally {
+                if (result.AttachedForeground) {
+                    AttachThreadInput(result.CurrentThread, result.ForegroundThread, false);
+                }
+                if (result.AttachedTarget) {
+                    AttachThreadInput(result.CurrentThread, result.TargetThread, false);
+                }
+            }
+            return result;
+        }
     }
 }
 '@ -ErrorAction Stop
@@ -1454,6 +1502,162 @@ function Read-SynapseChromeNavigationState {
     }
 }
 
+function Wait-SynapseChromeForegroundReadback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int64]$TargetHwnd,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Deadline,
+        [Parameter(Mandatory = $true)]
+        [int]$MaxWaitMilliseconds
+    )
+
+    $waitDeadline = (Get-Date).AddMilliseconds($MaxWaitMilliseconds)
+    if ($waitDeadline -gt $Deadline) {
+        $waitDeadline = $Deadline
+    }
+    do {
+        $foregroundNow = Read-SynapseForegroundWindow
+        if ($foregroundNow.hwnd -eq $TargetHwnd) {
+            return $foregroundNow
+        }
+        if ((Get-Date) -ge $waitDeadline) {
+            return $null
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+}
+
+function Wait-SynapseChromeForegroundAcquisition {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Deadline
+    )
+
+    $stage = 'initializing'
+    try {
+        $stage = 'convert_target_hwnd'
+        $targetHwnd = [IntPtr]$Window.hwnd
+        $targetHwndInt = [int64]$Window.hwnd
+        $attempts = New-Object System.Collections.Generic.List[object]
+        $stage = 'show_window_async'
+        $showResult = [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync($targetHwnd, 9)
+
+        $stage = 'initial_set_foreground'
+        $initialSetForeground = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow($targetHwnd)
+        $stage = 'record_initial_attempt'
+        $attempts.Add([pscustomobject]@{
+            method = 'show_window_async_set_foreground'
+            show_window_async_result = [bool]$showResult
+            set_foreground_window_result = [bool]$initialSetForeground
+            foreground_after = Read-SynapseForegroundWindow
+        }) | Out-Null
+        $stage = 'wait_initial_foreground'
+        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 900
+        if ($acquired) {
+            return [pscustomobject]@{
+                acquired = $true
+                method = 'show_window_async_set_foreground'
+                show_window_async_result = [bool]$showResult
+                initial_set_foreground_window_result = [bool]$initialSetForeground
+                attempts = @($attempts.ToArray())
+                foreground = $acquired
+            }
+        }
+
+        $stage = 'read_foreground_before_attach'
+        $foregroundBeforeAttach = Read-SynapseForegroundWindow
+        $foregroundHwnd = [IntPtr]::Zero
+        if ($foregroundBeforeAttach.hwnd -ne 0) {
+            $stage = 'convert_foreground_hwnd'
+            $foregroundHwnd = [IntPtr]$foregroundBeforeAttach.hwnd
+        }
+        $stage = 'attach_thread_input_set_foreground'
+        $nativeAttempt = [SynapseChromeBridgeAutoInstall.Win32]::AttachThreadInputBringToTopSetForeground(
+            $targetHwnd,
+            $foregroundHwnd
+        )
+        $stage = 'record_attach_attempt'
+        $attempts.Add([pscustomobject]@{
+            method = 'attach_thread_input_bring_to_top_set_foreground'
+            current_thread = [uint32]$nativeAttempt.CurrentThread
+            target_thread = [uint32]$nativeAttempt.TargetThread
+            target_pid = [uint32]$nativeAttempt.TargetPid
+            foreground_thread = [uint32]$nativeAttempt.ForegroundThread
+            foreground_pid = [uint32]$nativeAttempt.ForegroundPid
+            attached_target = [bool]$nativeAttempt.AttachedTarget
+            attached_foreground = [bool]$nativeAttempt.AttachedForeground
+            bring_window_to_top_result = [bool]$nativeAttempt.BringWindowToTopResult
+            set_foreground_window_result = [bool]$nativeAttempt.SetForegroundWindowResult
+            set_focus_result_hwnd = [int64]$nativeAttempt.SetFocusResultHwnd
+            foreground_before = $foregroundBeforeAttach
+            foreground_after = Read-SynapseForegroundWindow
+        }) | Out-Null
+        $stage = 'wait_attach_foreground'
+        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 1200
+        if ($acquired) {
+            return [pscustomobject]@{
+                acquired = $true
+                method = 'attach_thread_input_bring_to_top_set_foreground'
+                show_window_async_result = [bool]$showResult
+                initial_set_foreground_window_result = [bool]$initialSetForeground
+                attempts = @($attempts.ToArray())
+                foreground = $acquired
+            }
+        }
+
+        $stage = 'alt_unlock_key'
+        Send-SynapseNativeKeyTap -VirtualKey 0x12
+        Start-Sleep -Milliseconds 80
+        $stage = 'alt_unlock_set_foreground'
+        $altUnlockSetForeground = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow($targetHwnd)
+        $stage = 'record_alt_attempt'
+        $attempts.Add([pscustomobject]@{
+            method = 'alt_key_foreground_unlock_set_foreground'
+            set_foreground_window_result = [bool]$altUnlockSetForeground
+            foreground_after = Read-SynapseForegroundWindow
+        }) | Out-Null
+        $stage = 'wait_alt_foreground'
+        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 1500
+        if ($acquired) {
+            return [pscustomobject]@{
+                acquired = $true
+                method = 'alt_key_foreground_unlock_set_foreground'
+                show_window_async_result = [bool]$showResult
+                initial_set_foreground_window_result = [bool]$initialSetForeground
+                attempts = @($attempts.ToArray())
+                foreground = $acquired
+            }
+        }
+
+        [pscustomobject]@{
+            acquired = $false
+            method = 'unacquired'
+            show_window_async_result = [bool]$showResult
+            initial_set_foreground_window_result = [bool]$initialSetForeground
+            attempts = @($attempts.ToArray())
+            foreground = $null
+        }
+    } catch {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            stage = $stage
+            exception_type = $_.Exception.GetType().FullName
+            error = $_.Exception.Message
+            inner_error = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $null }
+            invocation = if ($_.InvocationInfo) { $_.InvocationInfo.PositionMessage } else { $null }
+            script_stack_trace = $_.ScriptStackTrace
+            target_hwnd = $Window.hwnd
+            target_hwnd_type = if ($null -ne $Window.hwnd) { $Window.hwnd.GetType().FullName } else { '<null>' }
+            target_pid = $Window.pid
+            target_title = $Window.title
+            foreground_now = Read-SynapseForegroundWindow
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_FOREGROUND_ACQUISITION_FAILED detail=$detail remediation=fix the typed Win32 foreground acquisition stage named in detail; setup refuses to send Chrome navigation keys without a separately verified foreground readback"
+    }
+}
+
 function Invoke-SynapseChromeAddressBarNavigation {
     param(
         [Parameter(Mandatory = $true)]
@@ -1472,33 +1676,27 @@ function Invoke-SynapseChromeAddressBarNavigation {
 
     $before = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
     $foregroundBefore = Read-SynapseForegroundWindow
-    $showResult = [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$Window.hwnd, 9)
-    $setForegroundResult = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$Window.hwnd)
     $foregroundDeadline = (Get-Date).AddSeconds(5)
     if ($foregroundDeadline -gt $Deadline) {
         $foregroundDeadline = $Deadline
     }
-    $foregroundAcquired = Wait-SynapseUntil -Deadline $foregroundDeadline -SleepMilliseconds 100 -Probe {
-        $foregroundNow = Read-SynapseForegroundWindow
-        if ($foregroundNow.hwnd -eq [int64]$Window.hwnd) {
-            return $foregroundNow
-        }
-        return $null
-    }
-    if (-not $foregroundAcquired) {
+    $foregroundReadback = Wait-SynapseChromeForegroundAcquisition -Window $Window -Deadline $foregroundDeadline
+    $foregroundAcquired = $foregroundReadback.foreground
+    if (-not $foregroundReadback.acquired) {
         $foregroundAfter = Read-SynapseForegroundWindow
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             purpose = $Purpose
             target_url = $Url
             chrome_window_hwnd = $Window.hwnd
             chrome_window_pid = $Window.pid
-            show_window_async_result = [bool]$showResult
-            set_foreground_window_result = [bool]$setForegroundResult
+            show_window_async_result = [bool]$foregroundReadback.show_window_async_result
+            set_foreground_window_result = [bool]$foregroundReadback.initial_set_foreground_window_result
+            foreground_acquisition = $foregroundReadback
             foreground_before = $foregroundBefore
             foreground_after = $foregroundAfter
             navigation_before = $before
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target; setup refuses to send browser navigation keys to an unverified foreground window"
+        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target after ordinary, attached-thread, and Alt-unlock foreground attempts; setup refuses to send browser navigation keys to an unverified foreground window"
     }
 
     $previousClipboardText = $null
@@ -1581,8 +1779,9 @@ function Invoke-SynapseChromeAddressBarNavigation {
         purpose = $Purpose
         target_url = $Url
         expected_title_pattern = $ExpectedTitlePattern
-        show_window_async_result = [bool]$showResult
-        set_foreground_window_result = [bool]$setForegroundResult
+        show_window_async_result = [bool]$foregroundReadback.show_window_async_result
+        set_foreground_window_result = [bool]$foregroundReadback.initial_set_foreground_window_result
+        foreground_acquisition = $foregroundReadback
         foreground_before = $foregroundBefore
         foreground_acquired = $foregroundAcquired
         before = $before
