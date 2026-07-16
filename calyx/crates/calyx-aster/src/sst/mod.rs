@@ -11,13 +11,9 @@ mod point_read;
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
 use calyx_core::{CalyxError, Result};
-use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use io_helpers::{record_crc, section_crc, storage_error, sync_parent};
+use io_helpers::{record_crc, section_crc};
 pub(crate) use point_read::{SstPointReader, SstStreamingReader};
 
 const MAGIC: &[u8; 4] = b"CXS1";
@@ -26,7 +22,6 @@ const VERSION: u32 = 2;
 const HEADER_LEN: usize = 32;
 const RECORD_HEADER_LEN: usize = 12;
 const INDEX_ENTRY_FIXED_LEN: usize = 12;
-static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata returned after writing an SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,26 +119,7 @@ pub fn write_sst<'a>(
         body_crc,
     );
 
-    let mut tmp = SstTemp::new(path)?;
-    {
-        let mut file = File::create(tmp.path()).map_err(|error| {
-            storage_error(&format!("create SST temp {}", tmp.path().display()), error)
-        })?;
-        file.write_all(&bytes).map_err(|error| {
-            storage_error(&format!("write SST {}", tmp.path().display()), error)
-        })?;
-        file.sync_all().map_err(|error| {
-            storage_error(&format!("fsync SST {}", tmp.path().display()), error)
-        })?;
-    }
-    fs::rename(tmp.path(), path).map_err(|error| {
-        storage_error(
-            &format!("rename SST {} to {}", tmp.path().display(), path.display()),
-            error,
-        )
-    })?;
-    tmp.commit();
-    sync_parent(path)?;
+    crate::fsync::write_atomic_create_new(path, &bytes, "SST")?;
 
     Ok(SstSummary {
         path: path.to_path_buf(),
@@ -152,48 +128,6 @@ pub fn write_sst<'a>(
         index_offset,
         bloom_offset,
     })
-}
-
-struct SstTemp {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl SstTemp {
-    fn new(path: &Path) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| CalyxError::disk_pressure("SST path has no parent"))?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| CalyxError::disk_pressure("SST path has no file name"))?;
-        let mut temp_name = OsString::from(name);
-        temp_name.push(format!(
-            ".{}.{}.tmp",
-            std::process::id(),
-            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        Ok(Self {
-            path: parent.join(temp_name),
-            committed: false,
-        })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for SstTemp {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 impl SstReader {

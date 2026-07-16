@@ -441,13 +441,12 @@ fn write_index_with_hook(
     sync_parent(&generation_manifest)?;
     publication_hook(PublicationBoundary::GenerationManifestSynced)?;
     let published_generation = generations_root.join(&generation);
-    fs::rename(&staging, &published_generation).map_err(|error| {
-        CalyxError::disk_pressure(format!(
-            "publish immutable Base page index generation {} -> {}: {error}",
-            staging.display(),
-            published_generation.display()
-        ))
-    })?;
+    crate::fsync::publish_path(
+        &staging,
+        &published_generation,
+        "immutable Base page index generation",
+        crate::fsync::PublishMode::CreateNew,
+    )?;
     sync_parent(&published_generation)?;
     publication_hook(PublicationBoundary::GenerationPublished)?;
     validate_immutable_generation(vault, &published_generation, &manifest)?;

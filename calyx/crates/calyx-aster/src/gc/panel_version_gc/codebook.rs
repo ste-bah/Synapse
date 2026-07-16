@@ -171,16 +171,20 @@ fn move_versioned_file(
     let Some(path) = find_versioned_file(hot_dir, id, parse_id)? else {
         return Ok(0);
     };
-    fs::create_dir_all(cold_dir)
-        .map_err(|error| calyx_core::CalyxError::disk_pressure(error.to_string()))?;
+    crate::fsync::create_dir_all(cold_dir, "cold codebook directory")?;
     let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
     let target =
         cold_dir
             .join(path.file_name().ok_or_else(|| {
                 calyx_core::CalyxError::disk_pressure("version path has no name")
             })?);
-    fs::rename(&path, target)
-        .map_err(|error| calyx_core::CalyxError::disk_pressure(error.to_string()))?;
+    crate::fsync::publish_path(
+        &path,
+        &target,
+        "cold codebook version",
+        crate::fsync::PublishMode::CreateNew,
+    )?;
+    crate::fsync::sync_parent(&target, "cold codebook version")?;
     Ok(bytes)
 }
 

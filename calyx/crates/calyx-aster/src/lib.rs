@@ -43,3 +43,21 @@ pub mod wal;
 pub use dedup::{
     CompressionRatio, Domain, DomainCompressionStats, compression_ratio, domain_compression_stats,
 };
+
+pub mod durable_fs {
+    use std::path::Path;
+
+    use calyx_core::Result;
+
+    pub fn write_atomic_create_new(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+        crate::fsync::write_atomic_create_new(path, bytes, label)
+    }
+
+    pub fn write_atomic_replace(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+        crate::fsync::write_atomic_replace(path, bytes, label)
+    }
+
+    pub fn sync_parent(path: &Path, label: &str) -> Result<()> {
+        crate::fsync::sync_parent(path, label)
+    }
+}

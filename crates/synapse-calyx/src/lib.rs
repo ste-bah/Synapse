@@ -4,16 +4,17 @@ mod async_vault;
 mod error_bridge;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Clock, Seq, SystemClock, Ts, VaultId};
+use calyx_core::{CalyxError, Clock, Seq, SystemClock, Ts, VaultId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -1154,7 +1155,6 @@ fn write_identity_atomic(
     path: &Path,
     identity: &VaultIdentityDisk,
 ) -> Result<(), SynapseCalyxError> {
-    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let encoded = serde_json::to_vec_pretty(identity).map_err(|error| {
         SynapseCalyxError::new(
             "SYNAPSE_CALYX_IDENTITY_ENCODE_FAILED",
@@ -1162,53 +1162,43 @@ fn write_identity_atomic(
             IDENTITY_REMEDIATION,
         )
     })?;
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| {
-                SynapseCalyxError::with_io(
-                    "SYNAPSE_CALYX_IDENTITY_WRITE_FAILED",
-                    "create staged Calyx vault identity",
-                    &temp,
-                    &error,
-                    IDENTITY_REMEDIATION,
-                )
-            })?;
-        file.write_all(&encoded).map_err(|error| {
-            SynapseCalyxError::with_io(
-                "SYNAPSE_CALYX_IDENTITY_WRITE_FAILED",
-                "write staged Calyx vault identity",
-                &temp,
+    calyx_aster::durable_fs::write_atomic_replace(path, &encoded, "Calyx vault identity").map_err(
+        |error| {
+            durable_publish_error(
+                "SYNAPSE_CALYX_IDENTITY_RENAME_FAILED",
+                "Calyx vault identity",
+                path,
                 &error,
                 IDENTITY_REMEDIATION,
             )
-        })?;
-        file.sync_all().map_err(|error| {
-            SynapseCalyxError::with_io(
-                "SYNAPSE_CALYX_IDENTITY_SYNC_FAILED",
-                "sync staged Calyx vault identity",
-                &temp,
-                &error,
-                IDENTITY_REMEDIATION,
-            )
-        })?;
-    }
-    fs::rename(&temp, path).map_err(|error| {
-        SynapseCalyxError::with_io(
-            "SYNAPSE_CALYX_IDENTITY_RENAME_FAILED",
-            "publish Calyx vault identity",
-            path,
-            &error,
-            IDENTITY_REMEDIATION,
-        )
-    })?;
-    sync_parent_dir(
-        path,
-        "Calyx vault identity",
-        "SYNAPSE_CALYX_IDENTITY_PARENT_SYNC_FAILED",
-        IDENTITY_REMEDIATION,
+        },
+    )
+}
+
+fn durable_publish_error(
+    code: &'static str,
+    label: &str,
+    path: &Path,
+    error: &CalyxError,
+    remediation: &'static str,
+) -> SynapseCalyxError {
+    tracing::error!(
+        code,
+        label,
+        path = %path.display(),
+        calyx_code = error.code,
+        calyx_remediation = error.remediation,
+        "Calyx durable publish failed"
+    );
+    SynapseCalyxError::new(
+        code,
+        format!(
+            "publish {label} {} failed with {}: {}",
+            path.display(),
+            error.code,
+            error.message
+        ),
+        remediation,
     )
 }
 
@@ -1261,56 +1251,21 @@ fn write_machine_salt_atomic(
     path: &Path,
     bytes: &[u8; MACHINE_SALT_BYTES],
 ) -> Result<(), SynapseCalyxError> {
-    let temp = path.with_extension(format!("bin.tmp.{}", std::process::id()));
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| {
-                SynapseCalyxError::with_io(
-                    "SYNAPSE_CALYX_MACHINE_SALT_WRITE_FAILED",
-                    "create staged Calyx machine-local salt",
-                    &temp,
-                    &error,
-                    IDENTITY_REMEDIATION,
-                )
-            })?;
-        file.write_all(BASE64.encode(bytes).as_bytes())
-            .map_err(|error| {
-                SynapseCalyxError::with_io(
-                    "SYNAPSE_CALYX_MACHINE_SALT_WRITE_FAILED",
-                    "write staged Calyx machine-local salt",
-                    &temp,
-                    &error,
-                    IDENTITY_REMEDIATION,
-                )
-            })?;
-        file.sync_all().map_err(|error| {
-            SynapseCalyxError::with_io(
-                "SYNAPSE_CALYX_MACHINE_SALT_SYNC_FAILED",
-                "sync staged Calyx machine-local salt",
-                &temp,
-                &error,
-                IDENTITY_REMEDIATION,
-            )
-        })?;
-    }
-    fs::rename(&temp, path).map_err(|error| {
-        SynapseCalyxError::with_io(
+    let encoded = BASE64.encode(bytes);
+    calyx_aster::durable_fs::write_atomic_replace(
+        path,
+        encoded.as_bytes(),
+        "Calyx machine-local salt",
+    )
+    .map_err(|error| {
+        durable_publish_error(
             "SYNAPSE_CALYX_MACHINE_SALT_RENAME_FAILED",
-            "publish Calyx machine-local salt",
+            "Calyx machine-local salt",
             path,
             &error,
             IDENTITY_REMEDIATION,
         )
-    })?;
-    sync_parent_dir(
-        path,
-        "Calyx machine-local salt",
-        "SYNAPSE_CALYX_MACHINE_SALT_PARENT_SYNC_FAILED",
-        IDENTITY_REMEDIATION,
-    )
+    })
 }
 
 fn write_pid_sidecar(path: &Path) -> Result<(), SynapseCalyxError> {
@@ -1366,6 +1321,74 @@ fn write_pid_sidecar(path: &Path) -> Result<(), SynapseCalyxError> {
     )
 }
 
+fn retry_io<T>(
+    code: &'static str,
+    label: &str,
+    operation: &'static str,
+    path: &Path,
+    remediation: &'static str,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> Result<T, SynapseCalyxError> {
+    let mut attempts = 0_u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_sharing_error(&error) && attempts < 7 => {
+                attempts += 1;
+                let delay = Duration::from_millis(10 * (1_u64 << (attempts - 1)));
+                tracing::warn!(
+                    code,
+                    label,
+                    operation,
+                    path = %path.display(),
+                    attempt = attempts,
+                    retry_after_ms = delay.as_millis(),
+                    kind = ?error.kind(),
+                    os_error = error.raw_os_error(),
+                    "retrying transient Windows Calyx durable filesystem operation"
+                );
+                std::thread::sleep(delay);
+            }
+            Err(error) => {
+                tracing::error!(
+                    code,
+                    label,
+                    operation,
+                    path = %path.display(),
+                    attempts,
+                    kind = ?error.kind(),
+                    os_error = error.raw_os_error(),
+                    "Calyx durable filesystem operation failed"
+                );
+                return Err(SynapseCalyxError::new(
+                    code,
+                    format!(
+                        "{operation} {label} path={} attempts={attempts} kind={:?} raw_os_error={:?}: {error}",
+                        path.display(),
+                        error.kind(),
+                        error.raw_os_error()
+                    ),
+                    remediation,
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_retryable_sharing_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    error.raw_os_error().is_some_and(|code| {
+        code == ERROR_SHARING_VIOLATION.cast_signed() || code == ERROR_LOCK_VIOLATION.cast_signed()
+    })
+}
+
+#[cfg(not(windows))]
+fn is_retryable_sharing_error(_error: &io::Error) -> bool {
+    false
+}
+
 fn sync_parent_dir(
     path: &Path,
     label: &str,
@@ -1399,17 +1422,14 @@ fn sync_dir(
             remediation,
         ));
     }
-    File::open(dir)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| {
-            SynapseCalyxError::with_io(
-                code,
-                "sync Calyx parent directory",
-                dir,
-                &error,
-                remediation,
-            )
-        })
+    retry_io(
+        code,
+        label,
+        "sync Calyx parent directory",
+        dir,
+        remediation,
+        || File::open(dir).and_then(|handle| handle.sync_all()),
+    )
 }
 
 #[cfg(windows)]
@@ -1433,21 +1453,21 @@ fn sync_dir(
             remediation,
         ));
     }
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| {
-            SynapseCalyxError::with_io(
-                code,
-                "sync Calyx parent directory",
-                dir,
-                &error,
-                remediation,
-            )
-        })
+    retry_io(
+        code,
+        label,
+        "sync Calyx parent directory",
+        dir,
+        remediation,
+        || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+                .and_then(|handle| handle.sync_all())
+        },
+    )
 }
 
 #[cfg(not(any(unix, windows)))]

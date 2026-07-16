@@ -1,7 +1,6 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bincode::config;
 use calyx_core::{CalyxError, Result};
@@ -12,7 +11,6 @@ const MAGIC: &[u8] = b"calyx_ledger_query_index_v1\0";
 const DIRECTORY: &str = "ledger_query_index";
 const SUFFIX: &str = ".idx";
 const MAX_FILE_BYTES: u64 = 1 << 30;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn newest_previous_index(vault: &Path, height: u64) -> Result<Option<PathBuf>> {
     let dir = vault.join(DIRECTORY);
@@ -93,56 +91,8 @@ pub(super) fn write_index(path: &Path, index: &LedgerQueryIndex) -> Result<()> {
     bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
-    let temp = parent.join(format!(
-        ".ledger-query-index-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|error| {
-                CalyxError::disk_pressure(format!(
-                    "create ledger query index temp {}: {error}",
-                    temp.display()
-                ))
-            })?;
-        file.write_all(&bytes).map_err(|error| {
-            CalyxError::disk_pressure(format!(
-                "write ledger query index temp {}: {error}",
-                temp.display()
-            ))
-        })?;
-        file.sync_all().map_err(|error| {
-            CalyxError::disk_pressure(format!(
-                "sync ledger query index temp {}: {error}",
-                temp.display()
-            ))
-        })?;
-        drop(file);
-        fs::rename(&temp, path).map_err(|error| {
-            CalyxError::disk_pressure(format!(
-                "publish ledger query index {} -> {}: {error}",
-                temp.display(),
-                path.display()
-            ))
-        })?;
-        crate::fsync::sync_parent(path, "ledger query index")?;
-        remove_old_generations(parent, path)
-    })();
-    if result.is_err()
-        && temp.exists()
-        && let Err(cleanup) = fs::remove_file(&temp)
-    {
-        tracing::error!(
-            path = %temp.display(),
-            error = %cleanup,
-            "failed to remove unpublished ledger query index temp file"
-        );
-    }
-    result
+    crate::fsync::write_atomic_create_new(path, &bytes, "ledger query index")?;
+    remove_old_generations(parent, path)
 }
 
 fn remove_old_generations(directory: &Path, keep: &Path) -> Result<()> {

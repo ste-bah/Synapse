@@ -355,15 +355,19 @@ where
         let Some(path) = find_panel_file(&self.hot_panel_dir, id)? else {
             return Ok(0);
         };
-        fs::create_dir_all(&self.cold_panel_dir)
-            .map_err(|error| calyx_core::CalyxError::disk_pressure(error.to_string()))?;
+        crate::fsync::create_dir_all(&self.cold_panel_dir, "cold panel directory")?;
         let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
         let target = self.cold_panel_dir.join(
             path.file_name()
                 .ok_or_else(|| calyx_core::CalyxError::disk_pressure("panel path has no name"))?,
         );
-        fs::rename(&path, target)
-            .map_err(|error| calyx_core::CalyxError::disk_pressure(error.to_string()))?;
+        crate::fsync::publish_path(
+            &path,
+            &target,
+            "cold panel version",
+            crate::fsync::PublishMode::CreateNew,
+        )?;
+        crate::fsync::sync_parent(&target, "cold panel version")?;
         Ok(bytes)
     }
 

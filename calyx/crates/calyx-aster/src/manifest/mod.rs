@@ -11,8 +11,8 @@ use calyx_core::{CalyxError, Result, TemporalPolicy};
 use calyx_ledger::QuarantineSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use error::{format_version_unsupported, storage_error};
@@ -450,21 +450,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<VaultManifest> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file =
-            File::create(&tmp).map_err(|error| storage_error("create atomic temp", &tmp, error))?;
-        file.write_all(bytes)
-            .map_err(|error| storage_error("write atomic temp", &tmp, error))?;
-        file.sync_all()
-            .map_err(|error| storage_error("fsync atomic temp", &tmp, error))?;
-    }
-    fs::rename(&tmp, path).map_err(|error| storage_error("rename atomic file", path, error))?;
-    sync_parent(path)
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    crate::fsync::sync_parent(path, "manifest")
+    crate::fsync::write_atomic_replace(path, bytes, "manifest")
 }
 
 fn invalid_component(component: Component<'_>) -> bool {

@@ -101,13 +101,10 @@ impl Residency {
             )));
         }
         let path = vault_root.join(RESIDENCY_SIDECAR);
-        let tmp = vault_root.join(format!("{RESIDENCY_SIDECAR}.tmp"));
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| residency_corrupt(format!("encode residency pin: {error}")))?;
-        std::fs::write(&tmp, &bytes)
-            .map_err(|error| residency_io(format!("write residency sidecar: {error}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|error| residency_io(format!("commit residency sidecar: {error}")))?;
+        crate::fsync::write_atomic_create_new(&path, &bytes, "residency sidecar")
+            .map_err(|error| residency_io(error.to_string()))?;
         Ok(())
     }
 

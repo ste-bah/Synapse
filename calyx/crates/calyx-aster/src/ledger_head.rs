@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result};
@@ -43,29 +42,10 @@ pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Resu
         }
     }
     let path = head_anchor_path(vault);
-    let parent = path
-        .parent()
-        .ok_or_else(|| CalyxError::disk_pressure("Aster ledger head path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        CalyxError::disk_pressure(format!("create Aster ledger head dir: {error}"))
-    })?;
-    let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(anchor).map_err(|error| {
         CalyxError::ledger_corrupt(format!("encode Aster ledger head: {error}"))
     })?;
-    {
-        let mut file = File::create(&tmp).map_err(|error| {
-            CalyxError::disk_pressure(format!("create Aster ledger head temp: {error}"))
-        })?;
-        file.write_all(&bytes).map_err(|error| {
-            CalyxError::disk_pressure(format!("write Aster ledger head temp: {error}"))
-        })?;
-        file.sync_all().map_err(|error| {
-            CalyxError::disk_pressure(format!("sync Aster ledger head: {error}"))
-        })?;
-    }
-    replace_file(&tmp, &path)?;
-    sync_parent(&path)
+    crate::fsync::write_atomic_replace(&path, &bytes, "Aster ledger head")
 }
 
 pub(crate) fn newest_anchor_from_rows(rows: &[WriteRow]) -> Result<Option<LedgerHeadAnchor>> {
@@ -111,19 +91,4 @@ pub(crate) fn missing_head_anchor(vault: &Path, head: u64) -> CalyxError {
         "Aster ledger head anchor missing for non-empty durable ledger at head {head} in {}",
         vault.display()
     ))
-}
-
-fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| {
-            CalyxError::disk_pressure(format!("replace Aster ledger head: {error}"))
-        })?;
-    }
-    fs::rename(tmp, path)
-        .map_err(|error| CalyxError::disk_pressure(format!("rename Aster ledger head: {error}")))
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    crate::fsync::sync_parent(path, "Aster ledger head")
 }

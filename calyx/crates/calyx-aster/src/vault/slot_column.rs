@@ -5,8 +5,8 @@ use crate::sst::arrow::{decode_column_chunk, encode_column_chunk};
 use calyx_core::{CalyxError, Clock, CxId, Result, Seq, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const MANIFEST_MAGIC: &str = "CXSC1";
@@ -237,21 +237,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file =
-            File::create(&tmp).map_err(|error| storage_error("create slot temp", error))?;
-        file.write_all(bytes)
-            .map_err(|error| storage_error("write slot temp", error))?;
-        file.sync_all()
-            .map_err(|error| storage_error("fsync slot temp", error))?;
-    }
-    fs::rename(&tmp, path).map_err(|error| storage_error("rename slot artifact", error))?;
-    sync_parent(path)
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    crate::fsync::sync_parent(path, "slot artifact")
+    crate::fsync::write_atomic_replace(path, bytes, "slot artifact")
 }
 
 fn storage_error(context: &str, error: io::Error) -> CalyxError {
