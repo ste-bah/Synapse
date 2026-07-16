@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
-    DiskPressureLevel, GcReport, PressureReport, StorageResult, cf, decode_json,
+    CalyxVaultInspect, DiskPressureLevel, GcReport, PressureReport, StorageResult, cf, decode_json,
 };
 
 use crate::{ReflexError, ReflexResult, ReflexRuntime};
@@ -82,6 +82,17 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn storage_cf_estimated_row_counts(&self) -> StorageResult<synapse_storage::CfEstimateMap> {
         self.db.cf_estimated_row_counts()
+    }
+
+    /// Returns physical Calyx vault collection statistics when the runtime is
+    /// backed by Calyx.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the opened Calyx vault cannot be inspected.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
+        self.db.calyx_vault_inspect()
     }
 
     /// Returns the newest rows in one storage column family.

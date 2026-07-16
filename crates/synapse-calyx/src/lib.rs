@@ -601,6 +601,146 @@ pub struct SynapseCalyxVault {
     math_runtime: SynapseCalyxMathRuntime,
 }
 
+#[derive(Debug)]
+pub struct SynapseCalyxReadOnlyVault {
+    config: SynapseCalyxConfig,
+    vault: AsterVault<SynapseCalyxClock>,
+}
+
+impl SynapseCalyxReadOnlyVault {
+    /// Opens an existing Calyx vault for physical inspection only.
+    ///
+    /// This path does not create the vault directory, identity file, machine
+    /// salt, lock file, or PID sidecar, and it does not acquire the Synapse
+    /// exclusive writer lock. Mutating Aster operations fail closed because the
+    /// underlying handle is opened with `read_only=true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the vault directory, identity, machine
+    /// salt, or read-only Aster recovery cannot be read.
+    pub fn open_existing(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+        error_bridge::validate_calyx_error_bridge()?;
+        let clock = SynapseCalyxClock::from_tuning(&config.tuning)?;
+        if !config.vault_dir.is_dir() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_READ_ONLY_VAULT_MISSING",
+                format!(
+                    "read-only Calyx vault inspection requires an existing directory: {}",
+                    config.vault_dir.display()
+                ),
+                "point the inspector at an existing Calyx vault directory",
+            ));
+        }
+        let identity = read_identity(&identity_path(&config.vault_dir))?;
+        let vault_id = VaultId::from_str(&identity.vault_id).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_VAULT_ID_INVALID",
+                format!(
+                    "parse vault id {} from {}: {error}",
+                    identity.vault_id,
+                    identity_path(&config.vault_dir).display()
+                ),
+                IDENTITY_REMEDIATION,
+            )
+        })?;
+        let machine_salt = read_machine_salt(&config.machine_salt_path)?;
+        let options = VaultOptions {
+            read_only: true,
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            selected_cfs: Some(vec![ColumnFamily::Kv]),
+            ..VaultOptions::default()
+        };
+        let vault =
+            AsterVault::open_with_clock(&config.vault_dir, vault_id, machine_salt, options, clock)
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx("open read-only Calyx Aster vault", &error)
+                })?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_READ_ONLY_VAULT_OPENED",
+            vault_dir = %config.vault_dir.display(),
+            vault_id = %vault.vault_id(),
+            latest_seq = vault.latest_seq(),
+            "opened read-only Calyx Aster vault for inspection"
+        );
+        Ok(Self { config, vault })
+    }
+
+    #[must_use]
+    pub fn vault_dir(&self) -> &Path {
+        &self.config.vault_dir
+    }
+
+    #[must_use]
+    pub fn vault_id(&self) -> String {
+        self.vault.vault_id().to_string()
+    }
+
+    #[must_use]
+    pub fn latest_seq(&self) -> Seq {
+        self.vault.latest_seq()
+    }
+
+    /// Returns the same millisecond clock source used by this opened vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured config error if the vault has an invalid fixed
+    /// clock configuration after startup validation.
+    pub fn clock_now_ms(&self) -> Result<Ts, SynapseCalyxError> {
+        match self.config.tuning.clock_mode {
+            SynapseCalyxClockMode::System => Ok(SystemClock.now()),
+            SynapseCalyxClockMode::Fixed => {
+                self.config
+                    .tuning
+                    .fixed_clock_unix_ms
+                    .ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_CLOCK_INVALID",
+                            "clock_mode=fixed is missing fixed_clock_unix_ms after validation",
+                            "inspect the Calyx tuning config and restart after fixing the fixed clock fields",
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Reads one raw CF row at a numeric snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the read-only handle cannot
+    /// serve the requested snapshot/key.
+    pub fn read_cf_at(
+        &self,
+        snapshot: Seq,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.vault
+            .read_cf_at(snapshot, cf, key)
+            .map_err(|error| SynapseCalyxError::from_calyx("read Calyx CF row", &error))
+    }
+
+    /// Scans visible raw CF rows in a key range at a numeric snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the read-only handle cannot
+    /// serve the requested snapshot/range.
+    pub fn scan_cf_range_at(
+        &self,
+        snapshot: Seq,
+        cf: ColumnFamily,
+        range: &KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_range_at(snapshot, cf, range)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan Calyx CF range", &error))
+    }
+}
+
 impl SynapseCalyxVault {
     /// Opens the configured durable Aster vault after acquiring the Synapse
     /// process lock and loading the stable vault identity.
@@ -692,6 +832,16 @@ impl SynapseCalyxVault {
             lock,
             math_runtime,
         })
+    }
+
+    #[must_use]
+    pub fn vault_id(&self) -> String {
+        self.vault.vault_id().to_string()
+    }
+
+    #[must_use]
+    pub fn latest_seq(&self) -> Seq {
+        self.vault.latest_seq()
     }
 
     #[must_use]

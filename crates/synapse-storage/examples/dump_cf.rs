@@ -2,83 +2,72 @@
 //!
 //! Its output is supporting storage evidence only; manual FSV remains separate.
 //!
-//! Opens a Synapse `RocksDB` strictly READ-ONLY and prints every row of one
-//! column family so physical storage state can be verified independently of
-//! the MCP tool surface. Read-only open never creates databases or column
-//! families (a source-of-truth reader must not be able to mutate the source
-//! of truth) and works even while a live daemon holds the write lock.
+//! Opens an existing Synapse storage backend strictly for read-only logical
+//! scans and prints metadata-only row samples. Raw key and value material is
+//! never emitted; hashes and byte lengths are enough to correlate against a
+//! known synthetic input without turning the dump into a data-exfiltration
+//! surface.
 //!
-//! Usage: `cargo run -p synapse-storage --example dump_cf -- <db_path> <cf_name>`
+//! Usage:
+//! `cargo run -p synapse-storage --example dump_cf -- --backend <rocksdb|calyx> <db_path> <cf_name>`
 
 use std::{
     error::Error,
     fmt,
     io::{self, Write},
+    path::Path,
 };
 
-use rocksdb::{DB, Options};
-use synapse_storage::{cf, timeline};
+use synapse_storage::{StorageBackendKind, dump_cf_read_only};
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
+const USAGE: &str = "usage: dump_cf --backend <rocksdb|calyx> <db_path> <cf_name>";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    let db_path = args.next().ok_or("usage: dump_cf <db_path> <cf_name>")?;
-    let cf_name = args.next().ok_or("usage: dump_cf <db_path> <cf_name>")?;
-
-    let existing_cfs = DB::list_cf(&Options::default(), &db_path)
-        .map_err(|error| format!("not an existing RocksDB at {db_path}: {error}"))?;
-    if !existing_cfs.iter().any(|name| name == &cf_name) {
-        return Err(format!(
-            "column family {cf_name} does not exist in {db_path}; present: {existing_cfs:?}"
-        )
-        .into());
+    let backend_flag = args.next().ok_or(USAGE)?;
+    if backend_flag != "--backend" {
+        return Err(format!("{USAGE}; got first argument {backend_flag:?}").into());
+    }
+    let backend_raw = args.next().ok_or(USAGE)?;
+    let backend = StorageBackendKind::parse_config(&backend_raw)?;
+    let db_path = args.next().ok_or(USAGE)?;
+    let cf_name = args.next().ok_or(USAGE)?;
+    if let Some(extra) = args.next() {
+        return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
     }
 
-    let db = DB::open_cf_for_read_only(&Options::default(), &db_path, &existing_cfs, false)?;
-    let handle = db
-        .cf_handle(&cf_name)
-        .ok_or_else(|| format!("column family handle missing after open: {cf_name}"))?;
-
-    let mut row_count = 0_usize;
-    let mut rows = Vec::new();
-    for item in db.iterator_cf(&handle, rocksdb::IteratorMode::Start) {
-        let (key, value) =
-            item.map_err(|error| format!("DUMP_CF_ROW_READ_FAILED cf={cf_name}: {error}"))?;
-        rows.push((key.to_vec(), value.to_vec()));
-        row_count += 1;
-    }
+    let dump = dump_cf_read_only(
+        Path::new(&db_path),
+        synapse_core::SCHEMA_VERSION,
+        backend,
+        &cf_name,
+    )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if !write_stdout_line(
         &mut stdout,
-        format_args!("dump_cf db_path={db_path} cf={cf_name} mode=read_only row_count={row_count}"),
+        format_args!(
+            "dump_cf db_path={db_path} cf={} backend={} mode=read_only row_count={}",
+            dump.cf_name,
+            dump.backend.as_str(),
+            dump.row_count
+        ),
     )? {
         return Ok(());
     }
-    for (index, (key, value)) in rows.iter().enumerate() {
-        let key_hex = hex_encode(key);
-        let decoded_key = if cf_name == cf::CF_TIMELINE {
-            match timeline::decode_timeline_key(key) {
-                Ok((ts_ns, seq)) => format!(" ts_ns={ts_ns} seq={seq}"),
-                Err(error) => format!(" key_decode_error={error}"),
-            }
-        } else {
-            String::new()
-        };
+    for (index, row) in dump.rows.iter().enumerate() {
         if !write_stdout_line(
             &mut stdout,
             format_args!(
-                "row[{index}] key_hex={key_hex}{decoded_key} value={}",
-                String::from_utf8_lossy(value)
+                "row[{index}] key_len_bytes={} key_sha256={} key_material_omitted={} value_len_bytes={} value_sha256={} value_encoding={} value_content_omitted={} redaction_policy={}",
+                row.key_len_bytes,
+                row.key_sha256,
+                row.key_material_omitted,
+                row.value_len_bytes,
+                row.value_sha256,
+                row.value_encoding,
+                row.value_content_omitted,
+                row.redaction_policy
             ),
         )? {
             return Ok(());

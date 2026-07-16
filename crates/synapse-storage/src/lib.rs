@@ -15,7 +15,11 @@ pub mod timeline;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub use backend::StorageBackendKind;
+pub use backend::{
+    CalyxVaultCollectionInspect, CalyxVaultInspect, STORAGE_METADATA_ONLY_REDACTION_POLICY,
+    StorageBackendKind, StorageCfDump, StorageDumpRow, dump_cf_read_only,
+    inspect_calyx_vault_read_only, scan_cf_read_only,
+};
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
@@ -341,6 +345,18 @@ impl Db {
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap> {
         self.backend.cf_estimated_row_counts()
+    }
+
+    /// Returns physical Calyx vault collection statistics when this DB is
+    /// backed by Calyx.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the Calyx vault cannot be inspected. `RocksDB`
+    /// backends return `Ok(None)` because there is no Calyx vault.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
+        self.backend.calyx_vault_inspect()
     }
 
     /// Runs one disk-pressure check immediately.

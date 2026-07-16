@@ -9,7 +9,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
-use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
+use synapse_storage::{
+    CalyxVaultCollectionInspect as BackendCalyxVaultCollectionInspect,
+    CalyxVaultInspect as BackendCalyxVaultInspect, DiskPressureLevel, GcReport, PressureReport,
+    STORAGE_METADATA_ONLY_REDACTION_POLICY, cf,
+};
 
 use crate::m1::mcp_error;
 
@@ -28,9 +32,6 @@ const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
 const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN_FAMILIES;
-const STORAGE_INSPECT_REDACTION_POLICY: &str =
-    "metadata_only_no_raw_keys_or_values_hashes_for_correlation";
-
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectParams {}
@@ -94,6 +95,8 @@ pub struct StorageInspectResponse {
     pub cf_sizes: BTreeMap<String, u64>,
     pub cf_row_counts: BTreeMap<String, u64>,
     pub cf_row_samples: BTreeMap<String, Vec<StorageRowSample>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault: Option<StorageCalyxVaultInspect>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -122,6 +125,42 @@ pub struct StorageRowSample {
     pub value_encoding: String,
     pub value_content_omitted: bool,
     pub redaction_policy: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCalyxVaultInspect {
+    pub schema_version: u32,
+    pub vault_id: String,
+    pub latest_seq: u64,
+    pub inspected_at_unix_ms: u64,
+    pub collection_count: u64,
+    pub raw_row_count: u64,
+    pub live_row_count: u64,
+    pub expired_row_count: u64,
+    pub user_key_bytes: u64,
+    pub payload_bytes: u64,
+    pub stored_value_bytes: u64,
+    pub total_logical_bytes: u64,
+    pub collections: BTreeMap<String, StorageCalyxVaultCollectionInspect>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCalyxVaultCollectionInspect {
+    pub collection_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_name: Option<String>,
+    pub collection_id_hex: String,
+    pub namespace: u64,
+    pub raw_row_count: u64,
+    pub live_row_count: u64,
+    pub expired_row_count: u64,
+    pub user_key_bytes: u64,
+    pub payload_bytes: u64,
+    pub stored_value_bytes: u64,
+    pub total_logical_bytes: u64,
+    pub expires_at_ms_histogram: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -424,6 +463,10 @@ fn inspect_locked(runtime: &ReflexRuntime) -> Result<StorageInspectResponse, Err
             .storage_cf_row_counts()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?,
         cf_row_samples: cf_row_samples(runtime)?,
+        calyx_vault: runtime
+            .storage_calyx_vault_inspect()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .map(storage_calyx_vault_inspect),
     })
 }
 
@@ -454,7 +497,48 @@ fn storage_row_sample(key: &[u8], value: &[u8]) -> StorageRowSample {
         value_sha256: sha256_hex(value),
         value_encoding: classify_value_encoding(value),
         value_content_omitted: true,
-        redaction_policy: STORAGE_INSPECT_REDACTION_POLICY.to_owned(),
+        redaction_policy: STORAGE_METADATA_ONLY_REDACTION_POLICY.to_owned(),
+    }
+}
+
+fn storage_calyx_vault_inspect(report: BackendCalyxVaultInspect) -> StorageCalyxVaultInspect {
+    StorageCalyxVaultInspect {
+        schema_version: report.schema_version,
+        vault_id: report.vault_id,
+        latest_seq: report.latest_seq,
+        inspected_at_unix_ms: report.inspected_at_unix_ms,
+        collection_count: report.collection_count,
+        raw_row_count: report.raw_row_count,
+        live_row_count: report.live_row_count,
+        expired_row_count: report.expired_row_count,
+        user_key_bytes: report.user_key_bytes,
+        payload_bytes: report.payload_bytes,
+        stored_value_bytes: report.stored_value_bytes,
+        total_logical_bytes: report.total_logical_bytes,
+        collections: report
+            .collections
+            .into_iter()
+            .map(|(name, collection)| (name, storage_calyx_vault_collection(collection)))
+            .collect(),
+    }
+}
+
+fn storage_calyx_vault_collection(
+    collection: BackendCalyxVaultCollectionInspect,
+) -> StorageCalyxVaultCollectionInspect {
+    StorageCalyxVaultCollectionInspect {
+        collection_name: collection.collection_name,
+        cf_name: collection.cf_name,
+        collection_id_hex: collection.collection_id_hex,
+        namespace: collection.namespace,
+        raw_row_count: collection.raw_row_count,
+        live_row_count: collection.live_row_count,
+        expired_row_count: collection.expired_row_count,
+        user_key_bytes: collection.user_key_bytes,
+        payload_bytes: collection.payload_bytes,
+        stored_value_bytes: collection.stored_value_bytes,
+        total_logical_bytes: collection.total_logical_bytes,
+        expires_at_ms_histogram: collection.expires_at_ms_histogram,
     }
 }
 

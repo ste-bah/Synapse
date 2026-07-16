@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -15,8 +15,10 @@ use rocksdb::{
     Direction, IteratorMode, Options, SliceTransform, WriteBatch,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError, SynapseCalyxVault,
+    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError,
+    SynapseCalyxReadOnlyVault, SynapseCalyxVault,
 };
 use synapse_core::{
     error_codes,
@@ -54,6 +56,61 @@ const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
 const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
 const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
 const MIB_U64: u64 = 1024 * 1024;
+pub const STORAGE_METADATA_ONLY_REDACTION_POLICY: &str =
+    "metadata_only_no_raw_keys_or_values_hashes_for_correlation";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageCfDump {
+    pub backend: StorageBackendKind,
+    pub cf_name: String,
+    pub row_count: u64,
+    pub rows: Vec<StorageDumpRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageDumpRow {
+    pub key_len_bytes: u64,
+    pub key_sha256: String,
+    pub key_material_omitted: bool,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
+    pub value_encoding: String,
+    pub value_content_omitted: bool,
+    pub redaction_policy: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalyxVaultInspect {
+    pub schema_version: u32,
+    pub vault_id: String,
+    pub latest_seq: u64,
+    pub inspected_at_unix_ms: u64,
+    pub collection_count: u64,
+    pub raw_row_count: u64,
+    pub live_row_count: u64,
+    pub expired_row_count: u64,
+    pub user_key_bytes: u64,
+    pub payload_bytes: u64,
+    pub stored_value_bytes: u64,
+    pub total_logical_bytes: u64,
+    pub collections: BTreeMap<String, CalyxVaultCollectionInspect>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalyxVaultCollectionInspect {
+    pub collection_name: String,
+    pub cf_name: Option<String>,
+    pub collection_id_hex: String,
+    pub namespace: u64,
+    pub raw_row_count: u64,
+    pub live_row_count: u64,
+    pub expired_row_count: u64,
+    pub user_key_bytes: u64,
+    pub payload_bytes: u64,
+    pub stored_value_bytes: u64,
+    pub total_logical_bytes: u64,
+    pub expires_at_ms_histogram: BTreeMap<String, u64>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +187,7 @@ pub trait StorageBackend: Send + Sync {
     fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap>;
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
+    fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -514,6 +572,10 @@ impl StorageBackend for RocksDbBackend {
         self.cf_property_estimates(ESTIMATE_NUM_KEYS)
     }
 
+    fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
+        Ok(None)
+    }
+
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -651,6 +713,7 @@ impl StorageBackend for RocksDbBackend {
 }
 
 pub struct CalyxBackend {
+    path: PathBuf,
     vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
     pressure: Arc<pressure::PressureState>,
 }
@@ -662,6 +725,7 @@ impl CalyxBackend {
             SynapseCalyxVault::open(config).map_err(|source| calyx_open_failed(path, &source))?;
         verify_calyx_schema_version(&vault, path, schema_version)?;
         Ok(Self {
+            path: path.to_path_buf(),
             vault: Arc::new(Mutex::new(Some(vault))),
             pressure: Arc::new(pressure::PressureState::default()),
         })
@@ -1063,6 +1127,15 @@ impl StorageBackend for CalyxBackend {
         Ok((counts, Vec::new()))
     }
 
+    fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
+        self.with_vault(
+            "<calyx-vault>",
+            "inspect Calyx vault collections",
+            false,
+            |vault| inspect_calyx_vault(vault, &self.path).map(Some),
+        )
+    }
+
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -1159,6 +1232,487 @@ impl StorageBackend for CalyxBackend {
     }
 }
 
+/// Scans one storage column family without opening the backend for writes.
+///
+/// # Errors
+///
+/// Returns a storage error when the backend cannot be opened read-only, the
+/// requested column family is not part of the Synapse schema, the schema
+/// sentinel is missing or mismatched, or the rows cannot be read.
+pub fn scan_cf_read_only(
+    path: &Path,
+    schema_version: u32,
+    backend: StorageBackendKind,
+    cf_name: &str,
+) -> StorageResult<Vec<RawRow>> {
+    match backend {
+        StorageBackendKind::RocksDb => scan_rocksdb_cf_read_only(path, schema_version, cf_name),
+        StorageBackendKind::Calyx => scan_calyx_cf_read_only(path, schema_version, cf_name),
+    }
+}
+
+/// Builds a metadata-only dump of one storage column family without opening it for writes.
+///
+/// # Errors
+///
+/// Returns a storage error when the backend cannot be opened read-only, the
+/// requested column family is not part of the Synapse schema, the schema
+/// sentinel is missing or mismatched, or the rows cannot be read.
+pub fn dump_cf_read_only(
+    path: &Path,
+    schema_version: u32,
+    backend: StorageBackendKind,
+    cf_name: &str,
+) -> StorageResult<StorageCfDump> {
+    let rows = scan_cf_read_only(path, schema_version, backend, cf_name)?;
+    let row_count = u64::try_from(rows.len()).map_err(|_error| StorageError::ReadFailed {
+        cf_name: cf_name.to_owned(),
+        detail: format!("storage dump row count does not fit in u64: {}", rows.len()),
+    })?;
+    Ok(StorageCfDump {
+        backend,
+        cf_name: cf_name.to_owned(),
+        row_count,
+        rows: rows
+            .iter()
+            .map(|(key, value)| storage_dump_row(key, value))
+            .collect(),
+    })
+}
+
+/// Inspects the physical Calyx vault collections without opening a writer.
+///
+/// # Errors
+///
+/// Returns a storage error when the Calyx vault is missing, cannot be opened
+/// read-only, has a mismatched schema sentinel, or contains malformed Synapse
+/// value envelopes.
+pub fn inspect_calyx_vault_read_only(
+    path: &Path,
+    schema_version: u32,
+) -> StorageResult<CalyxVaultInspect> {
+    let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
+    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+        .map_err(|source| calyx_open_failed(path, &source))?;
+    let actual = verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    inspect_calyx_vault_with_schema(&vault, path, actual)
+}
+
+fn scan_rocksdb_cf_read_only(
+    path: &Path,
+    schema_version: u32,
+    cf_name: &str,
+) -> StorageResult<Vec<RawRow>> {
+    require_known_cf_for_read(cf_name)?;
+    let existing_cfs = DB::list_cf(&Options::default(), path)
+        .map_err(|source| open_failed_detail(path, format!("not an existing RocksDB: {source}")))?;
+    if !existing_cfs.iter().any(|name| name == cf_name) {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "column family {cf_name} does not exist in {}; present: {existing_cfs:?}",
+                path.display()
+            ),
+        });
+    }
+    let db = DB::open_cf_for_read_only(&Options::default(), path, &existing_cfs, false)
+        .map_err(|source| open_failed(path, &source))?;
+    verify_rocksdb_schema_version_read_only(&db, path, schema_version)?;
+    let handle = db
+        .cf_handle(cf_name)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!("column family handle missing after read-only open: {cf_name}"),
+        })?;
+    let mut rows = Vec::new();
+    for item in db.iterator_cf(&handle, IteratorMode::Start) {
+        let (key, value) = item.map_err(|source| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!("read-only RocksDB row iteration failed: {source}"),
+        })?;
+        rows.push((key.to_vec(), value.to_vec()));
+    }
+    Ok(rows)
+}
+
+fn scan_calyx_cf_read_only(
+    path: &Path,
+    schema_version: u32,
+    cf_name: &str,
+) -> StorageResult<Vec<RawRow>> {
+    require_known_cf_for_read(cf_name)?;
+    let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
+    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+        .map_err(|source| calyx_open_failed(path, &source))?;
+    verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    read_all_rows_from_vault(&vault, cf_name)
+}
+
+fn require_known_cf_for_read(cf_name: &str) -> StorageResult<&'static str> {
+    cf::ALL_COLUMN_FAMILIES
+        .iter()
+        .copied()
+        .find(|known| *known == cf_name)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "column family name is not part of the Synapse storage schema".to_owned(),
+        })
+}
+
+fn verify_rocksdb_schema_version_read_only(
+    db: &DB,
+    path: &Path,
+    schema_version: u32,
+) -> StorageResult<()> {
+    let Some(value) = db
+        .get(SCHEMA_VERSION_KEY)
+        .map_err(|source| open_failed(path, &source))?
+    else {
+        return Err(StorageError::SchemaMismatch {
+            expected: schema_version,
+            actual: 0,
+        });
+    };
+    let actual = decode_schema_version(&value).unwrap_or_default();
+    if actual == schema_version {
+        Ok(())
+    } else {
+        Err(StorageError::SchemaMismatch {
+            expected: schema_version,
+            actual,
+        })
+    }
+}
+
+fn storage_dump_row(key: &[u8], value: &[u8]) -> StorageDumpRow {
+    StorageDumpRow {
+        key_len_bytes: key.len() as u64,
+        key_sha256: sha256_hex(key),
+        key_material_omitted: true,
+        value_len_bytes: value.len() as u64,
+        value_sha256: sha256_hex(value),
+        value_encoding: classify_value_encoding(value),
+        value_content_omitted: true,
+        redaction_policy: STORAGE_METADATA_ONLY_REDACTION_POLICY.to_owned(),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(64 + "sha256:".len());
+    encoded.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn classify_value_encoding(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "empty".to_owned();
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return "binary_or_invalid_utf8".to_owned();
+    }
+    if serde_json::from_slice::<serde_json::Value>(bytes).is_ok() {
+        return "json".to_owned();
+    }
+    "utf8_non_json".to_owned()
+}
+
+trait CalyxVaultKvRead {
+    fn vault_id_string(&self) -> String;
+    fn latest_seq_value(&self) -> u64;
+    fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError>;
+    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError>;
+    fn scan_kv_range_at(
+        &self,
+        snapshot: u64,
+        range: &calyx_aster::cf::KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError>;
+}
+
+impl CalyxVaultKvRead for SynapseCalyxVault {
+    fn vault_id_string(&self) -> String {
+        self.vault_id()
+    }
+
+    fn latest_seq_value(&self) -> u64 {
+        self.latest_seq()
+    }
+
+    fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError> {
+        self.clock_now_ms()
+    }
+
+    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.read_cf_at(snapshot, ColumnFamily::Kv, key)
+    }
+
+    fn scan_kv_range_at(
+        &self,
+        snapshot: u64,
+        range: &calyx_aster::cf::KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_range_at(snapshot, ColumnFamily::Kv, range)
+    }
+}
+
+impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
+    fn vault_id_string(&self) -> String {
+        self.vault_id()
+    }
+
+    fn latest_seq_value(&self) -> u64 {
+        self.latest_seq()
+    }
+
+    fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError> {
+        self.clock_now_ms()
+    }
+
+    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.read_cf_at(snapshot, ColumnFamily::Kv, key)
+    }
+
+    fn scan_kv_range_at(
+        &self,
+        snapshot: u64,
+        range: &calyx_aster::cf::KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_range_at(snapshot, ColumnFamily::Kv, range)
+    }
+}
+
+fn inspect_calyx_vault(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+) -> StorageResult<CalyxVaultInspect> {
+    let schema_version = verify_calyx_schema_version_existing(vault, path, 0)?;
+    inspect_calyx_vault_with_schema(vault, path, schema_version)
+}
+
+fn inspect_calyx_vault_with_schema(
+    vault: &impl CalyxVaultKvRead,
+    _path: &Path,
+    schema_version: u32,
+) -> StorageResult<CalyxVaultInspect> {
+    let inspected_at_unix_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed("<calyx-vault>", "read Calyx vault clock", &source))?;
+    let rows = vault
+        .scan_kv_range_at(vault.latest_seq_value(), &prefix_range(&[CALYX_KV_DISC]))
+        .map_err(|source| {
+            calyx_read_failed(
+                "<calyx-vault>",
+                "scan physical Calyx KV collections",
+                &source,
+            )
+        })?;
+    let mut collections: BTreeMap<String, CalyxVaultCollectionInspect> = BTreeMap::new();
+    let mut totals = CalyxVaultTotals::default();
+    for (full_key, stored_value) in rows {
+        let key = decode_calyx_key_parts(&full_key).map_err(|detail| StorageError::ReadFailed {
+            cf_name: "<calyx-vault>".to_owned(),
+            detail,
+        })?;
+        let collection_name = calyx_collection_report_name(key.collection_id, key.namespace);
+        let entry = collections
+            .entry(collection_name.clone())
+            .or_insert_with(|| CalyxVaultCollectionInspect {
+                collection_name,
+                cf_name: cf_name_for_calyx_collection_id(key.collection_id).map(str::to_owned),
+                collection_id_hex: format!("0x{:016x}", key.collection_id),
+                namespace: key.namespace,
+                raw_row_count: 0,
+                live_row_count: 0,
+                expired_row_count: 0,
+                user_key_bytes: 0,
+                payload_bytes: 0,
+                stored_value_bytes: 0,
+                total_logical_bytes: 0,
+                expires_at_ms_histogram: BTreeMap::new(),
+            });
+        let envelope =
+            decode_calyx_value_raw(&stored_value).map_err(|detail| StorageError::ReadFailed {
+                cf_name: entry
+                    .cf_name
+                    .clone()
+                    .unwrap_or_else(|| "<calyx-vault>".to_owned()),
+                detail: format!("decode Calyx vault inspection value: {detail}"),
+            })?;
+        let expired = calyx_value_is_expired(envelope.expires_at_ms, inspected_at_unix_ms);
+        let user_key_bytes = key.user_key.len() as u64;
+        let payload_bytes = envelope.payload.len() as u64;
+        let stored_value_bytes = stored_value.len() as u64;
+        let total_logical_bytes =
+            user_key_bytes
+                .checked_add(payload_bytes)
+                .ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: entry
+                        .cf_name
+                        .clone()
+                        .unwrap_or_else(|| "<calyx-vault>".to_owned()),
+                    detail: "Calyx vault inspection byte accounting overflow".to_owned(),
+                })?;
+        entry.raw_row_count = entry.raw_row_count.saturating_add(1);
+        entry.user_key_bytes = entry.user_key_bytes.saturating_add(user_key_bytes);
+        entry.payload_bytes = entry.payload_bytes.saturating_add(payload_bytes);
+        entry.stored_value_bytes = entry.stored_value_bytes.saturating_add(stored_value_bytes);
+        entry.total_logical_bytes = entry
+            .total_logical_bytes
+            .saturating_add(total_logical_bytes);
+        if expired {
+            entry.expired_row_count = entry.expired_row_count.saturating_add(1);
+        } else {
+            entry.live_row_count = entry.live_row_count.saturating_add(1);
+        }
+        let bucket = expires_at_histogram_bucket(envelope.expires_at_ms, inspected_at_unix_ms);
+        *entry
+            .expires_at_ms_histogram
+            .entry(bucket.to_owned())
+            .or_insert(0) += 1;
+        totals.add(expired, user_key_bytes, payload_bytes, stored_value_bytes)?;
+    }
+    Ok(CalyxVaultInspect {
+        schema_version,
+        vault_id: vault.vault_id_string(),
+        latest_seq: vault.latest_seq_value(),
+        inspected_at_unix_ms,
+        collection_count: collections.len() as u64,
+        raw_row_count: totals.raw_row_count,
+        live_row_count: totals.live_row_count,
+        expired_row_count: totals.expired_row_count,
+        user_key_bytes: totals.user_key_bytes,
+        payload_bytes: totals.payload_bytes,
+        stored_value_bytes: totals.stored_value_bytes,
+        total_logical_bytes: totals.total_logical_bytes,
+        collections,
+    })
+}
+
+#[derive(Default)]
+struct CalyxVaultTotals {
+    raw_row_count: u64,
+    live_row_count: u64,
+    expired_row_count: u64,
+    user_key_bytes: u64,
+    payload_bytes: u64,
+    stored_value_bytes: u64,
+    total_logical_bytes: u64,
+}
+
+impl CalyxVaultTotals {
+    fn add(
+        &mut self,
+        expired: bool,
+        user_key_bytes: u64,
+        payload_bytes: u64,
+        stored_value_bytes: u64,
+    ) -> StorageResult<()> {
+        self.raw_row_count = self.raw_row_count.saturating_add(1);
+        if expired {
+            self.expired_row_count = self.expired_row_count.saturating_add(1);
+        } else {
+            self.live_row_count = self.live_row_count.saturating_add(1);
+        }
+        self.user_key_bytes = self.user_key_bytes.saturating_add(user_key_bytes);
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
+        self.stored_value_bytes = self.stored_value_bytes.saturating_add(stored_value_bytes);
+        self.total_logical_bytes = self
+            .total_logical_bytes
+            .checked_add(user_key_bytes.checked_add(payload_bytes).ok_or_else(|| {
+                StorageError::ReadFailed {
+                    cf_name: "<calyx-vault>".to_owned(),
+                    detail: "Calyx vault total byte accounting overflow".to_owned(),
+                }
+            })?)
+            .ok_or_else(|| StorageError::ReadFailed {
+                cf_name: "<calyx-vault>".to_owned(),
+                detail: "Calyx vault total byte accounting overflow".to_owned(),
+            })?;
+        Ok(())
+    }
+}
+
+struct CalyxKeyParts {
+    collection_id: u64,
+    namespace: u64,
+    user_key: Vec<u8>,
+}
+
+fn decode_calyx_key_parts(full_key: &[u8]) -> Result<CalyxKeyParts, String> {
+    if full_key.len() < 1 + 8 + 8 + 2 {
+        return Err(format!(
+            "Calyx KV key is shorter than the Synapse envelope header: len={}",
+            full_key.len()
+        ));
+    }
+    if full_key[0] != CALYX_KV_DISC {
+        return Err(format!(
+            "Calyx KV key has unsupported discriminator 0x{:02x}; expected 0x{CALYX_KV_DISC:02x}",
+            full_key[0]
+        ));
+    }
+    let mut collection_bytes = [0_u8; 8];
+    collection_bytes.copy_from_slice(&full_key[1..9]);
+    let mut namespace_bytes = [0_u8; 8];
+    namespace_bytes.copy_from_slice(&full_key[9..17]);
+    let len = usize::from(u16::from_be_bytes([full_key[17], full_key[18]]));
+    let Some(user_key) = full_key.get(19..19 + len) else {
+        return Err("Calyx KV key length prefix exceeds the stored key".to_owned());
+    };
+    if full_key.len() != 19 + len {
+        return Err("Calyx KV key has trailing bytes after the user key".to_owned());
+    }
+    Ok(CalyxKeyParts {
+        collection_id: u64::from_be_bytes(collection_bytes),
+        namespace: u64::from_be_bytes(namespace_bytes),
+        user_key: user_key.to_vec(),
+    })
+}
+
+const fn expires_at_histogram_bucket(expires_at_ms: u64, now_ms: u64) -> &'static str {
+    if expires_at_ms == 0 {
+        return "durable";
+    }
+    if now_ms >= expires_at_ms {
+        return "expired";
+    }
+    let remaining = expires_at_ms - now_ms;
+    if remaining <= MILLIS_PER_HOUR {
+        "expires_within_1h"
+    } else if remaining <= MILLIS_PER_DAY {
+        "expires_within_24h"
+    } else if remaining <= 7 * MILLIS_PER_DAY {
+        "expires_within_7d"
+    } else {
+        "expires_after_7d"
+    }
+}
+
+fn calyx_collection_report_name(collection_id: u64, namespace: u64) -> String {
+    if collection_id == CALYX_METADATA_COLLECTION_ID {
+        return format!("__synapse_metadata/ns/{namespace}");
+    }
+    cf_name_for_calyx_collection_id(collection_id).map_or_else(
+        || format!("unknown/0x{collection_id:016x}/ns/{namespace}"),
+        |cf_name| format!("{cf_name}/ns/{namespace}"),
+    )
+}
+
+fn cf_name_for_calyx_collection_id(collection_id: u64) -> Option<&'static str> {
+    for (offset, known_cf) in (1_u64..).zip(cf::ALL_COLUMN_FAMILIES) {
+        if collection_id == (CALYX_COLLECTION_ID_BASE | offset) {
+            return Some(known_cf);
+        }
+    }
+    None
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn emit_storage_cf_bytes(sizes: &BTreeMap<String, u64>) {
     for (cf_name, bytes) in sizes {
@@ -1208,18 +1762,49 @@ fn verify_calyx_schema_version(
     }
 }
 
+fn verify_calyx_schema_version_existing(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+    expected_schema_version: u32,
+) -> StorageResult<u32> {
+    let key = encode_calyx_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
+        .map_err(|detail| calyx_open_failed_detail(path, detail))?;
+    let Some(value) = vault
+        .read_kv_at(vault.latest_seq_value(), &key)
+        .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?
+    else {
+        return Err(calyx_open_failed_detail(
+            path,
+            "missing Synapse schema-version sentinel in Calyx metadata collection".to_owned(),
+        ));
+    };
+    let payload =
+        decode_calyx_value_raw(&value).map_err(|detail| calyx_open_failed_detail(path, detail))?;
+    let actual = decode_schema_version(payload.payload).unwrap_or_default();
+    if expected_schema_version == 0 || actual == expected_schema_version {
+        Ok(actual)
+    } else {
+        Err(StorageError::SchemaMismatch {
+            expected: expected_schema_version,
+            actual,
+        })
+    }
+}
+
 fn read_all_rows_from_vault(
-    vault: &SynapseCalyxVault,
+    vault: &impl CalyxVaultKvRead,
     cf_name: &str,
 ) -> StorageResult<Vec<RawRow>> {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
-    let snapshot = latest_calyx_seq(vault);
+    let snapshot = vault.latest_seq_value();
     let rows = vault
-        .scan_cf_range_at(snapshot, ColumnFamily::Kv, &range)
+        .scan_kv_range_at(snapshot, &range)
         .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV namespace", &source))?;
     let mut decoded = Vec::with_capacity(rows.len());
-    let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
     for (key, value) in rows {
         let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
         if let Some(payload) = decode_calyx_value_for_read(cf_name, &value, now_ms)? {
@@ -1231,7 +1816,7 @@ fn read_all_rows_from_vault(
 }
 
 fn latest_calyx_seq(vault: &SynapseCalyxVault) -> u64 {
-    vault.status().latest_seq.unwrap_or_default()
+    vault.latest_seq()
 }
 
 fn commit_calyx_rows_to_vault(
