@@ -45,7 +45,9 @@ use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
     install_action_combo_scheduler,
 };
-use synapse_storage::{Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask};
+use synapse_storage::{
+    Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask, StorageBackendKind,
+};
 use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
@@ -56,6 +58,7 @@ use self::timeline_control::RecorderControl;
 use crate::http::sse::SseState;
 
 const DB_ENV: &str = "SYNAPSE_DB";
+const STORAGE_BACKEND_ENV: &str = "SYNAPSE_STORAGE_BACKEND";
 const PROFILE_DIR_ENV: &str = "SYNAPSE_PROFILE_DIR";
 const REFLEX_DISABLED_ENV: &str = "SYNAPSE_REFLEX_DISABLED";
 const REFLEX_FORCE_DEGRADED_ENV: &str = "SYNAPSE_REFLEX_FORCE_DEGRADED";
@@ -80,6 +83,7 @@ pub type SharedM3State = Arc<Mutex<M3State>>;
 )]
 pub struct M3ServiceConfig {
     pub db_path: Option<PathBuf>,
+    pub storage_backend: StorageBackendKind,
     pub profile_dir: Option<PathBuf>,
     pub reflex_disabled: bool,
     pub bind: String,
@@ -107,6 +111,7 @@ impl M3ServiceConfig {
     )]
     pub fn from_cli_parts(
         db_path: Option<PathBuf>,
+        storage_backend: StorageBackendKind,
         profile_dir: Option<PathBuf>,
         reflex_disabled: bool,
         bind: String,
@@ -119,6 +124,7 @@ impl M3ServiceConfig {
     ) -> Self {
         Self {
             db_path,
+            storage_backend,
             profile_dir,
             reflex_disabled,
             bind,
@@ -136,6 +142,7 @@ impl M3ServiceConfig {
     }
 
     pub fn from_env() -> Result<Self> {
+        let storage_backend_raw = std::env::var(STORAGE_BACKEND_ENV).ok();
         let reflex_disabled_raw = std::env::var(REFLEX_DISABLED_ENV).ok();
         let reflex_force_degraded_raw = std::env::var(REFLEX_FORCE_DEGRADED_ENV).ok();
         let storage_pressure_free_bytes_sample_raw =
@@ -146,6 +153,10 @@ impl M3ServiceConfig {
         let max_subscriptions_raw = std::env::var(MAX_SUBSCRIPTIONS_ENV).ok();
         Ok(Self {
             db_path: std::env::var_os(DB_ENV).map(PathBuf::from),
+            storage_backend: storage_backend_raw.as_deref().map_or_else(
+                || Ok(StorageBackendKind::default()),
+                StorageBackendKind::parse_config,
+            )?,
             profile_dir: std::env::var_os(PROFILE_DIR_ENV).map(PathBuf::from),
             reflex_disabled: parse_bool_env(REFLEX_DISABLED_ENV, reflex_disabled_raw.as_deref())?,
             enable_audio: parse_bool_env(ENABLE_AUDIO_ENV, enable_audio_raw.as_deref())?,
@@ -263,6 +274,7 @@ impl RealityWriteGrant {
 )]
 pub struct M3State {
     pub db_path: Option<PathBuf>,
+    pub storage_backend: StorageBackendKind,
     pub profile_dir: Option<PathBuf>,
     pub reflex_disabled: bool,
     pub bind: String,
@@ -288,7 +300,7 @@ pub struct M3State {
     pub calyx_vault_config: Option<synapse_calyx::SynapseCalyxConfig>,
     pub calyx_vault: Option<synapse_calyx::SynapseCalyxVault>,
     pub calyx_vault_status: synapse_calyx::SynapseCalyxVaultStatus,
-    /// Shared RocksDB handle. Opened once (eagerly at daemon startup, or lazily
+    /// Shared storage handle. Opened once (eagerly at daemon startup, or lazily
     /// on first reflex use) and reused by the reflex runtime so there is never
     /// a second open of the same path within this process.
     pub db: Option<Arc<Db>>,
@@ -409,6 +421,7 @@ impl M3State {
     ) -> Result<Self> {
         Self::from_parts_with_sse_state(
             config.db_path,
+            config.storage_backend,
             config.profile_dir,
             Some(bool_env_value(config.reflex_disabled)),
             config.bearer_token,
@@ -431,6 +444,7 @@ impl M3State {
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts_with_sse_state(
         db_path: Option<PathBuf>,
+        storage_backend: StorageBackendKind,
         profile_dir: Option<PathBuf>,
         reflex_disabled: Option<&str>,
         bearer_token: Option<String>,
@@ -479,6 +493,7 @@ impl M3State {
         };
         Ok(Self {
             db_path,
+            storage_backend,
             profile_dir,
             reflex_disabled: parse_bool_env(REFLEX_DISABLED_ENV, reflex_disabled)?,
             bind: bind
@@ -604,7 +619,7 @@ impl M3State {
         Ok(runtime)
     }
 
-    /// Open the shared RocksDB handle once and cache it; subsequent callers
+    /// Open the shared storage handle once and cache it; subsequent callers
     /// (including the reflex runtime) reuse the same handle, so the path is
     /// never opened twice within this process. Called eagerly at daemon startup
     /// for fail-fast lock/schema detection, and lazily otherwise.
@@ -621,7 +636,7 @@ impl M3State {
             return Ok(Arc::clone(db));
         }
         let db_path = self.db_path.clone().unwrap_or_else(default_db_path);
-        match Db::open(&db_path, SCHEMA_VERSION) {
+        match Db::open_with_backend(&db_path, SCHEMA_VERSION, self.storage_backend) {
             Ok(db) => {
                 let db = Arc::new(db);
                 self.db = Some(Arc::clone(&db));

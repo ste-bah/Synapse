@@ -80,7 +80,7 @@ pub(super) async fn handle(
         operation,
         source_of_truth: TELEMETRY_SOT.to_owned(),
         readback_source_of_truth:
-            "tool profile snapshot + RocksDB storage summary + ingress counters".to_owned(),
+            "tool profile snapshot + storage backend summary + ingress counters".to_owned(),
         status,
     }))
 }

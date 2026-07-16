@@ -10,6 +10,10 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub enum StorageError {
     #[error("storage open failed for {path:?}: {detail}")]
     OpenFailed { path: PathBuf, detail: String },
+    #[error("storage backend config invalid for {value:?}: {detail}")]
+    BackendInvalidConfig { value: String, detail: String },
+    #[error("storage backend {backend:?} unavailable: {detail}")]
+    BackendUnavailable { backend: String, detail: String },
     #[error("storage write failed while encoding {type_name}: {source}")]
     EncodeJson {
         type_name: &'static str,
@@ -44,6 +48,8 @@ impl StorageError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::OpenFailed { .. } => error_codes::STORAGE_OPEN_FAILED,
+            Self::BackendInvalidConfig { .. } => error_codes::STORAGE_BACKEND_INVALID_CONFIG,
+            Self::BackendUnavailable { .. } => error_codes::STORAGE_BACKEND_UNIMPLEMENTED,
             Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
                 error_codes::STORAGE_WRITE_FAILED
             }

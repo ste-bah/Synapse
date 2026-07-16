@@ -129,6 +129,13 @@ struct Cli {
     allow_non_loopback: bool,
     #[arg(long, env = "SYNAPSE_DB")]
     db: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "SYNAPSE_STORAGE_BACKEND",
+        default_value = "rocksdb",
+        value_name = "rocksdb|calyx"
+    )]
+    storage_backend: String,
     #[arg(long, env = "SYNAPSE_PROFILE_DIR")]
     profile_dir: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOG_LEVEL", default_value = "info")]
@@ -278,9 +285,19 @@ impl Cli {
         m2::M2ServiceConfig::from_env()
     }
 
-    fn m3_config(&self) -> m3::M3ServiceConfig {
+    fn m3_config(&self) -> anyhow::Result<m3::M3ServiceConfig> {
+        let storage_backend = synapse_storage::StorageBackendKind::parse_config(
+            &self.storage_backend,
+        )
+        .with_context(|| {
+            format!(
+                "parse --storage-backend/SYNAPSE_STORAGE_BACKEND value {:?}",
+                self.storage_backend
+            )
+        })?;
         let mut config = m3::M3ServiceConfig::from_cli_parts(
             self.db.clone(),
+            storage_backend,
             self.profile_dir.clone(),
             self.reflex_disabled,
             self.bind.clone(),
@@ -294,7 +311,7 @@ impl Cli {
         config.calyx_vault = self.calyx_vault;
         config.calyx_vault_dir = self.calyx_vault_dir.clone();
         config.calyx_config_path = self.calyx_config.clone();
-        config
+        Ok(config)
     }
 
     fn m4_config(&self) -> anyhow::Result<m4::M4ServiceConfig> {
@@ -451,7 +468,22 @@ async fn run() -> anyhow::Result<ExitCode> {
     );
 
     let m2_config = Cli::m2_config();
-    let m3_config = cli.m3_config();
+    let m3_config = match cli.m3_config() {
+        Ok(config) => config,
+        Err(error) => {
+            if let Some(storage_error) = error.downcast_ref::<synapse_storage::StorageError>() {
+                tracing::error!(
+                    code = storage_error.code(),
+                    detail = %storage_error,
+                    "storage backend configuration invalid"
+                );
+                eprintln!("synapse-mcp error: {error:#}");
+                drop(telemetry_guard);
+                return Ok(ExitCode::from(2));
+            }
+            return Err(error);
+        }
+    };
     let m4_config = match cli.m4_config() {
         Ok(config) => config,
         Err(error) => {
@@ -993,7 +1025,7 @@ async fn run_stdio(
     tracing::info!(code = "MCP_STDIO_STARTED", "starting stdio MCP transport");
 
     // Single-instance guard (epic #717 / single-daemon invariant): an embedded
-    // stdio daemon is a FULL daemon: it opens RocksDB and owns its own
+    // stdio daemon is a FULL daemon: it opens storage and owns its own
     // process-global input lease + per-session registries. Without this guard a
     // stray or misconfigured stdio launch would run a SECOND parallel daemon
     // whose lease/state cannot coordinate with the canonical HTTP daemon, which
@@ -1001,7 +1033,7 @@ async fn run_stdio(
     // lock before binding the port; the stdio path must obey the same rule.
     // Fail loud, naming the current holder, and point the operator at --mode
     // connect (the supported way for a stdio-only client to reach the shared
-    // daemon) instead of crashing later on a cryptic RocksDB LOCK error.
+    // daemon) instead of crashing later on a cryptic backend lock error.
     let db_path = m3_config
         .db_path
         .clone()

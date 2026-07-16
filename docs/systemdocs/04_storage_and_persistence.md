@@ -4,6 +4,7 @@
 
 - `crates/synapse-storage/Cargo.toml`
 - `crates/synapse-storage/src/lib.rs`
+- `crates/synapse-storage/src/backend.rs`
 - `crates/synapse-storage/src/cf.rs`
 - `crates/synapse-storage/src/codecs.rs`
 - `crates/synapse-storage/src/error.rs`
@@ -33,7 +34,11 @@
 
 ### 1.1 Engine
 
-The storage engine is **RocksDB**, via the `rocksdb` crate (`crates/synapse-storage/Cargo.toml`) with features `["lz4", "zstd", "multi-threaded-cf"]`. The only other persistence-relevant dependencies are `fs2` (free-space probing for disk pressure), `serde`/`serde_json` (codecs), `synapse-core`, `synapse-telemetry`, `thiserror`, `tokio`, and `tracing`.
+The public storage surface is the `synapse_storage::Db` facade. It keeps the existing `put_batch`, `get_cf`, scan, GC, pressure, and metrics API stable while an internal object-safe backend trait owns the concrete engine.
+
+`StorageBackendKind` accepts `rocksdb` (implemented default) and `calyx` (reserved for #1656). Selecting `calyx` before the Calyx backend lands fails closed with `StorageError::BackendUnavailable` / `STORAGE_BACKEND_UNIMPLEMENTED`; unknown strings fail closed with `StorageError::BackendInvalidConfig` / `STORAGE_BACKEND_INVALID_CONFIG`. The selected backend is visible in storage health and storage facade responses as `storage_backend`.
+
+The implemented backend is **RocksDB**, via the `rocksdb` crate (`crates/synapse-storage/Cargo.toml`) with features `["lz4", "zstd", "multi-threaded-cf"]`. The only other persistence-relevant dependencies are `fs2` (free-space probing for disk pressure), `serde`/`serde_json` (codecs), `synapse-core`, `synapse-telemetry`, `thiserror`, `tokio`, and `tracing`.
 
 The opened handle is the `Db` struct in `crates/synapse-storage/src/lib.rs`:
 
@@ -41,23 +46,30 @@ The opened handle is the `Db` struct in `crates/synapse-storage/src/lib.rs`:
 |---|---|---|
 | `path` | `PathBuf` | DB directory on disk |
 | `schema_version` | `u32` | schema version this binary opened with |
-| `batcher` | `batch::Batcher` | background write-batching thread |
-| `inner` | `Arc<DB>` | the RocksDB handle |
-| `pressure` | `Arc<pressure::PressureState>` | disk-pressure state machine |
+| `backend` | `Box<dyn StorageBackend>` | internal backend object; currently `RocksDbBackend` |
+
+`RocksDbBackend` in `backend.rs` owns the RocksDB `Arc<DB>`, the background `batch::Batcher`, and the `pressure::PressureState`.
 
 ### 1.2 On-disk location
 
-The DB lives in a single RocksDB directory. The default path is computed by `default_db_path()` in `crates/synapse-mcp/src/m3.rs`:
+The DB lives in a single storage directory. For the `rocksdb` backend this is a RocksDB directory. The default path is computed by `default_db_path()` in `crates/synapse-mcp/src/m3.rs`:
 
 ```
 %LOCALAPPDATA%\synapse\db        (falls back to std::env::temp_dir()/synapse/db when LOCALAPPDATA is unset)
 ```
 
-It is opened via `Db::open(&db_path, SCHEMA_VERSION)` (`crates/synapse-mcp/src/m3.rs`). A single-instance lock (`SingleInstanceGuard`) is acquired on the same directory before open.
+It is opened via `Db::open_with_backend(&db_path, SCHEMA_VERSION, storage_backend)` (`crates/synapse-mcp/src/m3.rs`). A single-instance lock (`SingleInstanceGuard`) is acquired on the same directory before open.
 
-### 1.3 Open sequence (`Db::open`, `crates/synapse-storage/src/lib.rs`)
+### 1.3 Open sequence (`Db::open_with_backend`, `crates/synapse-storage/src/lib.rs`)
 
-1. Build base `Options` from `db_options()`.
+1. Parse `--storage-backend` / `SYNAPSE_STORAGE_BACKEND` into `StorageBackendKind`.
+2. `rocksdb` delegates to `RocksDbBackend::open`.
+3. `calyx` returns `BackendUnavailable` with `STORAGE_BACKEND_UNIMPLEMENTED`.
+4. Unknown values return `BackendInvalidConfig` with `STORAGE_BACKEND_INVALID_CONFIG`.
+
+`RocksDbBackend::open` then:
+
+1. Builds base `Options` from `db_options()`.
 2. `DB::list_cf(...)` enumerates the CFs physically present on disk (errors are ignored — a fresh DB).
 3. Any on-disk CF that is neither `default` nor in `cf::ALL_COLUMN_FAMILIES` is treated as an **unknown CF**: it is opened with `Options::default()` and a `STORAGE_UNKNOWN_CF_OPENED` warning. Rows are preserved untouched — this is rollback safety so an older binary does not brick the DB after a CF was added.
 4. Descriptors = every known CF (with `cf_options(name)`) chained with every unknown CF (default options).
@@ -82,7 +94,7 @@ It is opened via `Db::open(&db_path, SCHEMA_VERSION)` (`crates/synapse-mcp/src/m
 | `level_zero_file_num_compaction_trigger` | `4` |
 | block cache | LRU, `BLOCK_CACHE_BYTES` = `64 MiB` (via `apply_block_cache`) |
 
-Module constants (`crates/synapse-storage/src/lib.rs`): `MIB = 1024*1024`, `DEFAULT_WRITE_BUFFER_BYTES = 64*MIB`, `MODEL_CACHE_WRITE_BUFFER_BYTES = 256*MIB`, `BLOCK_CACHE_BYTES = 64*MIB`, `TIMELINE_PERIODIC_COMPACTION_SECONDS = 86_400` (1 day).
+Module constants (`crates/synapse-storage/src/backend.rs`): `MIB = 1024*1024`, `DEFAULT_WRITE_BUFFER_BYTES = 64*MIB`, `MODEL_CACHE_WRITE_BUFFER_BYTES = 256*MIB`, `BLOCK_CACHE_BYTES = 64*MIB`, `TIMELINE_PERIODIC_COMPACTION_SECONDS = 86_400` (1 day).
 
 ### 1.5 Per-CF tuning (`cf_options(name)`)
 
@@ -110,9 +122,9 @@ The fixed 8-byte prefix extractor matches the 8-byte big-endian `ts_ns` prefix o
 | `SCHEMA_VERSION` | `crates/synapse-core/src/defaults.rs` | `1` |
 | `PROFILE_SCHEMA_VERSION` | `crates/synapse-core/src/types/profile.rs` | `2` (profile docs, separate axis) |
 
-The storage sentinel key is `__schema_version` (`SCHEMA_VERSION_KEY = b"__schema_version"` in `lib.rs`), stored in the RocksDB **default** CF as a 4-byte big-endian `u32`.
+The storage sentinel key is `__schema_version` (`SCHEMA_VERSION_KEY = b"__schema_version"` in `backend.rs`), stored in the RocksDB **default** CF as a 4-byte big-endian `u32`.
 
-`verify_schema_version()` (`crates/synapse-storage/src/lib.rs`):
+`verify_schema_version()` (`crates/synapse-storage/src/backend.rs`):
 
 - If the key is **absent** (fresh DB), it writes `schema_version.to_be_bytes()`.
 - If present, it decodes via `decode_schema_version()` (`u32::from_be_bytes` over exactly 4 bytes; otherwise `None`).
@@ -146,7 +158,7 @@ The storage sentinel key is `__schema_version` (`SCHEMA_VERSION_KEY = b"__schema
 | `CF_AGENT_EVENTS` | Agent lifecycle/telemetry journal (`AgentEventRecord`) | `ts_ns (8 BE) ‖ seq (4 BE)` (12 B) | JSON | §6.3; TTL 30 d; append-only |
 | `CF_AGENT_TRANSCRIPTS` | Normalized agent transcripts (`AgentTranscriptRecord`) | `spawn_id ‖ 0x00 ‖ line_no (8 BE)` | JSON | §6.4; TTL 30 d; idempotent re-ingest |
 
-`Db` exposes read/scan helpers over CFs: `scan_cf`, `scan_cf_prefix`, `scan_cf_prefix_from` (stops when key no longer matches prefix), `scan_cf_from` (paged window, returns `(rows, more)`), `scan_cf_tail` (last N rows, re-reversed to ascending), `compact_cf`, `compact_cf_range`. Size/metric helpers: `cf_sizes` (exact byte scan), `cf_row_counts` (exact), `cf_live_data_size_estimates` / `cf_estimated_row_counts` (RocksDB property-backed, cheaper; missing properties returned as 0 plus a list of CF names).
+`Db` exposes read/scan helpers over CFs: `scan_cf`, `scan_cf_prefix`, `scan_cf_prefix_from` (stops when key no longer matches prefix), `scan_cf_from` (paged window, returns `(rows, more)`), `scan_cf_tail` (last N rows, re-reversed to ascending), `compact_cf`, `compact_cf_range`. Size/metric helpers: `cf_sizes` (exact byte scan), `cf_row_counts` (exact), `cf_live_data_size_estimates` / `cf_estimated_row_counts` (backend property-backed when available; missing properties returned as 0 plus a list of CF names).
 
 ---
 
@@ -433,6 +445,8 @@ Batcher mechanics: the worker accepts `Write`/`Flush`/`Shutdown` commands over a
 | Variant | Fields | `code()` (`error_codes`) |
 |---|---|---|
 | `OpenFailed` | `path: PathBuf`, `detail: String` | `STORAGE_OPEN_FAILED` |
+| `BackendInvalidConfig` | `value: String`, `detail: String` | `STORAGE_BACKEND_INVALID_CONFIG` |
+| `BackendUnavailable` | `backend: String`, `detail: String` | `STORAGE_BACKEND_UNIMPLEMENTED` |
 | `EncodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_WRITE_FAILED` |
 | `DecodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_READ_FAILED` |
 | `WriteFailed` | `cf_name: String`, `detail: String` | `STORAGE_WRITE_FAILED` |
@@ -440,7 +454,7 @@ Batcher mechanics: the worker accepts `Write`/`Flush`/`Shutdown` commands over a
 | `ReadFailed` | `cf_name: String`, `detail: String` | `STORAGE_READ_FAILED` |
 | `SchemaMismatch` | `expected: u32`, `actual: u32` | `STORAGE_SCHEMA_MISMATCH` |
 
-Related codes emitted via tracing (not `StorageError` variants): `STORAGE_UNKNOWN_CF_OPENED` (warn on rollback-unknown CF), `STORAGE_CF_HARD_CAP_REACHED` (GC), `STORAGE_DISK_PRESSURE_LEVEL_1..4` (pressure transitions). All `STORAGE_*` codes are defined in `crates/synapse-core/src/error_codes.rs`.
+Related codes emitted via tracing (not `StorageError` variants): `STORAGE_BACKEND_OPENED`, `STORAGE_UNKNOWN_CF_OPENED` (warn on rollback-unknown CF), `STORAGE_CF_HARD_CAP_REACHED` (GC), `STORAGE_DISK_PRESSURE_LEVEL_1..4` (pressure transitions). All `STORAGE_*` codes are defined in `crates/synapse-core/src/error_codes.rs`.
 
 ---
 

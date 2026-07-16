@@ -22,6 +22,13 @@ impl ReflexRuntime {
         self.db.schema_version
     }
 
+    /// Returns the storage backend backing this runtime.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_backend_name(&self) -> &'static str {
+        self.db.backend_name()
+    }
+
     /// Returns the current storage pressure level backing reflex persistence.
     #[must_use]
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
@@ -45,7 +52,7 @@ impl ReflexRuntime {
         self.db.cf_sizes()
     }
 
-    /// Returns `RocksDB`'s live-data-size estimate for each storage column family.
+    /// Returns the storage backend's live-data-size estimate for each column family.
     ///
     /// # Errors
     ///
@@ -67,7 +74,7 @@ impl ReflexRuntime {
         self.db.cf_row_counts()
     }
 
-    /// Returns `RocksDB`'s estimated row count for each storage column family.
+    /// Returns the storage backend's estimated row count for each column family.
     ///
     /// # Errors
     ///

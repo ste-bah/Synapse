@@ -430,12 +430,18 @@ impl SynapseService {
                     .db_path
                     .as_ref()
                     .map(|path| path.display().to_string());
+                let storage_backend = state
+                    .db
+                    .as_ref()
+                    .map_or(state.storage_backend.as_str(), |db| db.backend_name())
+                    .to_owned();
                 let maintenance = state.storage_maintenance_readback();
                 if let Some(error) = &state.storage_last_error {
                     let mut health = SubsystemHealth {
                         status: "error".to_owned(),
                         detail: Some(error.clone()),
                         db_path,
+                        storage_backend: Some(storage_backend),
                         ..SubsystemHealth::default()
                     };
                     apply_storage_maintenance_fields(&mut health, &maintenance);
@@ -462,6 +468,7 @@ impl SynapseService {
                                 None => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
                             }),
                             db_path,
+                            storage_backend: Some(storage_backend),
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
                             cf_sizes,
                             ..SubsystemHealth::default()
@@ -473,6 +480,7 @@ impl SynapseService {
                         status: "initializing".to_owned(),
                         detail: Some("storage opens on first reflex tool call".to_owned()),
                         db_path,
+                        storage_backend: Some(storage_backend),
                         ..SubsystemHealth::default()
                     };
                     apply_storage_maintenance_fields(&mut health, &maintenance);
@@ -489,11 +497,12 @@ impl SynapseService {
                                 ),
                                 detail: Some(match maintenance_error {
                                     Some(error) => format!(
-                                        "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance unhealthy: {error}"
+                                        "storage runtime initialized; cf_sizes use backend live-data estimates; maintenance unhealthy: {error}"
                                     ),
-                                    None => "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance tasks running and pressure probe observed".to_owned(),
+                                    None => "storage runtime initialized; cf_sizes use backend live-data estimates; maintenance tasks running and pressure probe observed".to_owned(),
                                 }),
                                 db_path: Some(runtime.storage_path().display().to_string()),
+                                storage_backend: Some(runtime.storage_backend_name().to_owned()),
                                 schema_version: Some(runtime.schema_version()),
                                 cf_sizes: Some(cf_sizes.0),
                                 ..SubsystemHealth::default()
@@ -506,6 +515,7 @@ impl SynapseService {
                                 status: "error".to_owned(),
                                 detail: Some(error.to_string()),
                                 db_path: Some(runtime.storage_path().display().to_string()),
+                                storage_backend: Some(runtime.storage_backend_name().to_owned()),
                                 schema_version: Some(runtime.schema_version()),
                                 ..SubsystemHealth::default()
                             };
@@ -520,6 +530,7 @@ impl SynapseService {
                                 "reflex runtime lock poisoned while reading storage".to_owned(),
                             ),
                             db_path,
+                            storage_backend: Some(storage_backend),
                             ..SubsystemHealth::default()
                         };
                         apply_storage_maintenance_fields(&mut health, &maintenance);

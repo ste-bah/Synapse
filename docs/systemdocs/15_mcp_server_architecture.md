@@ -22,10 +22,10 @@ The `synapse-mcp` binary is the Synapse daemon: a Model Context Protocol (MCP) s
 
 The server runs in one of two transport modes:
 
-- **stdio** (`--mode stdio`, default) — an embedded full daemon speaking JSON-RPC over stdin/stdout via `rmcp::transport::stdio()`. This is a complete daemon: it opens RocksDB and owns its own input lease and session registries.
+- **stdio** (`--mode stdio`, default) — an embedded full daemon speaking JSON-RPC over stdin/stdout via `rmcp::transport::stdio()`. This is a complete daemon: it opens the configured storage backend and owns its own input lease and session registries.
 - **HTTP / SSE** (`--mode http`) — an axum HTTP server (default bind `127.0.0.1:7700`) exposing the rmcp Streamable HTTP transport at `/mcp`, plus a separate daemon-owned SSE event channel at `/events`, a `/health` endpoint, dashboard routes, and Chrome native-host bridge routes.
 
-Because a daemon owns a process-global input lease and a single RocksDB directory, **only one daemon may own a given DB path at a time** (enforced via `single_instance.rs`, section 5). Stdio-only clients that need to reach the shared HTTP daemon use the thin `--mode connect` bridge rather than spawning a second daemon.
+Because a daemon owns a process-global input lease and a single storage directory, **only one daemon may own a given DB path at a time** (enforced via `single_instance.rs`, section 5). Stdio-only clients that need to reach the shared HTTP daemon use the thin `--mode connect` bridge rather than spawning a second daemon.
 
 The MCP server identifies itself (`get_info`, `server/handler.rs`) as:
 
@@ -69,7 +69,8 @@ The `Mode` enum (`main.rs`) selects behavior. There are no clap subcommands; mod
 | `--mode` | `SYNAPSE_MODE` | `stdio` | Transport / sub-process mode |
 | `--bind` | `SYNAPSE_BIND` | `127.0.0.1:7700` | HTTP bind address |
 | `--allow-non-loopback` | `SYNAPSE_ALLOW_NON_LOOPBACK` | false | Permit non-loopback HTTP bind |
-| `--db` | `SYNAPSE_DB` | `%LOCALAPPDATA%\synapse\db` | RocksDB directory |
+| `--db` | `SYNAPSE_DB` | `%LOCALAPPDATA%\synapse\db` | Storage directory |
+| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `rocksdb` | `synapse_storage::Db` backend; `calyx` is reserved for #1656 and fails closed until implemented |
 | `--profile-dir` | `SYNAPSE_PROFILE_DIR` | — | App profile directory |
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | `info` | Tracing level |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | false | Disable M3 reflex runtime |
@@ -122,7 +123,7 @@ The tool surface is organized into four milestone layers (`m1`/`m2`/`m3`/`m4`), 
 
 ### M3 — Memory / Reflexes
 
-`M3ServiceConfig` fields: `db_path`, `profile_dir`, `reflex_disabled`, `bind`, `bearer_token` (from `SYNAPSE_BEARER_TOKEN`), `max_subscriptions`, `enable_audio`, `allow_unknown_profile`, `allowed_permissions`, `reflex_force_degraded`, `storage_pressure_free_bytes_sample`. `default_db_path()` → `%LOCALAPPDATA%\synapse\db`. `M3State` adds the shared RocksDB handle, profile/reflex runtimes, `SseState`, activity recorder, audio runtime, intent tracker, and audit-session maps. M3 exposes the largest tool surface (~58 tool stubs).
+`M3ServiceConfig` fields: `db_path`, `storage_backend`, `profile_dir`, `reflex_disabled`, `bind`, `bearer_token` (from `SYNAPSE_BEARER_TOKEN`), `max_subscriptions`, `enable_audio`, `allow_unknown_profile`, `allowed_permissions`, `reflex_force_degraded`, `storage_pressure_free_bytes_sample`. `default_db_path()` → `%LOCALAPPDATA%\synapse\db`. `M3State` adds the shared storage handle, profile/reflex runtimes, `SseState`, activity recorder, audio runtime, intent tracker, and audit-session maps. M3 exposes the largest tool surface (~58 tool stubs).
 
 ### M4 — Effector
 
@@ -153,7 +154,7 @@ The stdio transport wraps stdin in `CancelOnEofRead<R>`, an `AsyncRead` adapter.
 3. `SingleInstanceGuard::acquire` — `AlreadyRunning` → `MCP_DAEMON_ALREADY_RUNNING`, exit **3**.
 4. `daemon_lifecycle::configure(mode="http", ...)` + panic hook.
 5. `TcpListener::bind`, create shutdown/connection-closed cancellation tokens, build `SseState`.
-6. Eager RocksDB open (failure → exit **4**, distinguishing `STORAGE_LOCK_CONTENDED` vs `STORAGE_OPEN_FAILED`) and eager activity-recorder start (failure → exit **4**).
+6. Eager storage backend open (failure → exit **4**, distinguishing lock contention, `STORAGE_OPEN_FAILED`, `STORAGE_BACKEND_INVALID_CONFIG`, and `STORAGE_BACKEND_UNIMPLEMENTED`) and eager activity-recorder start (failure → exit **4**).
 7. Spawn background tasks (routine miner, intent detector, armed-routine runner, transcript ingester, ambient-agent discovery) and the operator hotkey.
 8. Build the axum `Router`, then `axum::serve(...).with_graceful_shutdown(...)`, racing server completion against the shutdown signal.
 
@@ -316,7 +317,7 @@ Per-session durable tool-profile gating (RocksDB `CF_SESSIONS`, key `mcp/tool-pr
 
 ### 8.1 Health (`server/health.rs`)
 
-The `health` tool / `GET /health` returns a `Health` payload: `ok` (true iff no subsystem is `"error"`), `version`, `build` (git SHA or `"dev"`), `pid`, `uptime_s`, `tool_count`, `tool_surface_sha256`, `tool_names`, and a `subsystems` map. Subsystems aggregated: `storage` (RocksDB CF sizes + disk-pressure level + schema version), `reflex` (active/sample counts, tick jitter, degraded/disabled), `profiles`, `perception`, `action` (emitter availability, recording, operator-hotkey label, allow_shell/launch counts, input-lease owner/expiry, backend-resolution policy), `audio`, `chrome_bridge`, `http` (bind addr, active sessions, SSE subscriber count; `disabled` in stdio), `daemon_drain`, and `daemon_lifecycle`. `tool_surface_sha256` is a deterministic SHA-256 of the session-profile-gated, canonically key-sorted tool list, for drift detection.
+The `health` tool / `GET /health` returns a `Health` payload: `ok` (true iff no subsystem is `"error"`), `version`, `build` (git SHA or `"dev"`), `pid`, `uptime_s`, `tool_count`, `tool_surface_sha256`, `tool_names`, and a `subsystems` map. Subsystems aggregated: `storage` (storage backend, CF sizes + disk-pressure level + schema version), `reflex` (active/sample counts, tick jitter, degraded/disabled), `profiles`, `perception`, `action` (emitter availability, recording, operator-hotkey label, allow_shell/launch counts, input-lease owner/expiry, backend-resolution policy), `audio`, `chrome_bridge`, `http` (bind addr, active sessions, SSE subscriber count; `disabled` in stdio), `daemon_drain`, and `daemon_lifecycle`. `tool_surface_sha256` is a deterministic SHA-256 of the session-profile-gated, canonically key-sorted tool list, for drift detection.
 
 ### 8.2 Doctor
 

@@ -1728,13 +1728,13 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "storage",
         "StorageOperation",
-        "RocksDB CF metadata + exact row readbacks",
+        "storage backend CF metadata + exact row readbacks",
         &[
             op(
                 "inspect",
                 false,
                 false,
-                "RocksDB CF sizes/counts/samples",
+                "storage backend CF sizes/counts/samples",
                 None,
                 error_codes::STORAGE_READ_FAILED,
                 "inspect storage health and CF metadata before mutating",
@@ -1743,7 +1743,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "summary",
                 false,
                 false,
-                "RocksDB CF live-data estimates + exact row counts",
+                "storage backend CF live-data estimates + exact row counts",
                 None,
                 error_codes::STORAGE_READ_FAILED,
                 "repair storage initialization and read CF metadata again",
@@ -1752,7 +1752,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "gc_once",
                 true,
                 false,
-                "RocksDB CF row counts + audit retention report rows",
+                "storage backend CF row counts + audit retention report rows",
                 Some("CF row-count and GC report readback after pass"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to an explicit maintenance profile before running GC",

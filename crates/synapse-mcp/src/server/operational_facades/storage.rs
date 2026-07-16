@@ -54,7 +54,8 @@ pub(super) async fn handle(
             Ok(Json(storage_response(
                 operation,
                 format!(
-                    "RocksDB CF rows={} pressure={}",
+                    "{} CF rows={} pressure={}",
+                    response.storage_backend,
                     response.cf_row_counts.len(),
                     response.pressure_level.name
                 ),
@@ -74,13 +75,14 @@ pub(super) async fn handle(
                     "storage_summary",
                     STORAGE_SOT,
                     error,
-                    "repair storage initialization and read RocksDB CF metadata again",
+                    "repair storage initialization and read storage backend CF metadata again",
                 )
             })?;
             Ok(Json(storage_response(
                 operation,
                 format!(
-                    "RocksDB summary cf_count={} pressure={}",
+                    "{} summary cf_count={} pressure={}",
+                    response.storage_backend,
                     response.cf_row_counts.len(),
                     response.pressure_level.name
                 ),

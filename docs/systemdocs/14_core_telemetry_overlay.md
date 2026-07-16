@@ -133,7 +133,7 @@ All types below are re-exported flat from `synapse_core::types` (and most from `
 #### Health (`types/health.rs`)
 
 - **`Health`** — `ok`, `version`, `build`, `pid:u32`, `uptime_s:u64`, `tool_count`, `tool_surface_sha256`, `tool_names: Vec<String>`, `subsystems: BTreeMap<String, SubsystemHealth>`.
-- **`SubsystemHealth`** — `status`, `detail`, plus a large set of optional per-subsystem fields (profile/capture/reflex/storage/HTTP/audio/shell-policy diagnostics).
+- **`SubsystemHealth`** — `status`, `detail`, plus a large set of optional per-subsystem fields (profile/capture/reflex/storage/HTTP/audio/shell-policy diagnostics), including storage `db_path`, `storage_backend`, `schema_version`, CF sizes, and maintenance readbacks.
 
 ### 1.3 Error-code catalog — `error_codes.rs`
 
@@ -300,6 +300,8 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | Code | Meaning |
 | --- | --- |
 | `STORAGE_OPEN_FAILED` | Storage open failed. |
+| `STORAGE_BACKEND_INVALID_CONFIG` | Storage backend config value was not recognized. |
+| `STORAGE_BACKEND_UNIMPLEMENTED` | Selected storage backend is known but unavailable in this binary. |
 | `STORAGE_WRITE_FAILED` | Storage write failed. |
 | `STORAGE_READ_FAILED` | Storage read failed. |
 | `STORAGE_CORRUPTED` | Storage corrupted. |

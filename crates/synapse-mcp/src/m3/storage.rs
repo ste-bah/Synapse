@@ -87,6 +87,7 @@ pub struct StoragePressureSampleParams {
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectResponse {
     pub schema_version: u32,
+    pub storage_backend: String,
     pub pressure_level: StoragePressureLevel,
     pub pressure_transition_codes: Vec<String>,
     pub audit_retention_policies: Vec<AuditRetentionPolicy>,
@@ -99,6 +100,7 @@ pub struct StorageInspectResponse {
 #[serde(deny_unknown_fields)]
 pub struct StorageSummaryResponse {
     pub schema_version: u32,
+    pub storage_backend: String,
     pub pressure_level: StoragePressureLevel,
     pub pressure_transition_codes: Vec<String>,
     pub audit_retention_policy_count: usize,
@@ -254,6 +256,7 @@ pub fn inspect_storage_summary(
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageSummaryResponse {
         schema_version: runtime.schema_version(),
+        storage_backend: runtime.storage_backend_name().to_owned(),
         pressure_level: pressure_level(runtime.storage_pressure_level()),
         pressure_transition_codes: runtime
             .storage_pressure_transition_codes()
@@ -262,7 +265,10 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: "rocksdb_live_data_size_estimates_estimated_row_counts".to_owned(),
+        metrics_mode: format!(
+            "{}_live_data_size_estimates_estimated_row_counts",
+            runtime.storage_backend_name()
+        ),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
@@ -397,6 +403,7 @@ pub fn apply_storage_pressure_sample(
 fn inspect_locked(runtime: &ReflexRuntime) -> Result<StorageInspectResponse, ErrorData> {
     Ok(StorageInspectResponse {
         schema_version: runtime.schema_version(),
+        storage_backend: runtime.storage_backend_name().to_owned(),
         pressure_level: pressure_level(runtime.storage_pressure_level()),
         pressure_transition_codes: runtime
             .storage_pressure_transition_codes()

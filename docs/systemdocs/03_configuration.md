@@ -18,7 +18,7 @@
 
 Synapse has **no global TOML/JSON config file** for the daemon itself. Most configuration is via (1) CLI flags, (2) environment variables, and (3) on-disk locations derived from `%LOCALAPPDATA%` / `%APPDATA%`. The daemon also reads two scoped files: the bearer-token file `%APPDATA%\synapse\token.txt`, and an optional Calyx-only TOML file supplied by `--calyx-config` / `SYNAPSE_CALYX_CONFIG` whose only accepted section is `[calyx]`. Many flags accept a matching `env =` fallback through `clap`.
 
-See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB store, and [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for the server/daemon model.
+See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the storage backend, and [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for the server/daemon model.
 
 ---
 
@@ -54,7 +54,8 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--mode` | `SYNAPSE_MODE` | enum | `stdio` | One of `stdio`, `http`, `connect`, `chrome-native-host`, `approval-protocol`, `desktop-worker`, `doctor`, `local-agent`. |
 | `--bind` | `SYNAPSE_BIND` | string | `127.0.0.1:7700` | HTTP server bind address (host:port). Also the single-daemon port. |
 | `--allow-non-loopback` | `SYNAPSE_ALLOW_NON_LOOPBACK` | bool | `false` | Permit binding/serving on a non-loopback address. |
-| `--db` | `SYNAPSE_DB` | path | (derived, see §4) | RocksDB store path. |
+| `--db` | `SYNAPSE_DB` | path | (derived, see §4) | Storage directory path. |
+| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `rocksdb` or `calyx` | `rocksdb` | Selects the `synapse_storage::Db` backend. `rocksdb` is the implemented default. `calyx` is reserved for #1656 and fails closed with `STORAGE_BACKEND_UNIMPLEMENTED` until that backend lands. Unknown values fail startup with `STORAGE_BACKEND_INVALID_CONFIG`. |
 | `--profile-dir` | `SYNAPSE_PROFILE_DIR` | path | bundled dir (see [11]) | Profile package directory. See profiles doc (11) for layout. |
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | string | `info` | Tracing level (`off`/`error`/`warn`/`info`/`debug`/`trace`). Parsed as `LevelFilter`. |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | bool | `false` | Disable the reflex runtime. |
@@ -112,7 +113,8 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | Name | Read in | Type | Default | Description |
 |------|---------|------|---------|-------------|
 | `LOCALAPPDATA` | many (telemetry, m3, m4, models, etc.) | path | (Windows-provided) | Root for db/logs/models/runs/shell dirs (see §4). |
-| `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | RocksDB store path (also CLI `--db`). |
+| `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | Storage directory path (also CLI `--db`). |
+| `SYNAPSE_STORAGE_BACKEND` | `m3.rs` (`STORAGE_BACKEND_ENV`) and `main.rs` (`--storage-backend`) | enum | `rocksdb` | Selects `rocksdb` or `calyx`; invalid strings fail closed before serving. |
 | `SYNAPSE_ACTION_RECOVERY_FILE` | `synapse-action/recovery.rs` (`RECOVERY_FILE_ENV`) | path | derived (§4) | Held-input crash-recovery JSONL ledger path. |
 | `SYNAPSE_SHELL_SESSION_DIR` | `m4.rs` (`SHELL_SESSION_DIR_ENV`) | path | derived (§4) | Per-session shell working/session dir override. |
 | `SYNAPSE_SHELL_WORKING_DIR` | `m4.rs` (`SHELL_WORKING_DIR_ENV`) | path | none | Working dir for shell jobs. |
@@ -271,7 +273,7 @@ All derivations assume Windows (the supported platform). Non-Windows fallbacks u
 
 | Logical name | Path / derivation | Source | Contents | Tier |
 |--------------|-------------------|--------|----------|------|
-| RocksDB store | `--db` / `SYNAPSE_DB`, else `%LOCALAPPDATA%\synapse\db` (falls back to `std::env::temp_dir()\synapse\db` if `LOCALAPPDATA` unset) | `m3.rs::default_db_path` | Timeline, episodes, agent events/transcripts, routines, KV, profiles history. | sacred (regenerable only by re-observing) |
+| Storage directory | `--db` / `SYNAPSE_DB`, else `%LOCALAPPDATA%\synapse\db` (falls back to `std::env::temp_dir()\synapse\db` if `LOCALAPPDATA` unset) | `m3.rs::default_db_path`; backend from `--storage-backend` / `SYNAPSE_STORAGE_BACKEND` | Timeline, episodes, agent events/transcripts, routines, KV, profiles history. | sacred (regenerable only by re-observing) |
 | Setup daemon db | `%LOCALAPPDATA%\synapse\db-daemon` (setup `-DbPath` default) | `synapse-setup.ps1` | Same as above for the installed daemon. | sacred |
 | Log dir | `%LOCALAPPDATA%\synapse\logs` (or `SYNAPSE_LOG_DIR`) | `synapse-telemetry::default_log_dir` | `synapse.log` (daily-rolled) + GC'd rotations; `daemon-launcher.log`. | regenerable |
 | Models dir | `%LOCALAPPDATA%\synapse\models` (falls back to `.\synapse\models`) | `synapse-models::default_model_dir` | Side-loaded ONNX models (e.g. `yolov10n_general.onnx`). See [13_models_subsystem.md]. | sacred (manually side-loaded; downloads disabled) |
@@ -299,7 +301,7 @@ WSL has two separate configuration sources. Keep them distinct:
 
 Do not put `[experimental]`, `autoMemoryReclaim`, or `sparseVhd` in `/etc/wsl.conf`. Current WSL builds report those as unknown per-distro keys on every `wsl.exe` invocation, which pollutes stderr for WSL-backed MCP wrappers and host readbacks.
 
-See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB internals.
+See [04_storage_and_persistence.md](04_storage_and_persistence.md) for storage internals.
 
 ---
 
@@ -320,7 +322,7 @@ See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the Rocks
 | Item | Value | Source |
 |------|-------|--------|
 | Default bind / daemon port | `127.0.0.1:7700` (`DEFAULT_BIND`) | `m3.rs`, `main.rs`, `synapse-setup.ps1` |
-| Single-daemon invariant | Embedded stdio daemon and HTTP daemon both open RocksDB; a single-instance guard prevents a second parallel daemon (#717). | `main.rs` (`run_stdio`), `single_instance.rs` |
+| Single-daemon invariant | Embedded stdio daemon and HTTP daemon both open the configured storage directory; a single-instance guard prevents a second parallel daemon (#717). | `main.rs` (`run_stdio`), `single_instance.rs` |
 | Local-agent MCP URL | `http://127.0.0.1:7700/mcp` | `main.rs` |
 | Bearer-token source order | `%APPDATA%\synapse\token.txt` (if present & non-empty) → `SYNAPSE_BEARER_TOKEN` env | `http/auth.rs::load_token` |
 | Auth header | `Authorization: Bearer <token>`; scheme case-insensitive, empty token rejected | `http/auth.rs::bearer_token` |
@@ -353,7 +355,7 @@ See [15_mcp_server_architecture.md](15_mcp_server_architecture.md).
 ---
 
 ## 8. Cross-references
-- Storage layout & RocksDB column families: [04_storage_and_persistence.md](04_storage_and_persistence.md)
+- Storage backend layout & column families: [04_storage_and_persistence.md](04_storage_and_persistence.md)
 - Profiles directory layout & loading: profiles doc (11)
 - Models directory & ONNX side-loading: [13_models_subsystem.md](13_models_subsystem.md)
 - Server/daemon architecture, single-instance, HTTP transport: [15_mcp_server_architecture.md](15_mcp_server_architecture.md)
