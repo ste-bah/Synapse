@@ -4,9 +4,9 @@ use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
 
 pub const FORMULA_COVERAGE_SURFACE: &str = "formula-coverage";
-pub const FORMULA_COVERAGE_ARTIFACT_KIND: &str = "prd22.formula-coverage.v1";
-pub const FORMULA_COVERAGE_SCHEMA_VERSION: u64 = 1;
-pub const FORMULA_COVERAGE_SOT_KEY: &str = "formula_coverage/prd22";
+pub const FORMULA_COVERAGE_ARTIFACT_KIND: &str = "prd22.formula-coverage.v2";
+pub const FORMULA_COVERAGE_SCHEMA_VERSION: u64 = 2;
+pub const FORMULA_COVERAGE_SOT_KEY: &str = "formula_coverage/prd22/v2";
 pub const CALYX_FORMULA_COVERAGE_MISSING: &str = "CALYX_FORMULA_COVERAGE_MISSING";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub struct FormulaCoverageArtifact {
     pub schema_version: u64,
     pub source_of_truth: String,
     pub generated_at: u64,
-    pub fsv_root: String,
+    pub evidence_root: String,
     pub rows: Vec<FormulaCoverageRow>,
     pub summary: FormulaCoverageSummary,
 }
@@ -35,8 +35,8 @@ pub struct FormulaCoverageRow {
     pub engine: String,
     pub callable: String,
     pub tunable_params: Vec<String>,
-    pub test: String,
-    pub fsv_root: String,
+    pub evidence: String,
+    pub evidence_root: String,
     pub status: FormulaCoverageStatus,
 }
 
@@ -55,7 +55,7 @@ pub struct FormulaRowSpec {
     pub engine: &'static str,
     pub callable: &'static str,
     pub tunable_params: &'static [&'static str],
-    pub test: &'static str,
+    pub evidence: &'static str,
 }
 
 pub fn prd22_formula_specs() -> &'static [FormulaRowSpec] {
@@ -63,13 +63,13 @@ pub fn prd22_formula_specs() -> &'static [FormulaRowSpec] {
 }
 
 pub fn formula_coverage_artifact(
-    fsv_root: impl Into<String>,
+    evidence_root: impl Into<String>,
     generated_at: u64,
 ) -> FormulaCoverageArtifact {
-    let fsv_root = fsv_root.into();
+    let evidence_root = evidence_root.into();
     let rows = FORMULA_ROWS
         .iter()
-        .map(|spec| spec.row(&fsv_root))
+        .map(|spec| spec.row(&evidence_root))
         .collect::<Vec<_>>();
     let summary = coverage_summary(&rows);
     FormulaCoverageArtifact {
@@ -78,14 +78,17 @@ pub fn formula_coverage_artifact(
         schema_version: FORMULA_COVERAGE_SCHEMA_VERSION,
         source_of_truth: format!("Aster assay CF key {FORMULA_COVERAGE_SOT_KEY} + artifact file"),
         generated_at,
-        fsv_root,
+        evidence_root,
         rows,
         summary,
     }
 }
 
-pub fn formula_coverage_json(fsv_root: impl Into<String>, generated_at: u64) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(&formula_coverage_artifact(fsv_root, generated_at))
+pub fn formula_coverage_json(
+    evidence_root: impl Into<String>,
+    generated_at: u64,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&formula_coverage_artifact(evidence_root, generated_at))
         .map_err(|error| coverage_error(format!("serialize formula coverage: {error}")))
 }
 
@@ -115,7 +118,7 @@ pub fn validate_formula_coverage(
 }
 
 impl FormulaRowSpec {
-    fn row(self, fsv_root: &str) -> FormulaCoverageRow {
+    fn row(self, evidence_root: &str) -> FormulaCoverageRow {
         FormulaCoverageRow {
             formula: self.formula.to_string(),
             prd_ref: self.prd_ref.to_string(),
@@ -126,14 +129,14 @@ impl FormulaRowSpec {
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
-            test: self.test.to_string(),
-            fsv_root: fsv_root.to_string(),
+            evidence: self.evidence.to_string(),
+            evidence_root: evidence_root.to_string(),
             status: self.status(),
         }
     }
 
     fn status(self) -> FormulaCoverageStatus {
-        if self.callable.trim().is_empty() || self.test.trim().is_empty() {
+        if self.callable.trim().is_empty() || self.evidence.trim().is_empty() {
             FormulaCoverageStatus::Missing
         } else {
             FormulaCoverageStatus::Covered
@@ -158,7 +161,7 @@ fn coverage_error(message: impl Into<String>) -> CalyxError {
     CalyxError {
         code: CALYX_FORMULA_COVERAGE_MISSING,
         message: message.into(),
-        remediation: "map every PRD-22 formula to a callable, test, and FSV evidence row",
+        remediation: "map every PRD-22 formula to a callable and manual evidence row",
     }
 }
 
@@ -168,7 +171,7 @@ const fn spec(
     engine: &'static str,
     callable: &'static str,
     tunable_params: &'static [&'static str],
-    test: &'static str,
+    evidence: &'static str,
 ) -> FormulaRowSpec {
     FormulaRowSpec {
         formula,
@@ -176,7 +179,7 @@ const fn spec(
         engine,
         callable,
         tunable_params,
-        test,
+        evidence,
     }
 }
 
@@ -189,7 +192,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "loom",
         "calyx_loom::dda_signal_yield",
         &["n_eff_materialization_budget"],
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
     spec(
         "Cross-term",
@@ -197,7 +200,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "loom",
         "calyx_loom::LoomStore::cross_term",
         &["cross_term_kind_plan"],
-        "calyx-loom::stage5_fsv",
+        "calyx-loom::stage5_manual_evidence",
     ),
     spec(
         "Meaning compression yield",
@@ -205,7 +208,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "loom",
         "calyx_loom::meaning_compression_yield",
         &["materialization_budget"],
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
     spec(
         "Per-lens signal",
@@ -213,7 +216,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::lens_signal",
         &["min_signal_bits"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Pairwise redundancy",
@@ -221,7 +224,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::pair_redundancy",
         &["max_pairwise_corr"],
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
     spec(
         "KSG estimator",
@@ -229,7 +232,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::ksg_mi_continuous",
         &["k"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Partitioned NMI",
@@ -237,7 +240,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::partitioned_histogram_nmi",
         &["bins"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Effective rank",
@@ -245,7 +248,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::stable_rank",
         &["redundancy_graph_threshold"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Marginal lens value",
@@ -253,7 +256,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::marginal_value",
         &["lens_admission_delta"],
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
     spec(
         "DPI ceiling",
@@ -261,7 +264,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::dpi_ceiling",
         NONE,
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
     spec(
         "Panel sufficiency",
@@ -269,7 +272,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::panel_sufficiency",
         &["tau_mi"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Per-sensor decomposition",
@@ -277,7 +280,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "assay",
         "calyx_assay::per_sensor_attribution",
         &["sole_carrier_threshold_bits"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Abundance honesty",
@@ -285,7 +288,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "loom",
         "calyx_loom::AbundanceReport::new",
         &["n_eff_budget", "dpi_ceiling"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Association graph",
@@ -293,7 +296,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::build_assoc_graph_from_loom",
         &["directional_confidence"],
-        "calyx-lodestar::ph33_loom_assoc_tests",
+        "calyx-lodestar::ph33_loom_assoc_evidence",
     ),
     spec(
         "Kernel graph",
@@ -301,7 +304,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::select_kernel_graph",
         &["kernel_graph_params"],
-        "calyx-lodestar::ph32_lodestar_tests",
+        "calyx-lodestar::ph32_lodestar_evidence",
     ),
     spec(
         "Grounding kernel",
@@ -309,7 +312,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::dfvs_approx",
         &["mfvs_search_depth"],
-        "calyx-lodestar::ph32_lodestar_tests",
+        "calyx-lodestar::ph32_lodestar_evidence",
     ),
     spec(
         "MFVS approx",
@@ -317,7 +320,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::tournament_2approx",
         &["approximation_method"],
-        "calyx-lodestar::ph32_lodestar_tests",
+        "calyx-lodestar::ph32_lodestar_evidence",
     ),
     spec(
         "Kernel-only recall",
@@ -325,7 +328,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::kernel_recall_gate",
         &["min_recall_ratio", "top_k"],
-        "calyx-lodestar::ph33_recall_test_tests",
+        "calyx-lodestar::ph33_recall_evidence",
     ),
     spec(
         "Hop attenuation",
@@ -333,7 +336,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "paths",
         "calyx_paths::attenuate",
         &["hop_decay"],
-        "calyx-paths::ph31_paths_tests",
+        "calyx-paths::ph31_paths_evidence",
     ),
     spec(
         "Grounding gaps",
@@ -341,7 +344,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "lodestar",
         "calyx_lodestar::grounding_gaps",
         &["label_cost_model"],
-        "calyx-lodestar::ph33_grounding_gaps_tests",
+        "calyx-lodestar::ph33_grounding_gaps_evidence",
     ),
     spec(
         "Gtau guard",
@@ -349,7 +352,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "ward",
         "calyx_ward::guard",
         &["tau_k"],
-        "calyx-ward::guard_ph37_fsv",
+        "calyx-ward::guard_ph37_evidence",
     ),
     spec(
         "Constellation pass",
@@ -357,7 +360,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "ward",
         "calyx_ward::guard",
         &["guard_policy_kofn"],
-        "calyx-ward::guard_tests",
+        "calyx-ward::constellation_pass_evidence",
     ),
     spec(
         "Tau calibration",
@@ -365,7 +368,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "ward",
         "calyx_ward::calibrate",
         &["alpha", "target_far"],
-        "calyx-ward::calibrate_unit",
+        "calyx-ward::calibration_evidence",
     ),
     spec(
         "Novelty new region",
@@ -373,7 +376,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "ward",
         "calyx_ward::classify_novelty",
         &["surprise_threshold"],
-        "calyx-ward::novelty_handler",
+        "calyx-ward::novelty_handler_evidence",
     ),
     spec(
         "Oracle self-consistency ceiling",
@@ -381,7 +384,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::oracle_ceiling",
         &["tau_corr"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "Consequence prediction",
@@ -389,7 +392,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::oracle_predict",
         &["confidence_ceiling"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "Butterfly expansion",
@@ -397,7 +400,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::butterfly_expand",
         &["max_hops", "hop_decay"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "Super-intelligence predicate",
@@ -405,7 +408,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::super_intelligence",
         &["min_kernel_recall_ratio"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "Sufficiency falsification",
@@ -413,7 +416,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::oracle_predict",
         &["tau_mi"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "RRF",
@@ -421,7 +424,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "sextant",
         "calyx_sextant::fusion::rrf::rrf_contribution",
         &["rrf.k", "weight"],
-        "calyx-sextant::rrf_tests",
+        "calyx-sextant::rrf_evidence",
     ),
     spec(
         "Weighted RRF",
@@ -429,7 +432,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "sextant",
         "calyx_sextant::weighted_profiles",
         &["profile_weights"],
-        "calyx-sextant::stage4_fsv",
+        "calyx-sextant::stage4_manual_evidence",
     ),
     spec(
         "ColBERT MaxSim",
@@ -437,7 +440,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "sextant",
         "calyx_sextant::MaxSimIndex::maxsim",
         &["token_cutoff"],
-        "calyx-sextant::stage4_fsv",
+        "calyx-sextant::stage4_manual_evidence",
     ),
     spec(
         "Causal gate",
@@ -445,7 +448,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "sextant",
         "calyx_sextant::causal_gate_mult",
         &["high_multiplier", "low_multiplier"],
-        "calyx-sextant::causal_gate_fsv",
+        "calyx-sextant::causal_gate_evidence",
     ),
     spec(
         "Cross-lens anomaly",
@@ -453,7 +456,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "loom",
         "calyx_loom::detect_blind_spot",
         &["delta_threshold"],
-        "calyx-assay::stage5_fsv",
+        "calyx-assay::stage5_manual_evidence",
     ),
     spec(
         "Define",
@@ -461,7 +464,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "sextant",
         "calyx_sextant::define",
         &["definition_k"],
-        "calyx-sextant::stage4_fsv",
+        "calyx-sextant::stage4_manual_evidence",
     ),
     spec(
         "Reverse query",
@@ -469,7 +472,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "oracle",
         "calyx_oracle::reverse_query",
         &["max_hops"],
-        "calyx-oracle::prd22",
+        "calyx-oracle::prd22_evidence",
     ),
     spec(
         "Q/A equivalence",
@@ -477,7 +480,7 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "paths",
         "calyx_paths::bidirectional",
         &["max_hops"],
-        "calyx-paths::ph31_paths_tests",
+        "calyx-paths::ph31_paths_evidence",
     ),
     spec(
         "Anneal self-tuning",
@@ -485,6 +488,6 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "anneal",
         "calyx_anneal::AnnealSubstrate::propose_change",
         &["rrf.k", "ksg.k", "tripwires"],
-        "calyx-assay::formula_coverage_fsv",
+        "calyx-assay::formula_coverage_evidence",
     ),
 ];

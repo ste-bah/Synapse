@@ -2,7 +2,6 @@
 
 mod budget;
 mod heal;
-mod integration_fsv;
 mod j;
 mod janitor;
 mod learn;
@@ -12,6 +11,7 @@ mod recurrence_schedule;
 mod rollback;
 mod rollback_codec;
 mod shadow;
+mod substrate;
 mod tripwire;
 mod tune;
 
@@ -53,10 +53,6 @@ pub use heal::triggers::{
     FaultDetector, FaultEvent, FaultKind, FaultMonitor, HttpProbe, LensProbeDetector, ProbeStatus,
     SignalDecayDetector, SignalSample, StaleDetector, StaleEntry, TauDriftDetector, TauDriftSample,
     WardMetrics,
-};
-pub use integration_fsv::{
-    AnnealLedgerActionPair, AnnealProposalLedgerOptions, AnnealStatus, AnnealSubstrate,
-    CALYX_LEDGER_WRITE_FAIL, ChangeOutcome,
 };
 pub use j::{
     ANNEAL_GROWTH_TAG, ANNEAL_REPORT_TAG, AsterGrowthCf, CALYX_ANNEAL_GOODHART_INVALID_CONFIG,
@@ -161,6 +157,10 @@ pub use shadow::{
     CALYX_ANNEAL_SHADOW_MEASUREMENT_MISSING, HeldOutReplay, MetricComparison, MetricSide,
     MetricSnapshot, ReplayAnchor, ReplayQuery, ReplaySource, ShadowExecutor, ShadowRevertReason,
     ShadowVerdict, build_replay,
+};
+pub use substrate::{
+    AnnealLedgerActionPair, AnnealProposalLedgerOptions, AnnealStatus, AnnealSubstrate,
+    CALYX_LEDGER_WRITE_FAIL, ChangeOutcome,
 };
 pub use tripwire::{
     CALYX_TRIPWIRE_INVALID_CONFIG, CALYX_TRIPWIRE_INVALID_METRIC, ThresholdDir, ThresholdState,
